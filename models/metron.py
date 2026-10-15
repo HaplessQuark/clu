@@ -1283,7 +1283,19 @@ def map_to_comicinfo(issue_data) -> Dict[str, Any]:
     year = None
     month = None
     day = None
-    if cover_date:
+    if store_date:
+        try:
+            dt = datetime.strptime(str(store_date), "%Y-%m-%d")
+            year = dt.year
+            month = dt.month
+            day = dt.day
+        except ValueError:
+            # Try parsing just year
+            try:
+                year = int(str(cover_date)[:4])
+            except (ValueError, TypeError):
+                pass
+    else:
         try:
             dt = datetime.strptime(str(cover_date), "%Y-%m-%d")
             year = dt.year
