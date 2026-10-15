@@ -985,7 +985,7 @@
         const seriesName = sanitizePathSegment(seriesData.name || 'Unknown');
         const startYear = seriesData.year_began || seriesData.volume_year || '';
         const volumeRaw = seriesData.volume || seriesData.volume_number || '';
-        const volumeNumber = volumeRaw ? 'v' + volumeRaw : '';
+        const volumeNumber = volumeRaw ? 'Volume 0' + volumeRaw : '';
 
         // Global regexes, not string arguments: a string search value
         // replaces only the first occurrence, so a pattern that repeats a
