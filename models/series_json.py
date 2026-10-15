@@ -159,7 +159,7 @@ def build_metadata(series, issues=None, api=None):
         "type": "comicSeries",
         "publisher": _resolve_publisher(series),
         "imprint": _resolve_imprint(series),
-        "name": _get(series, "name"),
+        "name": _get(series, "name") + " (" + str(year_began) + ")",
         "comicid": str(cv_id) if cv_id else None,
         "metron_id": metron_id,
         "year": year_began,
