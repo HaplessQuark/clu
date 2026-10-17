@@ -115,6 +115,8 @@ from core.thumbnail_cache import (
     regenerate_thumbnail,
     set_job_status,
     prune_hidden_jobs,
+    is_in_flight,
+    submit_thumbnail_job,
 )
 from core.notifications import (
     EVENT_DEFS as NOTIFICATION_EVENT_DEFS,
@@ -2858,6 +2860,14 @@ def scan_library_task():
                                     # once per startup, so the retry is bounded
                                     # to one attempt per restart.
                                     should_process = True
+                                elif status == "processing" and not is_in_flight(
+                                    full_path
+                                ):
+                                    # Orphaned: the job was queued by an
+                                    # earlier process and died with it (a
+                                    # restart, a worker kill). Nothing else
+                                    # will ever settle this row.
+                                    should_process = True
 
                             if should_process:
                                 # Update DB to mark as pending/processing and update mtime
@@ -2876,8 +2886,11 @@ def scan_library_task():
                                 # Queue the job
                                 cache_path = thumbnail_cache_path(full_path)
 
-                                thumbnail_executor.submit(
-                                    generate_thumbnail_task, full_path, cache_path
+                                submit_thumbnail_job(
+                                    thumbnail_executor,
+                                    generate_thumbnail_task,
+                                    full_path,
+                                    cache_path,
                                 )
                                 count_queued += 1
                             else:
@@ -6105,7 +6118,10 @@ def get_thumbnail():
         if served is not None:
             return served
 
-    if job and job["status"] == "processing":
+    # Trust a 'processing' row only while this process really has the job. The
+    # executor queue is in memory, so a restart orphans every queued row, and
+    # answering loading.svg for those meant a spinner that never ended.
+    if job and job["status"] == "processing" and is_in_flight(file_path):
         return redirect(url_for("static", filename="images/loading.svg"))
 
     if job and job["status"] == "error" and not file_changed_since(
@@ -6139,7 +6155,9 @@ def get_thumbnail():
         conn.close()
 
     # Submit task
-    thumbnail_executor.submit(generate_thumbnail_task, file_path, cache_path)
+    submit_thumbnail_job(
+        thumbnail_executor, generate_thumbnail_task, file_path, cache_path
+    )
 
     return redirect(url_for("static", filename="images/loading.svg"))
 
