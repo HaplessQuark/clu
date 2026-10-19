@@ -14,6 +14,7 @@ import threading
 from flask import Blueprint, jsonify, render_template, request
 
 from core.app_logging import app_logger
+from helpers.responses import error_response
 
 library_health_bp = Blueprint("library_health", __name__)
 
@@ -164,7 +165,22 @@ def api_dismiss():
     group_id = data.get("id")
     if not group_id:
         return jsonify({"success": False, "error": "Missing id"}), 400
-    ok, error = dismiss_group(group_id, dismissed=data.get("dismissed", True) is not False)
-    if not ok:
-        return jsonify({"success": False, "error": error}), 400
-    return jsonify({"success": True})
+    seen = data.get("members")
+    if seen is not None and not (isinstance(seen, list) and all(isinstance(p, str) for p in seen)):
+        return jsonify({"success": False, "error": "members must be a list of paths"}), 400
+    try:
+        result = dismiss_group(
+            group_id,
+            dismissed=data.get("dismissed", True) is not False,
+            until_scan=data.get("until_scan") is True,
+            seen_paths=seen,
+        )
+    except Exception as e:
+        return error_response("Could not update this group", e)
+    if result.get("changed"):
+        # A copy turning up is a conflict with what the page shows, not a bad request.
+        return error_response("Another copy has turned up since the page loaded",
+                              code=409, changed=True)
+    if not result.get("success"):
+        return error_response("Could not update this group", code=400)
+    return jsonify({"success": True, "gone": bool(result.get("gone"))})
