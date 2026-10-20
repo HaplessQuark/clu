@@ -20,17 +20,19 @@ import os
 import zipfile
 
 from core.app_logging import app_logger
-from core.config import config
+from core.config import get_data_dir
+from core.settings import get_bool, get_int
 from core.database import (
     get_files_needing_metadata_scan,
     get_files_needing_metronid_backfill,
+    get_files_needing_provider_backfill,
     get_files_with_missing_comicinfo_for_rescan,
     get_metadata_scan_stats,
     update_file_metadata,
     update_metadata_scanned_at,
     get_file_index_entry_by_path
 )
-from core.comicinfo import read_comicinfo_from_zip
+from core.comicinfo import read_comicinfo_from_zip, provider_from_notes, comicvine_issue_id
 
 # Priority levels (lower = higher priority)
 PRIORITY_NEW_FILE = 1      # Files just added via file_watcher
@@ -124,7 +126,7 @@ def process_metadata_scan(task):
 
         # Handle /data/ prefix (Docker mount point)
         if file_path.startswith('/data/'):
-            data_dir = config.get('SETTINGS', 'DATA_DIR', fallback='/data')
+            data_dir = get_data_dir()
             # Remove /data prefix and join with actual data dir
             relative_path = file_path[6:]  # Remove '/data/'
             file_path = os.path.join(data_dir, relative_path)
@@ -177,7 +179,13 @@ def process_metadata_scan(task):
             # since X" feed against the library. Stored as 0 when the XML has no
             # <MetronId>, which is also what keeps this file out of
             # get_files_needing_metronid_backfill() on the next pass.
-            'ci_metronid': metadata.get('MetronId')
+            'ci_metronid': metadata.get('MetronId'),
+            # Which provider wrote this file, read from Notes. '' (stored when
+            # there is none) keeps untagged files out of the provider backfill.
+            'ci_provider': provider_from_notes(metadata.get('Notes')) or '',
+            # The ComicVine issue id (from Web or Notes) -- what a CBL reading
+            # list names its issues by. 0 when there is none, like ci_metronid.
+            'ci_cvid': comicvine_issue_id(metadata.get('Web'), metadata.get('Notes')) or 0,
         }
 
         # Update database
@@ -240,7 +248,7 @@ def queue_file_for_scan(file_path, priority=PRIORITY_NEW_FILE):
             return
 
         # Convert filesystem path to database path format (/data/...)
-        data_dir = config.get('SETTINGS', 'DATA_DIR', fallback='/data')
+        data_dir = get_data_dir()
         if file_path.startswith(data_dir):
             db_path = '/data/' + file_path[len(data_dir):].lstrip('/').lstrip('\\')
         else:
@@ -354,7 +362,7 @@ def queue_missing_xml_for_rescan(limit=10000):
 
 
 def queue_metronid_backfill(limit=1000):
-    """Queue comics indexed before ci_metronid existed so the column fills in.
+    """Queue comics indexed before ci_metronid/ci_cvid existed so they fill in.
 
     Reading <MetronId> means opening the archive, which is the metadata
     scanner's job anyway. Drained in batches by the queue monitor when nothing
@@ -389,6 +397,39 @@ def queue_metronid_backfill(limit=1000):
         return 0
 
 
+def queue_provider_backfill(limit=1000):
+    """Queue comics indexed before ci_provider existed so the column fills in.
+
+    Same housekeeping contract as :func:`queue_metronid_backfill`: lowest
+    priority, drained only when idle, self-terminating because every scan
+    writes a provider or ''.
+
+    Returns:
+        Number of files queued.
+    """
+    try:
+        files = get_files_needing_provider_backfill(limit=limit)
+
+        for f in files:
+            metadata_queue.put(ScanTask(
+                priority=PRIORITY_BATCH,
+                file_path=f['path'],
+                file_id=f['id'],
+                modified_at=f['modified_at']
+            ))
+
+        if files:
+            with scanner_lock:
+                scanner_progress['total_pending'] += len(files)
+            app_logger.info(f"Queued {len(files)} files to backfill ci_provider")
+
+        return len(files)
+
+    except Exception as e:
+        app_logger.error(f"Error queuing ci_provider backfill: {e}")
+        return 0
+
+
 def queue_monitor():
     """
     Background thread that continuously monitors and queues pending files.
@@ -417,6 +458,7 @@ def queue_monitor():
                     # Nothing outstanding: spend the idle capacity filling in
                     # ci_metronid for files indexed before the column existed.
                     queue_metronid_backfill()
+                    queue_provider_backfill()
 
         except Exception as e:
             app_logger.error(f"Queue monitor error: {e}")
@@ -434,14 +476,14 @@ def start_metadata_scanner(num_workers=None):
     global worker_threads, monitor_thread
 
     # Check if scanning is enabled
-    enabled = config.getboolean('SETTINGS', 'ENABLE_METADATA_SCAN', fallback=True)
+    enabled = get_bool('ENABLE_METADATA_SCAN')
     if not enabled:
         app_logger.info("Metadata scanning disabled in config")
         return
 
     # Get configured thread count
     if num_workers is None:
-        num_workers = config.getint('SETTINGS', 'METADATA_SCAN_THREADS', fallback=2)
+        num_workers = get_int('METADATA_SCAN_THREADS')
     num_workers = max(1, min(num_workers, 4))  # Clamp between 1-4
 
     with scanner_lock:
@@ -514,7 +556,7 @@ def get_scanner_status():
 
     with scanner_lock:
         return {
-            'enabled': config.getboolean('SETTINGS', 'ENABLE_METADATA_SCAN', fallback=True),
+            'enabled': get_bool('ENABLE_METADATA_SCAN'),
             'is_running': scanner_progress['is_running'],
             'queue_size': metadata_queue.qsize(),
             'scanned_this_session': scanner_progress['scanned_count'],

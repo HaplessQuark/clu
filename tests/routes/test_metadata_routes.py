@@ -28,16 +28,7 @@ class TestAddComicInfoToCbz:
 
     def _patch_cache_dir(self, cache_dir):
         """Point CACHE_DIR at a local temp dir so assembly happens off /data."""
-        from routes import metadata
-
-        real_get = metadata.config.get
-
-        def fake_get(section, option, *args, **kwargs):
-            if section == "SETTINGS" and option == "CACHE_DIR":
-                return str(cache_dir)
-            return real_get(section, option, *args, **kwargs)
-
-        return patch.object(metadata.config, "get", side_effect=fake_get)
+        return patch("core.config.get_cache_dir", return_value=str(cache_dir))
 
     def test_inserts_comicinfo_at_root_and_preserves_images(self, tmp_path):
         from routes.metadata import add_comicinfo_to_cbz
@@ -438,6 +429,66 @@ class TestCbzInfoEditorFrontend:
         groups = js.split("var _fieldGroups", 1)[1].split("var _fieldByKey", 1)[0]
         keys = set(re.findall(r"key: '(\w+)'", groups))
         assert keys and keys <= EDITABLE_COMICINFO_FIELDS
+
+
+def _png(width, height):
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestCbzMetadataDimensions:
+    """/cbz-metadata?dimensions=1 -- image resolution for the duplicate compare."""
+
+    def _make(self, tmp_path, pages):
+        path = str(tmp_path / "Dims 001.cbz")
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, data in pages:
+                zf.writestr(name, data)
+        return path
+
+    def test_omitted_unless_requested(self, client, tmp_path):
+        path = self._make(tmp_path, [("p01.png", _png(10, 20))])
+        resp = client.get("/cbz-metadata", query_string={"path": path})
+        assert resp.status_code == 200
+        assert "image_dimensions" not in resp.get_json()
+
+    def test_cover_reported_apart_from_interior_median(self, client, tmp_path):
+        pages = [("p01.png", _png(400, 600))]          # cover, a different size
+        pages += [(f"p{n:02d}.png", _png(100, 150)) for n in range(2, 8)]
+        pages.append(("p08.png", _png(300, 450)))      # one odd page out
+        path = self._make(tmp_path, pages)
+        resp = client.get("/cbz-metadata", query_string={"path": path, "dimensions": "1"})
+        dims = resp.get_json()["image_dimensions"]
+        assert dims["cover"] == [400, 600]
+        assert dims["pages"] == [100, 150]
+        assert dims["sampled"] == 5
+
+    def test_natural_order_picks_the_real_cover(self, client, tmp_path):
+        # "p10" sorts before "p2" lexically; the reader's natural order does not.
+        path = self._make(tmp_path, [
+            ("p10.png", _png(50, 50)), ("p2.png", _png(50, 50)), ("p1.png", _png(80, 120)),
+        ])
+        resp = client.get("/cbz-metadata", query_string={"path": path, "dimensions": "1"})
+        assert resp.get_json()["image_dimensions"]["cover"] == [80, 120]
+
+    def test_unreadable_images_and_single_page(self, client, tmp_path):
+        path = self._make(tmp_path, [
+            ("p1.png", _png(80, 120)), ("p2.jpg", b"not an image"),
+            ("__MACOSX/._p3.png", b"junk"),
+        ])
+        resp = client.get("/cbz-metadata", query_string={"path": path, "dimensions": "1"})
+        dims = resp.get_json()["image_dimensions"]
+        assert dims == {"cover": [80, 120], "pages": None, "sampled": 0}
+
+    def test_dupe_modal_requests_and_shows_resolution(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, "static", "js", "clu-cbz-dupe.js"), encoding="utf-8") as f:
+            js = f.read()
+        assert "/cbz-metadata?dimensions=1&path=" in js
+        assert "_resolutionCells(results, 'cover')" in js
+        assert "_resolutionCells(results, 'pages')" in js
 
 
 class TestUpdateXmlFileIndexSync:
@@ -2573,6 +2624,73 @@ class TestSaveProviderCredentialsAuthModes:
         assert save.call_args[0][1] == {"api_key": "cv-key"}
         # ComicVine does not opt into save-time validation.
         assert 'valid' not in resp.get_json()
+
+
+class TestProviderTestUnsavedCredentials:
+    """``POST /api/providers/<type>/test`` with a body tests those credentials
+    instead of the saved ones and records nothing (the Guided Setup tests
+    before it saves)."""
+
+    def _test(self, client, provider_type, body=None, valid=True):
+        provider = MagicMock()
+        provider.test_connection.return_value = valid
+        provider.last_error = None if valid else "rejected"
+        kwargs = {"json": body} if body is not None else {}
+        with patch("models.providers.get_provider_by_name",
+                   return_value=provider) as build, \
+             patch("core.database.get_provider_credentials",
+                   return_value={"api_key": "saved"}), \
+             patch("core.database.update_provider_validity") as record, \
+             patch("core.database.register_provider_configured") as register:
+            resp = client.post(f'/api/providers/{provider_type}/test', **kwargs)
+        return resp, build, provider, record, register
+
+    def test_body_is_tested_instead_of_saved_credentials(self, client):
+        resp, build, provider, _, _ = self._test(client, "comicvine", {"api_key": "typed"})
+
+        assert resp.status_code == 200
+        assert resp.get_json()["valid"] is True
+        assert build.call_args[0][1].api_key == "typed"
+        assert provider.probe_only is True
+
+    def test_probe_records_nothing(self, client):
+        _, _, _, record, register = self._test(client, "comicvine", {"api_key": "typed"},
+                                               valid=False)
+        record.assert_not_called()
+        register.assert_not_called()
+
+    def test_failed_probe_reports_the_reason(self, client):
+        resp, *_ = self._test(client, "comicvine", {"api_key": "typed"}, valid=False)
+        data = resp.get_json()
+        assert data["valid"] is False
+        assert data["error"] == "rejected"
+
+    def test_no_body_tests_and_records_the_saved_credentials(self, client):
+        _, build, provider, record, _ = self._test(client, "comicvine")
+
+        assert build.call_args[0][1].api_key == "saved"
+        assert provider.probe_only is False
+        record.assert_called_once_with("comicvine", True)
+
+    def test_probe_applies_the_auth_mode(self, client):
+        _, build, _, _, _ = self._test(
+            client, "metron",
+            {"auth_mode": "token", "api_token": "tok", "username": "stale", "password": "x"})
+
+        creds = build.call_args[0][1]
+        assert creds.api_token == "tok"
+        assert creds.username is None and creds.password is None
+
+    def test_probe_with_an_unknown_mode_is_refused(self, client):
+        resp, build, *_ = self._test(client, "metron",
+                                     {"auth_mode": "carrier-pigeon", "api_token": "tok"})
+        assert resp.status_code == 400
+        build.assert_not_called()
+
+    def test_probe_with_only_blank_fields_needs_credentials(self, client):
+        resp, build, *_ = self._test(client, "comicvine", {"api_key": ""})
+        assert resp.status_code == 400
+        build.assert_not_called()
 
 
 class TestRenameConfigCarriesCleanup:

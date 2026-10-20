@@ -52,9 +52,10 @@ class TestPage:
     @patch("core.problem_files.list_problems", return_value=[])
     def test_page_states_it_does_not_scan(self, _list, _counts, client):
         """"Report only" is a promise; an empty page must not read as "your
-        library is clean"."""
+        library is clean". With the health scan opt-in, the page still says an
+        empty list means nothing has *failed*."""
         resp = client.get("/problem-files")
-        assert b"does not scan" in resp.data
+        assert b"nothing has failed" in resp.data
 
 
 class TestList:
@@ -167,6 +168,68 @@ class TestRetry:
             "/api/problem-files/retry", json={"path": "/data/x.cbz", "source": "wat"}
         )
         assert resp.status_code == 400
+
+
+class TestSalvage:
+    @pytest.fixture
+    def cbz(self, tmp_path):
+        path = tmp_path / "Bad.cbz"
+        path.write_bytes(b"PK")
+        return str(path)
+
+    @patch("core.problem_files.has_problem", return_value=False)
+    def test_an_unlisted_path_is_refused(self, _has, client, cbz):
+        resp = client.post("/api/problem-files/salvage",
+                           json={"path": cbz, "source": "integrity"})
+        assert resp.status_code == 404
+
+    @patch("core.problem_files.has_problem", return_value=True)
+    def test_only_a_cbz_is_salvaged(self, _has, client, tmp_path):
+        other = tmp_path / "Bad.cbr"
+        other.write_bytes(b"Rar!")
+        resp = client.post("/api/problem-files/salvage",
+                           json={"path": str(other), "source": "integrity"})
+        assert resp.status_code == 400
+
+    @patch("core.problem_files.get_problem", return_value=None)
+    @patch("core.problem_files.clear_problem")
+    @patch("core.library_health.recheck_file", return_value=(True, "Archive verified"))
+    @patch("core.thumbnail_cache.regenerate_thumbnail")
+    @patch("cbz_ops.salvage.salvage_cbz", return_value={
+        "ok": True, "salvaged": [{"name": "p2.jpg", "page": 2}], "failed": [],
+        "message": "Rebuilt — page 2 had a CRC mismatch and decoded OK."})
+    @patch("helpers.library.is_critical_path", return_value=False)
+    @patch("core.problem_files.has_problem", return_value=True)
+    def test_success_rechecks_then_clears_every_entry(
+            self, _has, _crit, _salvage, thumb, recheck, clear, _get, client, cbz):
+        resp = client.post("/api/problem-files/salvage",
+                           json={"path": cbz, "source": "integrity"})
+        data = resp.get_json()
+        assert data["fixed"] is True
+        assert data["salvaged"][0]["page"] == 2
+        thumb.assert_called_once_with(cbz)
+        recheck.assert_called_once_with(cbz)
+        # No source: the archive was rewritten, so a rebuild row goes too.
+        clear.assert_called_once_with(cbz)
+
+    @patch("core.problem_files.get_problem", return_value=_row(source="integrity"))
+    @patch("core.problem_files.clear_problem")
+    @patch("core.library_health.recheck_file")
+    @patch("cbz_ops.salvage.salvage_cbz", return_value={
+        "ok": False, "salvaged": [], "failed": [{"name": "p3.jpg", "page": 3,
+                                                 "reason": "does not decode"}],
+        "message": "Could not salvage page 3"})
+    @patch("helpers.library.is_critical_path", return_value=False)
+    @patch("core.problem_files.has_problem", return_value=True)
+    def test_failure_keeps_the_row_and_names_the_page(
+            self, _has, _crit, _salvage, recheck, clear, _get, client, cbz):
+        resp = client.post("/api/problem-files/salvage",
+                           json={"path": cbz, "source": "integrity"})
+        data = resp.get_json()
+        assert data["fixed"] is False
+        assert data["failed"][0]["page"] == 3
+        recheck.assert_not_called()
+        clear.assert_not_called()
 
 
 class TestDismiss:
@@ -391,3 +454,206 @@ class TestSeriesJsonScan:
                                json={"path": "/data/Batman/series.json"})
         assert resp.status_code == 400
         trash.assert_not_called()
+
+
+class TestRefreshAllSeriesJson:
+    """Bulk Refresh for series.json rows (core.series_json_check.refresh_all)."""
+
+    URL = "/api/problem-files/refresh-series-json-all"
+
+    def test_it_is_owner_only_by_prefix(self):
+        from core.auth import _OWNER_PREFIXES
+
+        assert self.URL.startswith(_OWNER_PREFIXES)
+        assert (self.URL + "/result").startswith(_OWNER_PREFIXES)
+
+    def test_nothing_to_refresh_is_a_400(self, client):
+        with patch("core.series_json_check.count_open_series_json", return_value=0):
+            resp = client.post(self.URL)
+        assert resp.status_code == 400
+
+    def test_unknown_provider_is_a_400(self, client):
+        resp = client.post(self.URL, json={"provider": "nonsense"})
+        assert resp.status_code == 400
+
+    def test_busy_scan_is_a_409_and_nothing_starts(self, client):
+        from routes import problem_files as pf
+
+        assert pf._scan_lock.acquire(blocking=False)
+        try:
+            with patch("core.series_json_check.count_open_series_json", return_value=3), \
+                 patch("core.series_json_check.refresh_all") as run:
+                resp = client.post(self.URL)
+                run.assert_not_called()
+        finally:
+            pf._scan_lock.release()
+        assert resp.status_code == 409
+
+    def test_starts_in_the_background_and_releases_the_lock(self, client):
+        import time as _time
+
+        from routes import problem_files as pf
+
+        with patch("core.series_json_check.count_open_series_json", return_value=3), \
+             patch("core.series_json_check.refresh_all", return_value={}) as run:
+            resp = client.post(self.URL, json={"provider": "metron"})
+            assert resp.status_code == 200 and resp.get_json()["op_id"]
+            deadline = _time.time() + 5
+            while pf._scan_lock.locked() and _time.time() < deadline:
+                _time.sleep(0.02)
+        assert not pf._scan_lock.locked()
+        assert run.call_args.kwargs["provider"] == "metron"
+
+    def test_a_crashing_run_still_releases_the_lock(self, client):
+        import time as _time
+
+        from routes import problem_files as pf
+
+        with patch("core.series_json_check.count_open_series_json", return_value=1), \
+             patch("core.series_json_check.refresh_all", side_effect=RuntimeError("boom")):
+            assert client.post(self.URL).status_code == 200
+            deadline = _time.time() + 5
+            while pf._scan_lock.locked() and _time.time() < deadline:
+                _time.sleep(0.02)
+        assert not pf._scan_lock.locked()
+
+    def test_result_endpoint(self, client):
+        report = {"total": 2, "fixed": 1, "failed": [{"folder": "/d/A", "path": "/d/A/series.json", "reason": "x"}]}
+        with patch("core.series_json_check.last_bulk_result", return_value=report):
+            data = client.get(self.URL + "/result").get_json()
+        assert data["success"] is True and data["result"]["fixed"] == 1
+        with patch("core.series_json_check.last_bulk_result", return_value=None):
+            assert client.get(self.URL + "/result").get_json()["result"] is None
+
+    def test_page_has_the_button_the_panel_and_the_confirmation(self, client):
+        with patch("core.problem_files.count_problems", return_value={}), \
+             patch("core.problem_files.list_problems", return_value=[]):
+            body = client.get("/problem-files").data
+        assert b'id="pf-refresh-sj-all"' in body
+        assert b'id="pf-sj-result"' in body
+        assert b'id="pf-sj-all-modal"' in body
+
+    def test_the_background_run_has_an_application_context(self, client):
+        """The provider lookups read current_app. A bare thread has none, so each
+        raised "Working outside of application context", the lookup swallowed it,
+        and every folder reported "No provider returned data" while the same
+        refresh from a request worked."""
+        import time as _time
+
+        from flask import has_app_context
+
+        from routes import problem_files as pf
+
+        seen = {}
+
+        def fake(op_id, provider="auto"):
+            seen["ctx"] = has_app_context()
+            return {}
+
+        with patch("core.series_json_check.count_open_series_json", return_value=1), \
+             patch("core.series_json_check.refresh_all", side_effect=fake):
+            assert client.post(self.URL).status_code == 200
+            deadline = _time.time() + 5
+            while pf._scan_lock.locked() and _time.time() < deadline:
+                _time.sleep(0.02)
+        assert seen.get("ctx") is True
+
+
+class TestEmptyFolders:
+    def test_empty_folder_is_a_valid_source_filter(self, client):
+        with patch("core.problem_files.list_problems", return_value=[]) as mock_list, \
+             patch("core.problem_files.count_problems",
+                   return_value={"open": 0, "dismissed": 0, "by_source": {}}):
+            resp = client.get("/api/problem-files?source=empty-folder")
+        assert resp.status_code == 200
+        assert mock_list.call_args.kwargs["source"] == "empty-folder"
+
+    def test_a_folder_row_gets_no_search_context(self, client):
+        row = _row(path="/data/Comics/Empty", source="empty-folder",
+                   filename="Empty", error_class="EmptyFolder")
+        with patch("core.problem_files.list_problems", return_value=[row]), \
+             patch("core.problem_files.count_problems",
+                   return_value={"open": 1, "dismissed": 0, "by_source": {}}):
+            resp = client.get("/api/problem-files")
+        assert "search" not in resp.get_json()["problems"][0]
+
+    def test_page_has_the_filter_and_the_scan_button(self, client):
+        with patch("core.problem_files.list_problems", return_value=[]), \
+             patch("core.problem_files.count_problems",
+                   return_value={"open": 0, "dismissed": 0, "by_source": {}}):
+            resp = client.get("/problem-files")
+        assert b'data-source="empty-folder"' in resp.data
+        assert b'id="pf-scan-empty"' in resp.data
+
+    def test_scan_starts_in_the_background(self, client):
+        import threading
+
+        ran = threading.Event()
+
+        def fake_scan(op_id=None):
+            ran.set()
+            return {"flagged": 0}
+
+        with patch("core.library_health.scan_empty_folders", side_effect=fake_scan):
+            resp = client.post("/api/problem-files/scan-empty-folders")
+            assert resp.status_code == 200
+            assert resp.get_json()["op_id"]
+            assert ran.wait(5)
+
+    def test_second_scan_while_running_is_409(self, client):
+        from core import library_health as lh
+
+        assert lh._empty_scan_lock.acquire(blocking=False)
+        try:
+            resp = client.post("/api/problem-files/scan-empty-folders")
+            assert resp.status_code == 409
+        finally:
+            lh._empty_scan_lock.release()
+
+
+class TestDeleteFolder:
+    """A folder is deleted only while it is a listed empty folder *and* still
+    empty: the scan that listed it may be a day old."""
+
+    def _patches(self, tmp_path, listed=True, outcome=("EmptyFolder", "No files")):
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(patch("core.problem_files.has_problem", return_value=True))
+        stack.enter_context(patch("core.problem_files.get_problem",
+                                  return_value={"path": "x"} if listed else None))
+        stack.enter_context(patch("helpers.library.is_critical_path", return_value=False))
+        stack.enter_context(patch("core.library_health.inspect_folder", return_value=outcome))
+        self.clear = stack.enter_context(patch("core.problem_files.clear_problem", return_value=1))
+        self.clear_under = stack.enter_context(
+            patch("core.problem_files.clear_problems_under", return_value=1))
+        self.trash = stack.enter_context(
+            patch("helpers.trash.move_to_trash", return_value={"trashed": True}))
+        return stack
+
+    def test_a_still_empty_listed_folder_is_trashed_with_its_rows(self, client, tmp_path):
+        folder = tmp_path / "Empty"
+        folder.mkdir()
+        with self._patches(tmp_path):
+            resp = client.post("/api/problem-files/delete", json={"path": str(folder)})
+            assert resp.status_code == 200
+            self.trash.assert_called_once_with(str(folder))
+            # A series.json row inside it must not linger as "unreachable".
+            self.clear_under.assert_called_once_with(str(folder))
+
+    def test_a_folder_that_filled_up_is_refused_and_dropped(self, client, tmp_path):
+        folder = tmp_path / "Filled"
+        folder.mkdir()
+        with self._patches(tmp_path, outcome=None):
+            resp = client.post("/api/problem-files/delete", json={"path": str(folder)})
+            assert resp.status_code == 409
+            self.trash.assert_not_called()
+            self.clear.assert_called_once_with(str(folder), "empty-folder")
+
+    def test_a_folder_listed_under_another_source_is_refused(self, client, tmp_path):
+        folder = tmp_path / "Other"
+        folder.mkdir()
+        with self._patches(tmp_path, listed=False):
+            resp = client.post("/api/problem-files/delete", json={"path": str(folder)})
+            assert resp.status_code == 404
+            self.trash.assert_not_called()

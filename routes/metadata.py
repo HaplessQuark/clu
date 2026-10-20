@@ -24,7 +24,6 @@ from flask import (Blueprint, request, jsonify, Response,
                    stream_with_context, current_app)
 import core.app_state as app_state
 from core.app_logging import app_logger
-from core.config import config
 from core.auth import require_role
 from helpers.library import is_valid_library_path, resolve_provider_library_id
 from models import gcd, inducks, metron, comicvine, comicvine_sqlite
@@ -335,9 +334,65 @@ def add_comicinfo_to_cbz(file_path, comicinfo_xml_bytes, merge_existing=True):
 # CBZ Metadata
 # =============================================================================
 
+# Interior pages sampled for the resolution figure. The cover is reported on
+# its own: it is often a different size (a wraparound, a scan from another
+# source), so averaging it in would misdescribe the pages.
+_RESOLUTION_SAMPLE_PAGES = 5
+
+
+def _page_order_key(name):
+    """Natural sort, as the reader orders pages (/api/read/.../page/N)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"([0-9]+)", name)]
+
+
+def _image_size(zf, name):
+    """(width, height) of one entry, read from its header only; None if unreadable."""
+    from PIL import Image
+    try:
+        with zf.open(name) as fp, Image.open(fp) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def _sample_page_dimensions(zf, image_files):
+    """Cover size plus the median size of a few evenly spaced interior pages.
+
+    Header-only reads, so this stays cheap on a large archive. Returns
+    ``{"cover": [w, h] | None, "pages": [w, h] | None, "sampled": n}``.
+    """
+    pages = sorted(
+        (n for n in image_files
+         if not n.startswith("__MACOSX") and not os.path.basename(n).startswith(".")),
+        key=_page_order_key,
+    )
+    result = {"cover": None, "pages": None, "sampled": 0}
+    if not pages:
+        return result
+
+    cover = _image_size(zf, pages[0])
+    result["cover"] = list(cover) if cover else None
+
+    interior = pages[1:]
+    if interior:
+        count = min(_RESOLUTION_SAMPLE_PAGES, len(interior))
+        step = len(interior) / count
+        picks = sorted({int(i * step + step / 2) for i in range(count)})
+        sizes = [s for s in (_image_size(zf, interior[i]) for i in picks) if s]
+        if sizes:
+            sizes.sort(key=lambda s: s[0] * s[1])
+            result["pages"] = list(sizes[len(sizes) // 2])
+            result["sampled"] = len(sizes)
+    return result
+
+
 @metadata_bp.route('/cbz-metadata', methods=['GET'])
 def cbz_metadata():
-    """Extract metadata from a CBZ file"""
+    """Extract metadata from a CBZ file.
+
+    ``dimensions=1`` also samples page image sizes (``image_dimensions``);
+    it is opt-in because only the duplicate compare needs it.
+    """
     file_path = request.args.get('path')
     if not file_path or not os.path.exists(file_path):
         return jsonify({"error": "Invalid file path"}), 400
@@ -371,6 +426,9 @@ def cbz_metadata():
                     image_files.append(file_name)
 
             metadata["image_files"] = len(image_files)
+
+            if request.args.get('dimensions') == '1':
+                metadata["image_dimensions"] = _sample_page_dimensions(zf, image_files)
 
             # Look for ComicInfo.xml
             from core.comicinfo import find_comicinfo_in_zip
@@ -814,6 +872,46 @@ def _validate_saved_credentials(provider_type):
         return False, str(e)
 
 
+def _should_suggest_folder_monitor():
+    """True when the settings page should offer to switch Folder Monitoring on.
+
+    Metron credentials enable subscriptions, which download new issues
+    unattended; Folder Monitoring is off by default, so the user is asked
+    rather than having it switched on behind their back. A read failure says
+    "don't ask" -- a prompt on every save is worse than a missed one.
+    """
+    try:
+        from core.settings import peek_setting
+        return peek_setting("MONITOR_ENABLED") is False
+    except Exception:
+        return False
+
+
+def _apply_auth_mode(provider_class, data):
+    """Drop the fields of the auth modes the user did not choose, in place.
+
+    A provider offering several auth methods posts which one the user chose.
+    The stored blob is replaced wholesale, and blank inputs never reach us, so
+    without this a switch from username/password to a token would leave the
+    old password behind and mokkari would keep using whichever it prefers.
+    Returns an error message, or None.
+    """
+    auth_mode = data.pop("auth_mode", None)
+    auth_modes = getattr(provider_class, "auth_modes", None) or []
+    if auth_mode and auth_modes:
+        chosen = next((m for m in auth_modes if m.get("id") == auth_mode), None)
+        if chosen is None:
+            return f"Unknown auth mode: {auth_mode}"
+        keep = set(chosen.get("fields") or [])
+        for mode in auth_modes:
+            for field in mode.get("fields") or []:
+                if field not in keep:
+                    data.pop(field, None)
+        if not any(data.get(field) for field in keep):
+            return f"Enter your {chosen.get('label', auth_mode)} details"
+    return None
+
+
 @metadata_bp.route('/api/providers/<provider_type>/credentials', methods=['POST'])
 def save_provider_creds(provider_type):
     """Save credentials for a provider."""
@@ -831,27 +929,10 @@ def save_provider_creds(provider_type):
         if not data:
             return jsonify({"error": "No credentials provided"}), 400
 
-        # A provider offering several auth methods posts which one the user
-        # chose. Drop the other methods' fields: the stored blob is replaced
-        # wholesale, and blank inputs never reach us, so without this a switch
-        # from username/password to a token would leave the old password behind
-        # and mokkari would keep using whichever it prefers.
-        auth_mode = data.pop("auth_mode", None)
         provider_class = get_provider_class(ProviderType(provider_type))
-        auth_modes = getattr(provider_class, "auth_modes", None) or []
-        if auth_mode and auth_modes:
-            chosen = next((m for m in auth_modes if m.get("id") == auth_mode), None)
-            if chosen is None:
-                return jsonify({"error": f"Unknown auth mode: {auth_mode}"}), 400
-            keep = set(chosen.get("fields") or [])
-            for mode in auth_modes:
-                for field in mode.get("fields") or []:
-                    if field not in keep:
-                        data.pop(field, None)
-            if not any(data.get(field) for field in keep):
-                return jsonify({
-                    "error": f"Enter your {chosen.get('label', auth_mode)} details"
-                }), 400
+        error = _apply_auth_mode(provider_class, data)
+        if error:
+            return jsonify({"error": error}), 400
 
         # Save credentials
         success = save_provider_credentials(provider_type, data)
@@ -892,6 +973,8 @@ def save_provider_creds(provider_type):
                     result["message"] = (
                         f"Credentials saved, but {provider_type} rejected them"
                     )
+            if provider_type == 'metron':
+                result["suggest_enable_monitor"] = _should_suggest_folder_monitor()
             return jsonify(result)
         else:
             return jsonify({"error": "Failed to save credentials"}), 500
@@ -1080,7 +1163,14 @@ def get_cv_update_result(op_id):
 
 @metadata_bp.route('/api/providers/<provider_type>/test', methods=['POST'])
 def test_provider_connection(provider_type):
-    """Test connection to a provider using saved credentials."""
+    """Test connection to a provider.
+
+    With no body this tests the saved credentials and records the verdict.
+    A JSON body of credential fields (plus an optional ``auth_mode``) is tested
+    *instead*, without saving it: the Guided Setup tests before it saves. That
+    probe records nothing -- neither ``is_valid`` nor the Metron lockout, which
+    describe the saved credentials, not the ones being tried.
+    """
     try:
         from core.database import get_provider_credentials, update_provider_validity, register_provider_configured
         from models.providers import get_provider_by_name, get_provider_class, ProviderCredentials
@@ -1096,21 +1186,31 @@ def test_provider_connection(provider_type):
         provider_class = get_provider_class(ptype)
         requires_auth = provider_class.requires_auth if provider_class else True
 
-        # Get saved credentials
-        creds_dict = get_provider_credentials(provider_type)
+        body = request.get_json(silent=True)
+        probe = isinstance(body, dict) and bool(body)
+        if probe:
+            error = _apply_auth_mode(provider_class, body)
+            if error:
+                return jsonify({"success": False, "error": error}), 400
+            creds_dict = {k: v for k, v in body.items() if v not in (None, "")}
+        else:
+            creds_dict = get_provider_credentials(provider_type)
         if not creds_dict and requires_auth:
             return jsonify({"success": False, "error": "No credentials configured"}), 400
 
         # Create provider instance with credentials (or None for public APIs)
         credentials = ProviderCredentials.from_dict(creds_dict) if creds_dict else None
         provider = get_provider_by_name(provider_type, credentials)
+        provider.probe_only = probe
 
         # Test connection
         is_valid = provider.test_connection()
 
         # Update validity in database
         # For auth-free providers, register them as configured when test succeeds
-        if not requires_auth:
+        if probe:
+            pass  # an unsaved probe records nothing
+        elif not requires_auth:
             register_provider_configured(provider_type, is_valid)
         else:
             update_provider_validity(provider_type, is_valid)
@@ -5426,11 +5526,6 @@ def search_comicvine_metadata():
         app_logger.debug(f"DEBUG: ComicVine API key configured: {bool(api_key)}")
         app_logger.debug(f"DEBUG: API key value (first 10 chars): {api_key[:10] if api_key else 'EMPTY'}")
         app_logger.debug(f"DEBUG: All COMICVINE config keys in current_app.config: {[k for k in current_app.config.keys() if 'COMIC' in k.upper()]}")
-
-        # Also check the raw config file
-        from core.config import config as raw_config
-        raw_key = raw_config.get("SETTINGS", "COMICVINE_API_KEY", fallback="")
-        app_logger.debug(f"DEBUG: Raw config.ini value (first 10 chars): {raw_key[:10] if raw_key else 'EMPTY'}")
 
         if not api_key:
             app_logger.error("ComicVine API key not configured")

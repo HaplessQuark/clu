@@ -10,7 +10,7 @@ import zipfile
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
-from core.config import config, CONFIG_DIR
+from core.config import CONFIG_DIR, get_cache_dir
 from core.app_logging import app_logger
 from core.metadata_normalize import (
     normalize_credit_list,
@@ -74,7 +74,7 @@ def _db_appears_populated(db_path):
 def _migrate_db_to_config_dir():
     """Move comic_utils.db (and WAL/SHM sidecars) from the legacy CACHE_DIR
     location to CONFIG_DIR. No-op once migrated. Safe to run on every startup."""
-    legacy_dir = config.get("SETTINGS", "CACHE_DIR", fallback="/cache")
+    legacy_dir = get_cache_dir()
     legacy_db = os.path.join(legacy_dir, "comic_utils.db")
     new_db = get_db_path()
 
@@ -221,6 +221,11 @@ def _init_db_locked():
         # Enable foreign key enforcement for ON DELETE CASCADE
         c.execute("PRAGMA foreign_keys=ON")
 
+        # Read before anything below creates a table: an empty file is a fresh
+        # install, which the Guided Setup stamp at the end needs to know.
+        c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'")
+        _fresh_db = c.fetchone()[0] == 0
+
         # Create thumbnail_jobs table
         c.execute("""
             CREATE TABLE IF NOT EXISTS thumbnail_jobs (
@@ -261,6 +266,48 @@ def _init_db_locked():
             "CREATE INDEX IF NOT EXISTS idx_problem_files_open "
             "ON problem_files(dismissed_at, last_seen)"
         )
+
+        # file_health: the rolling library scan's per-file result (content hash
+        # plus integrity verdict). Its own table rather than columns on
+        # file_index because the index is rewritten wholesale by a rebuild, and
+        # a hash is the one thing here that is expensive to recompute. The row
+        # is only trusted while (size, mtime) still match the index. See
+        # core/library_health.py.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS file_health (
+                path TEXT PRIMARY KEY,
+                content_hash TEXT,
+                size INTEGER,
+                mtime REAL,
+                checked_at REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_health_hash "
+            "ON file_health(content_hash)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_health_checked "
+            "ON file_health(checked_at)"
+        )
+        # A dismissed duplicate group stays dismissed only while its member set
+        # is unchanged (members_sig), so a new copy turning up re-opens it.
+        # until_scan=1 is "I dealt with it elsewhere": the next library health
+        # scan drops the row, so a group that still exists comes back.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS duplicate_dismissals (
+                group_key TEXT PRIMARY KEY,
+                members_sig TEXT NOT NULL,
+                dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                until_scan INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        c.execute("PRAGMA table_info(duplicate_dismissals)")
+        if "until_scan" not in [col[1] for col in c.fetchall()]:
+            c.execute(
+                "ALTER TABLE duplicate_dismissals ADD COLUMN until_scan INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Create problem_file_replacements table.
         #
@@ -390,6 +437,25 @@ def _init_db_locked():
             c.execute("ALTER TABLE file_index ADD COLUMN ci_metronid INTEGER")
             app_logger.info("Migrating file_index: adding ci_metronid column")
 
+        # Migration: Add ci_provider -- which provider wrote the file's
+        # ComicInfo.xml, parsed from Notes by core.comicinfo.provider_from_notes.
+        # NULL = not yet read, '' = read and no recognisable provider, otherwise
+        # a ProviderType value (or 'manual'). The '' matters for the same reason
+        # ci_metronid's 0 does: it keeps untagged files out of the backfill queue
+        # in core/metadata_scanner.queue_provider_backfill().
+        if "ci_provider" not in columns:
+            c.execute("ALTER TABLE file_index ADD COLUMN ci_provider TEXT")
+            app_logger.info("Migrating file_index: adding ci_provider column")
+
+        # Migration: Add ci_cvid -- the ComicVine issue id, read from ComicInfo
+        # Web/Notes by core.comicinfo.comicvine_issue_id. Same contract as
+        # ci_metronid: NULL = not yet read, 0 = read and none, otherwise the id.
+        # A CBL names its issues by ComicVine id, so this turns a reading-list
+        # match into a lookup instead of a guess.
+        if "ci_cvid" not in columns:
+            c.execute("ALTER TABLE file_index ADD COLUMN ci_cvid INTEGER")
+            app_logger.info("Migrating file_index: adding ci_cvid column")
+
         # Create indexes for file_index table
         c.execute("CREATE INDEX IF NOT EXISTS idx_file_index_name ON file_index(name)")
         c.execute(
@@ -408,6 +474,12 @@ def _init_db_locked():
         )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_index_metronid ON file_index(ci_metronid)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_index_cvid ON file_index(ci_cvid)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_index_provider ON file_index(ci_provider)"
         )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_index_first_indexed ON file_index(first_indexed_at)"
@@ -804,6 +876,15 @@ def _init_db_locked():
         if "metron_id" not in rle_columns:
             app_logger.info("Migrating reading_list_entries table: adding metron_id column")
             c.execute("ALTER TABLE reading_list_entries ADD COLUMN metron_id INTEGER")
+        # The ComicVine ids a CBL carries in <Database Name="cv" Series= Issue=>.
+        # The issue id joins file_index.ci_cvid; the volume id joins a folder's
+        # cvinfo. Both were thrown away at parse time before.
+        if "cv_issue_id" not in rle_columns:
+            app_logger.info("Migrating reading_list_entries table: adding cv_issue_id column")
+            c.execute("ALTER TABLE reading_list_entries ADD COLUMN cv_issue_id INTEGER")
+        if "cv_volume_id" not in rle_columns:
+            app_logger.info("Migrating reading_list_entries table: adding cv_volume_id column")
+            c.execute("ALTER TABLE reading_list_entries ADD COLUMN cv_volume_id INTEGER")
         if "last_queued_at" not in rle_columns:
             # When the GetComics sweep last queued a download for this entry.
             #
@@ -1542,28 +1623,6 @@ def _init_db_locked():
                 """)
                 app_logger.info("Created default library with path /data")
 
-        # Migration: Move TIMEZONE from config.ini to user_preferences
-        try:
-            tz_value = config.get("SETTINGS", "TIMEZONE", fallback=None)
-            if tz_value is not None:
-                # Check if timezone is already in user_preferences
-                c.execute("SELECT value FROM user_preferences WHERE key = 'timezone'")
-                if not c.fetchone():
-                    import json
-                    c.execute(
-                        "INSERT OR REPLACE INTO user_preferences (key, value, category, updated_at) "
-                        "VALUES (?, ?, 'personalization', CURRENT_TIMESTAMP)",
-                        ("timezone", json.dumps(tz_value)),
-                    )
-                    app_logger.info(f"Migrated TIMEZONE '{tz_value}' from config.ini to user_preferences")
-                # Remove TIMEZONE from config.ini
-                config.remove_option("SETTINGS", "TIMEZONE")
-                from core.config import write_config
-                write_config()
-                app_logger.info("Removed TIMEZONE from config.ini")
-        except Exception as e:
-            app_logger.debug(f"TIMEZONE migration skipped or already done: {e}")
-
         # ---------------------------------------------------------------------
         # Multi-user support (RBAC + per-user data isolation)
         #
@@ -1868,6 +1927,16 @@ def _init_db_locked():
         """)
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_bulk_review_job ON bulk_metadata_review(job_id, status)"
+        )
+
+        # Guided Setup: decide once whether this install redirects to /setup
+        # (core/setup_state.py). Not from the libraries table -- the /data seed
+        # above fills it on every fresh install. A database that had tables
+        # before this run predates the wizard and is never redirected.
+        c.execute(
+            "INSERT OR IGNORE INTO user_preferences (key, value, category, updated_at) "
+            "VALUES ('guided_setup_state', ?, 'onboarding', CURRENT_TIMESTAMP)",
+            ('"none"' if _fresh_db else '"upgraded"',),  # JSON-encoded, as set_user_preference stores
         )
 
         conn.commit()
@@ -4219,49 +4288,91 @@ def find_file_index_paths_by_name(filename, limit=5):
         return []
 
 
+def normalize_issue_number(number):
+    """An issue number in comparable form: lowercase, trimmed, leading zeros
+    off the integer part. "001" -> "1", "050.LR" -> "50.lr", "0" -> "0".
+
+    Equality on this is the rule for "same issue". SQLite's CAST is not: it
+    reads the numeric prefix, so CAST('50.LR' AS REAL) = 50 and a variant
+    issue matched the regular one.
+    """
+    text = str(number or "").strip().lower().lstrip("#").strip()
+    # The sign is part of the number: "#-1" is its own issue, never #1.
+    m = re.match(r"^(-?)0*(\d+)(.*)$", text)
+    if m:
+        text = m.group(1) + m.group(2) + m.group(3)
+    return text.rstrip(".")
+
+
+def _series_like_pattern(series):
+    """A LIKE pattern matching ``series`` whatever its punctuation and spacing.
+
+    Every run of non-word characters becomes a wildcard, so "Amazing
+    Spider-Man: Sins Rising" finds "Amazing Spider-Man: Sins Rising" as well
+    as "Amazing Spider Man - Sins Rising". Normalising the column in SQL
+    instead cannot work: SQLite has no way to collapse the double space that
+    ": " leaves behind, so a single-spaced needle never matched a name with a
+    colon in it.
+
+    The pattern is NOT lowercased here: the query folds both sides with
+    SQLite's ``LOWER()``, which only folds ASCII. Lowercasing one side in
+    Python (Unicode-aware) would leave "Élektra" in the column against
+    "élektra" in the needle, and LIKE is case-sensitive outside ASCII.
+    """
+    words = re.findall(r"\w+", series or "")
+    return "%" + "%".join(words) + "%" if words else None
+
+
 def search_by_comic_metadata(series, number, volume=None, year=None, publisher=None, limit=20):
     """
     Search file_index using ComicInfo.xml metadata columns.
 
-    Matches on ci_series (LIKE) and ci_number (numeric or text equality).
+    The SQL is a coarse filter -- series words in order, numeric-ish issue
+    match -- and the issue number is then checked exactly in Python with
+    :func:`normalize_issue_number`. Series identity is left to the caller,
+    which already applies ``series_names_compatible``.
+
+    ``limit`` is applied AFTER the exact check, never in SQL: the series
+    filter is word-wildcarded, so "X-Men" #1 also returns every "Uncanny
+    X-Men" and "All-New X-Men" #1, and a SQL LIMIT could fill up with those
+    before "X-Men 001" sorted in. Rows come back closest name first.
     Returns list of dicts with name, path, type, parent, size, and ci_* fields.
     """
+    pattern = _series_like_pattern(series)
+    wanted = normalize_issue_number(number)
+    if not pattern or not wanted:
+        return []
     try:
-        conn = get_db_connection()
-        if not conn:
-            return []
-
-        c = conn.cursor()
-
-        # Clean series: replace ':' and '-' with spaces, remove special chars,
-        # then collapse whitespace so "Batman - Legends" / "Batman: Legends"
-        # both match "Batman Legends" in metadata
-        series_cleaned = re.sub(r'[^\w\s]', '', series.replace(':', ' ').replace('-', ' '))
-        series_normalized = re.sub(r'\s+', ' ', series_cleaned).strip()
-
-        c.execute(
-            """
-            SELECT name, path, type, size, parent,
-                   ci_series, ci_number, ci_volume, ci_year, ci_publisher
-            FROM file_index
-            WHERE has_comicinfo = 1
-              AND type = 'file'
-              AND LOWER(REPLACE(REPLACE(ci_series, ':', ' '), '-', ' ')) LIKE LOWER(?)
-              AND (
-                  (CAST(ci_number AS REAL) = CAST(? AS REAL) AND ci_number GLOB '[0-9]*')
-                  OR LOWER(TRIM(ci_number)) = LOWER(TRIM(?))
-              )
-            ORDER BY name ASC
-            LIMIT ?
-        """,
-            (f"%{series_normalized}%", number, number, limit),
-        )
-
-        rows = c.fetchall()
-        conn.close()
+        with db_conn() as conn:
+            if not conn:
+                return []
+            rows = conn.execute(
+                """
+                SELECT name, path, type, size, parent,
+                       ci_series, ci_number, ci_volume, ci_year, ci_publisher
+                FROM file_index
+                WHERE has_comicinfo = 1
+                  AND type = 'file'
+                  AND LOWER(ci_series) LIKE LOWER(?)
+                  AND (
+                      -- CAST of a blank or non-numeric value is 0, so the
+                      -- numeric arm needs a number (or a signed one) to read.
+                      (CAST(ci_number AS REAL) = CAST(? AS REAL)
+                       AND (TRIM(ci_number) GLOB '[0-9]*'
+                            OR TRIM(ci_number) GLOB '-[0-9]*'))
+                      OR LOWER(TRIM(ci_number)) = LOWER(TRIM(?))
+                  )
+                ORDER BY LOWER(ci_series) = LOWER(?) DESC,
+                         LENGTH(ci_series) ASC,
+                         name ASC
+                """,
+                (pattern, number, number, (series or "").strip()),
+            ).fetchall()
 
         results = []
         for row in rows:
+            if normalize_issue_number(row["ci_number"]) != wanted:
+                continue
             results.append({
                 "name": row["name"],
                 "path": row["path"],
@@ -4274,7 +4385,8 @@ def search_by_comic_metadata(series, number, volume=None, year=None, publisher=N
                 "ci_year": row["ci_year"],
                 "ci_publisher": row["ci_publisher"],
             })
-
+            if len(results) >= limit:
+                break
         return results
 
     except Exception as e:
@@ -4317,7 +4429,7 @@ def update_file_metadata(file_id, metadata_dict, scanned_at, has_comicinfo=None)
                 ci_volume = ?, ci_year = ?, ci_writer = ?, ci_penciller = ?,
                 ci_inker = ?, ci_colorist = ?, ci_letterer = ?, ci_coverartist = ?,
                 ci_publisher = ?, ci_genre = ?, ci_characters = ?,
-                ci_metronid = ?,
+                ci_metronid = ?, ci_provider = ?, ci_cvid = ?,
                 metadata_scanned_at = ?, has_comicinfo = ?
             WHERE id = ?
         """,
@@ -4341,6 +4453,9 @@ def update_file_metadata(file_id, metadata_dict, scanned_at, has_comicinfo=None)
                 # records "read it, no MetronId there" and keeps the file out of
                 # the backfill queue.
                 _as_metron_id(metadata_dict.get("ci_metronid")) or 0,
+                # '' = read, no recognisable provider (see the migration).
+                metadata_dict.get("ci_provider") or "",
+                _as_metron_id(metadata_dict.get("ci_cvid")) or 0,
                 scanned_at,
                 has_comicinfo if has_comicinfo is not None else 0,
                 file_id,
@@ -4676,7 +4791,17 @@ def set_has_comicinfo(file_path, value=1):
         return False
 
 
-def update_file_index_from_comicinfo(file_path, comicinfo_dict):
+def _cvid_for_index(comicinfo_dict, authoritative=False):
+    """ci_cvid for update_file_index_from_comicinfo: the id, 0 when the dict
+    is the whole archive and names none, else None (leave it to the scanner)."""
+    from core.comicinfo import comicvine_issue_id
+    cvid = comicvine_issue_id(comicinfo_dict.get("Web"), comicinfo_dict.get("Notes"))
+    if cvid:
+        return cvid
+    return 0 if authoritative else None
+
+
+def update_file_index_from_comicinfo(file_path, comicinfo_dict, authoritative=False):
     """
     Update file_index name and ci_ columns from a ComicInfo-style metadata dict.
 
@@ -4687,6 +4812,9 @@ def update_file_index_from_comicinfo(file_path, comicinfo_dict):
     Args:
         file_path: Path as stored in file_index (used for WHERE clause and name)
         comicinfo_dict: Dict with ComicInfo keys (Title, Series, Number, etc.)
+        authoritative: True when the archive was REPLACED with exactly this
+            dict (no merge), so a missing MetronId means the file has none and
+            ci_metronid is written as 0 rather than left to COALESCE.
 
     Returns:
         True if a row was updated, False otherwise
@@ -4761,7 +4889,9 @@ def update_file_index_from_comicinfo(file_path, comicinfo_dict):
                 ci_publisher = ?, ci_genre = ?, ci_characters = ?,
                 has_comicinfo = 1, metadata_scanned_at = ?,
                 modified_at = COALESCE(?, modified_at),
-                ci_metronid = COALESCE(?, ci_metronid)
+                ci_metronid = COALESCE(?, ci_metronid),
+                ci_provider = COALESCE(?, ci_provider),
+                ci_cvid = COALESCE(?, ci_cvid)
             WHERE path = ?
             """,
             (
@@ -4777,7 +4907,13 @@ def update_file_index_from_comicinfo(file_path, comicinfo_dict):
                 # carries the existing <MetronId> forward into the archive. Writing
                 # 0 here would contradict the file. Left NULL, the scanner picks it
                 # up and reads the truth out of the XML.
-                _as_metron_id(comicinfo_dict.get("MetronId")),
+                _as_metron_id(comicinfo_dict.get("MetronId")) or (0 if authoritative else None),
+                # Same COALESCE reasoning: no Notes in the dict means we do not
+                # know, so leave the column for the scanner to read from the XML.
+                _provider_for_index(comicinfo_dict.get("Notes")),
+                # Same COALESCE reasoning as ci_metronid: a merge may carry an
+                # existing CV id forward that this dict does not name.
+                _cvid_for_index(comicinfo_dict, authoritative),
                 file_path,
             ),
         )
@@ -4944,7 +5080,7 @@ def get_files_needing_metronid_backfill(limit=1000):
             WHERE type = 'file'
             AND (LOWER(path) LIKE '%.cbz' OR LOWER(path) LIKE '%.zip')
             AND has_comicinfo = 1
-            AND ci_metronid IS NULL
+            AND (ci_metronid IS NULL OR ci_cvid IS NULL)
             ORDER BY modified_at DESC
             LIMIT ?
             """,
@@ -5014,6 +5150,84 @@ def find_files_by_metron_ids(issue_ids):
         app_logger.error(f"Failed to map Metron issue ids to files: {e}")
         return {}
 
+
+
+def list_comic_dirs():
+    """Every directory in the file index, as paths -- or None when the index
+    could not be read. An empty list means "no folders"; the caller caches
+    it, so a failed read must not look the same."""
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return None
+            return [r["path"] for r in conn.execute(
+                "SELECT path FROM file_index WHERE type = 'directory'"
+            ).fetchall()]
+    except Exception as e:
+        app_logger.error(f"Failed to list indexed directories: {e}")
+        return None
+
+
+def files_in_dirs(dirs):
+    """The indexed files directly inside ``dirs``, with their ComicInfo
+    number and year. Used to pick one issue out of a folder identified by its
+    cvinfo."""
+    dirs = list(dirs or [])
+    if not dirs:
+        return []
+    out = []
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return []
+            for start in range(0, len(dirs), 500):
+                batch = dirs[start:start + 500]
+                placeholders = ",".join("?" * len(batch))
+                out.extend(dict(r) for r in conn.execute(
+                    f"""
+                    SELECT name, path, parent, ci_series, ci_number, ci_year,
+                           ci_volume
+                    FROM file_index
+                    WHERE type = 'file' AND parent IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall())
+        return out
+    except Exception as e:
+        app_logger.error(f"Failed to list files in folders: {e}")
+        return []
+
+
+def find_files_by_cv_ids(issue_ids):
+    """``{cv issue id: [path, ...]}`` for the files tagged from those ids.
+
+    The ComicVine twin of :func:`find_files_by_metron_ids`, joined on
+    ``file_index.ci_cvid``.
+    """
+    wanted = [p for p in (_as_metron_id(r) for r in (issue_ids or [])) if p]
+    if not wanted:
+        return {}
+    found = {}
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return {}
+            for start in range(0, len(wanted), 500):
+                batch = wanted[start:start + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = conn.execute(
+                    f"""
+                    SELECT path, ci_cvid FROM file_index
+                    WHERE type = 'file' AND ci_cvid IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    found.setdefault(row["ci_cvid"], []).append(row["path"])
+        return found
+    except Exception as e:
+        app_logger.error(f"Failed to map ComicVine issue ids to files: {e}")
+        return {}
 
 def get_metadata_scan_stats():
     """
@@ -6986,6 +7200,222 @@ def _as_metron_id(value):
     except (TypeError, ValueError, AttributeError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _provider_for_index(notes):
+    """The ci_provider value to store for ``notes``; None when Notes is absent.
+
+    None (not '') is what lets the UPDATE's COALESCE leave the column alone, so
+    the scanner can read the truth out of the XML. A Notes that is present but
+    unrecognisable stores '' -- "read it, no provider".
+    """
+    if notes is None or not str(notes).strip():
+        return None
+    from core.comicinfo import provider_from_notes
+    return provider_from_notes(notes) or ""
+
+
+def get_files_needing_provider_backfill(limit=1000):
+    """Already-scanned comics whose ci_provider has never been read.
+
+    Same shape and reasoning as :func:`get_files_needing_metronid_backfill`:
+    each scan writes a provider or '', so the result set shrinks to empty.
+    """
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return []
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT id, path, modified_at
+                FROM file_index
+                WHERE type = 'file'
+                AND (LOWER(path) LIKE '%.cbz' OR LOWER(path) LIKE '%.zip')
+                AND has_comicinfo = 1
+                AND ci_provider IS NULL
+                ORDER BY modified_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                {"id": r["id"], "path": r["path"], "modified_at": r["modified_at"]}
+                for r in c.fetchall()
+            ]
+    except Exception as e:
+        app_logger.error(f"Failed to get files needing ci_provider backfill: {e}")
+        return []
+
+
+def get_providers_for_paths(paths):
+    """Map each path to its stored ci_provider (None = unread, '' = none).
+
+    Paths with no file_index row are absent from the result. Returns None when
+    the database cannot be read.
+    """
+    out = {}
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return None
+            c = conn.cursor()
+            paths = list(paths)
+            for i in range(0, len(paths), 500):
+                chunk = paths[i:i + 500]
+                c.execute(
+                    f"SELECT path, has_comicinfo, ci_provider FROM file_index "
+                    f"WHERE path IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                for r in c.fetchall():
+                    out[r["path"]] = (
+                        "" if not r["has_comicinfo"] else r["ci_provider"]
+                    )
+        return out
+    except Exception as e:
+        app_logger.error(f"Failed to read providers for paths: {e}")
+        return None
+
+
+def get_provider_state_for_paths(paths):
+    """``{path: (has_comicinfo, ci_provider)}`` for the paths that are indexed.
+
+    Unlike :func:`get_providers_for_paths` this keeps "no ComicInfo.xml" apart
+    from "has ComicInfo.xml but no recognisable provider" (``ci_provider ==
+    ''``), which is the one state a user may set a provider on. Returns None when
+    the database cannot be read.
+    """
+    out = {}
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return None
+            c = conn.cursor()
+            paths = list(paths)
+            for i in range(0, len(paths), 500):
+                chunk = paths[i:i + 500]
+                c.execute(
+                    f"SELECT path, has_comicinfo, ci_provider FROM file_index "
+                    f"WHERE path IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+                for r in c.fetchall():
+                    out[r["path"]] = (r["has_comicinfo"], r["ci_provider"])
+        return out
+    except Exception as e:
+        app_logger.error(f"Failed to read provider state for paths: {e}")
+        return None
+
+
+def set_ci_provider(path, provider):
+    """Record a file's provider in the index, after its Notes were rewritten."""
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return False
+            c = conn.cursor()
+            c.execute("UPDATE file_index SET ci_provider = ? WHERE path = ?",
+                      (provider, path))
+            conn.commit()
+            return c.rowcount > 0
+    except Exception as e:
+        app_logger.error(f"Failed to set ci_provider for {path}: {e}")
+        return False
+
+
+def _folder_scope_sql(folder, recursive):
+    """WHERE fragment + params selecting comics under ``folder``.
+
+    Uses substr, not LIKE: LIKE is case-insensitive and treats % and _ as
+    wildcards, and library paths are stored byte-exact.
+    """
+    prefix = folder.rstrip("/\\") + "/"
+    sql = "type = 'file' AND substr(path, 1, ?) = ?"
+    params = [len(prefix), prefix]
+    if not recursive:
+        sql += " AND instr(substr(path, ?), '/') = 0"
+        params.append(len(prefix) + 1)
+    sql += " AND (LOWER(path) LIKE '%.cbz' OR LOWER(path) LIKE '%.zip')"
+    return sql, params
+
+
+def get_provider_mix(folder, recursive=True):
+    """Count the comics under ``folder`` by the provider that tagged them.
+
+    Returns ``{"providers": {id: n}, "untagged": n, "no_xml": n,
+    "unscanned": n, "total": n}`` or None when the database cannot be read
+    (an empty dict would read as "nothing here").
+
+    * ``untagged`` -- has ComicInfo.xml, no recognisable provider
+    * ``no_xml``   -- no ComicInfo.xml at all
+    * ``unscanned``-- ci_provider not read yet (the backfill has not got to it)
+    """
+    try:
+        where, params = _folder_scope_sql(folder, recursive)
+        with db_conn() as conn:
+            if not conn:
+                return None
+            c = conn.cursor()
+            c.execute(
+                f"""
+                SELECT has_comicinfo, ci_provider, COUNT(*) AS n
+                FROM file_index WHERE {where}
+                GROUP BY has_comicinfo, ci_provider
+                """,
+                params,
+            )
+            mix = {"providers": {}, "untagged": 0, "no_xml": 0, "unscanned": 0, "total": 0}
+            for r in c.fetchall():
+                n = r["n"]
+                mix["total"] += n
+                if not r["has_comicinfo"]:
+                    mix["no_xml"] += n
+                elif r["ci_provider"] is None:
+                    mix["unscanned"] += n
+                elif r["ci_provider"] == "":
+                    mix["untagged"] += n
+                else:
+                    mix["providers"][r["ci_provider"]] = (
+                        mix["providers"].get(r["ci_provider"], 0) + n
+                    )
+            return mix
+    except Exception as e:
+        app_logger.error(f"Failed to read provider mix for {folder}: {e}")
+        return None
+
+
+def get_files_by_provider(folder, recursive=True, providers=None,
+                          include_untagged=False, exclude_providers=None):
+    """Paths under ``folder`` whose ci_provider is in ``providers``.
+
+    ``include_untagged`` also takes files with ComicInfo.xml but no provider.
+    ``exclude_providers`` removes some (e.g. the target of a re-tag, so files
+    already tagged by it are skipped). Returns None on a read failure.
+    """
+    try:
+        where, params = _folder_scope_sql(folder, recursive)
+        where += " AND has_comicinfo = 1"
+        clauses = []
+        if providers:
+            clauses.append(f"ci_provider IN ({','.join('?' * len(providers))})")
+            params += list(providers)
+        if include_untagged:
+            clauses.append("ci_provider = ''")
+        if clauses:
+            where += " AND (" + " OR ".join(clauses) + ")"
+        if exclude_providers:
+            where += f" AND COALESCE(ci_provider, '') NOT IN ({','.join('?' * len(exclude_providers))})"
+            params += list(exclude_providers)
+        with db_conn() as conn:
+            if not conn:
+                return None
+            c = conn.cursor()
+            c.execute(f"SELECT path FROM file_index WHERE {where} ORDER BY path", params)
+            return [r["path"] for r in c.fetchall()]
+    except Exception as e:
+        app_logger.error(f"Failed to list files by provider under {folder}: {e}")
+        return None
 
 
 def _normalize_ci_metadata(metadata_dict):
@@ -10575,8 +11005,8 @@ def add_reading_list_entry(list_id, data):
             """
             INSERT INTO reading_list_entries
             (reading_list_id, series, issue_number, volume, year, issue_year,
-             metron_id, matched_file_path, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             metron_id, cv_issue_id, cv_volume_id, matched_file_path, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 list_id,
@@ -10586,6 +11016,8 @@ def add_reading_list_entry(list_id, data):
                 data.get("year"),
                 data.get("issue_year"),
                 data.get("metron_id"),
+                data.get("cv_issue_id"),
+                data.get("cv_volume_id"),
                 data.get("matched_file_path"),
                 next_sort,
             ),
@@ -14778,7 +15210,8 @@ def get_source_wall_files(parent_path, max_retries=3):
                 SELECT id, name, path, type, size, has_thumbnail, has_comicinfo,
                        ci_title, ci_series, ci_number, ci_count, ci_volume, ci_year,
                        ci_writer, ci_penciller, ci_inker, ci_colorist, ci_letterer,
-                       ci_coverartist, ci_publisher, ci_genre, ci_characters
+                       ci_coverartist, ci_publisher, ci_genre, ci_characters,
+                       ci_provider
                 FROM file_index
                 WHERE parent = ?
                 ORDER BY type DESC, name COLLATE NOCASE ASC
@@ -14816,6 +15249,56 @@ def get_source_wall_files(parent_path, max_retries=3):
             if conn:
                 conn.close()
             return [], []
+
+
+SOURCE_WALL_PROVIDER_UNTAGGED = "untagged"
+
+
+def get_source_wall_files_by_provider(scopes, provider, limit=500, offset=0):
+    """Comics under any of ``scopes`` tagged by ``provider``, with ci_ columns.
+
+    ``provider`` is a ProviderType value, ``manual``, or
+    :data:`SOURCE_WALL_PROVIDER_UNTAGGED` for files that have ComicInfo.xml but
+    no recognisable provider. Returns ``(files, total)`` or ``(None, 0)`` when
+    the database cannot be read -- ``[]`` must keep meaning "none tagged".
+    """
+    if not scopes:
+        return [], 0
+    try:
+        scope_sql, params = [], []
+        for scope in scopes:
+            frag, p = _folder_scope_sql(scope, True)
+            scope_sql.append(f"({frag})")
+            params += p
+        where = "(" + " OR ".join(scope_sql) + ") AND has_comicinfo = 1"
+        if provider == SOURCE_WALL_PROVIDER_UNTAGGED:
+            where += " AND ci_provider = ''"
+        else:
+            where += " AND ci_provider = ?"
+            params.append(provider)
+        with db_conn() as conn:
+            if not conn:
+                return None, 0
+            c = conn.cursor()
+            c.execute(f"SELECT COUNT(*) FROM file_index WHERE {where}", params)
+            total = c.fetchone()[0]
+            c.execute(
+                f"""
+                SELECT id, name, path, parent, type, size, has_thumbnail, has_comicinfo,
+                       ci_title, ci_series, ci_number, ci_count, ci_volume, ci_year,
+                       ci_writer, ci_penciller, ci_inker, ci_colorist, ci_letterer,
+                       ci_coverartist, ci_publisher, ci_genre, ci_characters,
+                       ci_provider
+                FROM file_index WHERE {where}
+                ORDER BY parent COLLATE NOCASE, name COLLATE NOCASE
+                LIMIT ? OFFSET ?
+                """,
+                params + [int(limit), int(offset)],
+            )
+            return [dict(r) for r in c.fetchall()], total
+    except Exception as e:
+        app_logger.error(f"Failed to list source wall files by provider: {e}")
+        return None, 0
 
 
 def update_file_index_ci_field(path, field, value):
@@ -15230,8 +15713,8 @@ def sync_reading_list_entries(list_id, new_entries, preserve_manual=True):
             c.execute(
                 """INSERT INTO reading_list_entries
                 (reading_list_id, series, issue_number, volume, year, issue_year,
-                 metron_id, matched_file_path, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                 metron_id, cv_issue_id, cv_volume_id, matched_file_path, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
                 (
                     list_id,
                     entry.get("series"),
@@ -15240,10 +15723,31 @@ def sync_reading_list_entries(list_id, new_entries, preserve_manual=True):
                     entry.get("year"),
                     entry.get("issue_year"),
                     entry.get("metron_id"),
+                    entry.get("cv_issue_id"),
+                    entry.get("cv_volume_id"),
                     entry.get("matched_file_path"),
                 ),
             )
             added_count += 1
+
+        # A kept entry may predate the id columns: fill what the source now
+        # names, never overwrite what is there. This is how a list imported
+        # before cv_issue_id existed picks the ids up on its next sync.
+        for key in to_keep:
+            new = new_by_key[key]
+            c.execute(
+                """UPDATE reading_list_entries
+                SET metron_id = COALESCE(metron_id, ?),
+                    cv_issue_id = COALESCE(cv_issue_id, ?),
+                    cv_volume_id = COALESCE(cv_volume_id, ?)
+                WHERE id = ?""",
+                (
+                    new.get("metron_id"),
+                    new.get("cv_issue_id"),
+                    new.get("cv_volume_id"),
+                    existing_by_key[key]["id"],
+                ),
+            )
 
         # Reorder all remaining entries to match new CBL sort order
         for sort_idx, key in enumerate(new_keys):

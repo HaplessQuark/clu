@@ -69,14 +69,15 @@ from routes.opds import opds_bp
 from models import gcd
 from models import metron
 from core.config import (
-    config,
     load_flask_config,
-    write_config,
     load_config,
     is_auto_metadata_on_move_enabled,
     is_download_packs_enabled,
+    get_watch_dir,
 )
-from core.auth import enforce_path_access, current_user, filter_paths_for_user
+from core.settings import all_settings, get_bool, get_int, get_list, get_setting
+from core.auth import enforce_path_access, current_user, filter_paths_for_user, file_op_refusal
+from helpers.library import is_allowed_path
 from cbz_ops.edit import (
     get_edit_modal,
     save_cbz,
@@ -106,7 +107,7 @@ from core.user_time import (
     user_offset_label,
     utc_now_iso,
 )
-from core.download_utils import issue_number_to_int
+from core.download_utils import issue_number_to_int, monitor_enabled
 from core.thumbnail_cache import (
     thumbnail_cache_path,
     is_thumbnail_stale,
@@ -114,6 +115,8 @@ from core.thumbnail_cache import (
     regenerate_thumbnail,
     set_job_status,
     prune_hidden_jobs,
+    is_in_flight,
+    submit_thumbnail_job,
 )
 from core.notifications import (
     EVENT_DEFS as NOTIFICATION_EVENT_DEFS,
@@ -226,6 +229,17 @@ load_config()
 # Initialize Database
 init_db()
 
+# api.py filled app.config at import, before this database existed. On the first
+# start after the config.ini import (and on a fresh volume) that was all
+# defaults -- trash, rename pattern, cache paths -- until the next settings save.
+# Re-run it now that the preferences are there. It keeps the secret key.
+load_flask_config(app)
+
+# Folder Monitoring was the MONITOR env var; import it into the setting once.
+from core.config import seed_monitor_from_env  # noqa: E402
+
+seed_monitor_from_env()
+
 # Multi-user: ensure a Store Owner account exists (implicit-owner mode for
 # single-user installs; seeded from CLU_USERNAME/CLU_PASSWORD when present).
 from core.database import seed_owner_if_needed
@@ -264,7 +278,6 @@ if not _db_ok:
         level="error",
     )
 
-# Migrate custom rename settings from config.ini to user_preferences DB (one-time)
 from core.database import (
     get_user_preference,
     set_user_preference,
@@ -272,19 +285,8 @@ from core.database import (
     delete_user_setting,
 )
 
-if get_user_preference("custom_rename_pattern") is None:
-    _ini_pattern = config.get("SETTINGS", "CUSTOM_RENAME_PATTERN", fallback="")
-    _ini_enabled = config.getboolean("SETTINGS", "ENABLE_CUSTOM_RENAME", fallback=False)
-    if _ini_pattern or _ini_enabled:
-        set_user_preference(
-            "custom_rename_pattern", _ini_pattern, category="file_processing"
-        )
-        set_user_preference(
-            "enable_custom_rename", _ini_enabled, category="file_processing"
-        )
-        app_logger.info(
-            "Migrated custom rename settings from config.ini to user_preferences DB"
-        )
+# The database exists now: finish the one-time config.ini import if it is owed.
+load_config()
 
 # Migrate the legacy {year} rename token to {volume_year} (one-time, in-place).
 # Exact literal replace never touches {cover_year}/{store_year}/{issue_year}.
@@ -296,45 +298,6 @@ if _stored_rename_pattern and "{year}" in _stored_rename_pattern:
         category="file_processing",
     )
     app_logger.info("Migrated rename token {year} -> {volume_year} in user_preferences DB")
-
-# Migrate bootstrap_theme from config.ini to user_preferences DB
-if get_user_preference("bootstrap_theme") is None:
-    _ini_theme = config.get("SETTINGS", "BOOTSTRAP_THEME", fallback="default")
-    set_user_preference("bootstrap_theme", _ini_theme, category="personalization")
-    app_logger.info("Migrated bootstrap_theme from config.ini to user_preferences DB")
-
-# Migrate recommendation settings from config.ini to user_preferences DB
-if get_user_preference("rec_enabled") is None:
-    set_user_preference(
-        "rec_enabled",
-        config.get("SETTINGS", "REC_ENABLED", fallback="True") == "True",
-        category="personalization",
-    )
-    set_user_preference(
-        "rec_provider",
-        config.get("SETTINGS", "REC_PROVIDER", fallback="gemini"),
-        category="personalization",
-    )
-    set_user_preference(
-        "rec_api_key",
-        config.get("SETTINGS", "REC_API_KEY", fallback=""),
-        category="personalization",
-    )
-    set_user_preference(
-        "rec_model",
-        config.get("SETTINGS", "REC_MODEL", fallback="gemini-2.0-flash"),
-        category="personalization",
-    )
-    app_logger.info(
-        "Migrated recommendation settings from config.ini to user_preferences DB"
-    )
-
-# Migrate custom headers from config.ini to user_preferences DB
-if get_user_preference("custom_headers") is None:
-    _ini_headers = config.get("SETTINGS", "HEADERS", fallback="")
-    if _ini_headers:
-        set_user_preference("custom_headers", _ini_headers, category="downloads")
-        app_logger.info("Migrated custom headers from config.ini to user_preferences DB")
 
 # Backup database on startup (only if changed since last backup).
 #
@@ -408,9 +371,21 @@ app.register_blueprint(notifications_bp)
 from routes.problem_files import problem_files_bp
 
 app.register_blueprint(problem_files_bp)
+from routes.library_health import library_health_bp
+
+app.register_blueprint(library_health_bp)
 from routes.database import database_bp
 
 app.register_blueprint(database_bp)
+from routes.folder_monitor import folder_monitor_bp
+
+app.register_blueprint(folder_monitor_bp)
+from routes.mylar_import import mylar_import_bp
+
+app.register_blueprint(mylar_import_bp)
+from routes.setup import setup_bp
+
+app.register_blueprint(setup_bp)
 
 # Start unified scheduler
 app_state.scheduler.start()
@@ -873,6 +848,11 @@ def process_incoming_wanted_issues():
                             "series_volume": series.get("volume"),
                             "mapped_path": mapped_path,
                             "store_date": store_date,
+                            "cover_date": issue.get("cover_date"),
+                            # The series' run, so two same-name series can be
+                            # told apart by the year a download carries.
+                            "volume_year": series.get("volume_year"),
+                            "year_end": series.get("year_end"),
                         }
                     )
 
@@ -1050,9 +1030,7 @@ def process_incoming_wanted_issues():
                 )
 
             # Only rename if AUTO_RENAME_MONITOR is enabled
-            auto_rename_monitor = config.getboolean(
-                "SETTINGS", "AUTO_RENAME_MONITOR", fallback=True
-            )
+            auto_rename_monitor = get_bool("AUTO_RENAME_MONITOR")
             final_path = temp_dest
             if auto_rename_monitor:
                 from cbz_ops.rename import get_renamed_filename
@@ -1527,8 +1505,7 @@ def scheduled_getcomics_download(dry_run=False, only_series_id=None, op_id=None)
                 search_count += 1
 
                 # Get variant search preferences
-                search_variants_str = config.get("SETTINGS", "VARIANT_TYPES", fallback="")
-                search_variants = [v.strip().lower() for v in search_variants_str.split(",") if v.strip()]
+                search_variants = [v.lower() for v in get_list("VARIANT_TYPES")]
 
                 # Build searchable context for logging
                 ctx_parts = [f"{series_name} #{issue_num}"]
@@ -1759,11 +1736,7 @@ def scheduled_getcomics_download(dry_run=False, only_series_id=None, op_id=None)
                     )
 
                     # Use config-driven provider priority
-                    priority_str = config.get(
-                        "SETTINGS",
-                        "DOWNLOAD_PROVIDER_PRIORITY",
-                        fallback="pixeldrain,download_now,mega",
-                    )
+                    priority_str = get_setting("DOWNLOAD_PROVIDER_PRIORITY")
                     downloads = []  # (part, provider, url, fallback_urls)
                     for part in parts:
                         (primary_provider, download_url), fallback_urls = select_download_url(
@@ -2901,6 +2874,14 @@ def scan_library_task():
                                     # once per startup, so the retry is bounded
                                     # to one attempt per restart.
                                     should_process = True
+                                elif status == "processing" and not is_in_flight(
+                                    full_path
+                                ):
+                                    # Orphaned: the job was queued by an
+                                    # earlier process and died with it (a
+                                    # restart, a worker kill). Nothing else
+                                    # will ever settle this row.
+                                    should_process = True
 
                             if should_process:
                                 # Update DB to mark as pending/processing and update mtime
@@ -2919,8 +2900,11 @@ def scan_library_task():
                                 # Queue the job
                                 cache_path = thumbnail_cache_path(full_path)
 
-                                thumbnail_executor.submit(
-                                    generate_thumbnail_task, full_path, cache_path
+                                submit_thumbnail_job(
+                                    thumbnail_executor,
+                                    generate_thumbnail_task,
+                                    full_path,
+                                    cache_path,
                                 )
                                 count_queued += 1
                             else:
@@ -3076,9 +3060,6 @@ from helpers import is_hidden
 
 # app = Flask(__name__)
 
-# Legacy constant for backwards compatibility - use get_library_roots() instead
-DATA_DIR = "/data"  # Directory to browse (deprecated, kept for compatibility)
-
 
 def get_target_dir_live():
     """Live accessor for the TARGET directory (reads from app.config).
@@ -3122,6 +3103,7 @@ def _run_target_cleanup():
 from helpers.library import (
     get_library_roots,
     get_default_library,
+    get_default_library_root,
     is_valid_library_path,
     get_library_for_path,
     watch_target_verdict,
@@ -3130,6 +3112,23 @@ from helpers.library import (
 #########################
 #   Recent Files Helper #
 #########################
+
+
+def _is_nested_library_folder(folder_path):
+    """True if *folder_path* is at least two levels below its library root.
+
+    The auto-metadata hooks run on series folders (``<root>/Publisher/Series``),
+    never on a library root or a publisher folder directly under it.
+    """
+    normalized = os.path.normpath(folder_path)
+    # Longest root first, so a library nested inside another is measured
+    # from its own root.
+    for root in sorted(get_library_roots(), key=len, reverse=True):
+        root_normalized = os.path.normpath(root)
+        if normalized.startswith(root_normalized + os.sep):
+            rel_path = os.path.relpath(normalized, root_normalized)
+            return "/" in rel_path.replace("\\", "/")
+    return False
 
 
 def log_file_if_in_data(file_path):
@@ -3572,10 +3571,11 @@ def rebuild_entire_cache():
 def warmup_cache():
     """Proactively cache frequently accessed directories."""
     _target = get_target_dir_live()
-    warmup_paths = [DATA_DIR, _target]
+    base_paths = [*get_library_roots(), _target]
+    warmup_paths = list(base_paths)
 
     # Add common subdirectories
-    for base_path in [DATA_DIR, _target]:
+    for base_path in base_paths:
         try:
             if os.path.exists(base_path):
                 subdirs = [
@@ -4376,7 +4376,6 @@ def update_index_on_move(old_path, new_path, reconcile=True):
         # Normalize paths for comparison
         normalized_old = os.path.normpath(old_path)
         normalized_new = os.path.normpath(new_path)
-        normalized_data_dir = os.path.normpath(DATA_DIR)
 
         # Get TARGET from app.config (the authoritative source)
         target_dir = app.config.get("TARGET", "/downloads/processed")
@@ -4391,18 +4390,12 @@ def update_index_on_move(old_path, new_path, reconcile=True):
                 # Fallback: Check if normalized path starts with TARGET folder
                 return path.startswith(normalized_target_dir)
 
-        # Check if old and new paths are in DATA_DIR using robust comparison
-        # Same logic as log_file_if_in_data() for consistency
-        def is_in_data_dir(path):
-            try:
-                common_path = os.path.commonpath([path, normalized_data_dir])
-                return os.path.samefile(common_path, normalized_data_dir)
-            except (ValueError, OSError):
-                # Fallback: Check if normalized path starts with DATA_DIR
-                return path.startswith(normalized_data_dir)
-
-        old_in_data = is_in_data_dir(normalized_old)
-        new_in_data = is_in_data_dir(normalized_new)
+        # "In the library" means under ANY enabled library root, not a
+        # hard-coded /data: a library at /comics made every move look like
+        # outside -> outside, so the index was never updated.
+        # Same predicate as log_file_if_in_data() for consistency.
+        old_in_data = is_valid_library_path(normalized_old)
+        new_in_data = is_valid_library_path(normalized_new)
         new_in_target = is_in_target_dir(normalized_new)
 
         # Debug logging to help diagnose path comparison issues
@@ -4413,7 +4406,7 @@ def update_index_on_move(old_path, new_path, reconcile=True):
             f"Path comparison - New: {normalized_new} (in_data: {new_in_data}, in_target: {new_in_target})"
         )
         app_logger.debug(
-            f"Path comparison - DATA_DIR: {normalized_data_dir}, TARGET_DIR: {normalized_target_dir}"
+            f"Path comparison - TARGET_DIR: {normalized_target_dir}"
         )
 
         # Skip files in TARGET_DIR - they should not be indexed
@@ -4425,7 +4418,7 @@ def update_index_on_move(old_path, new_path, reconcile=True):
 
         # Scenario 1: Moving INTO /data (from WATCH/TEMP) -> ADD to index
         if not old_in_data and new_in_data:
-            app_logger.info(f"📥 Adding to index (moved into /data): {new_path}")
+            app_logger.info(f"📥 Adding to index (moved into library): {new_path}")
             update_index_on_create(new_path)
             # Reconcile the destination series: prune now-satisfied wanted issues
             # and refresh the collection-status cache. This is the reliable hook
@@ -4441,14 +4434,14 @@ def update_index_on_move(old_path, new_path, reconcile=True):
 
         # Scenario 2: Moving OUT OF /data -> DELETE from index
         if old_in_data and not new_in_data:
-            app_logger.info(f"📤 Removing from index (moved out of /data): {old_path}")
+            app_logger.info(f"📤 Removing from index (moved out of library): {old_path}")
             update_index_on_delete(old_path)
             return
 
         # Scenario 3: Moving WITHIN /data -> UPDATE in index
         if old_in_data and new_in_data:
             app_logger.info(
-                f"🔄 Updating index (moved within /data): {old_path} -> {new_path}"
+                f"🔄 Updating index (moved within library): {old_path} -> {new_path}"
             )
 
             excluded_extensions = {
@@ -4691,51 +4684,16 @@ def update_index_on_create(path):
 
 
 # Canonical theme catalog now lives in core/themes.py so routes/ can import it
-# too. Re-bound here because other modules already read app.DARK_BOOTSWATCH_THEMES.
-from core.themes import BOOTSWATCH_THEMES, DARK_BOOTSWATCH_THEMES  # noqa: E402
-
-
-def _resolve_request_theme():
-    """The theme for this request: personal override, else the site default.
-
-    ``app.config["BOOTSTRAP_THEME"]`` is the site default (loaded at startup by
-    core.config.load_flask_config and kept live by /api/config/styling), so the
-    middle link of the fallback chain costs no query — only an identified user
-    with an override triggers a lookup, and that is one indexed PK hit.
-
-    Memoized on ``g`` because a single render can call the context processor
-    more than once. routes/auth.py's teardown clears the memo; without that,
-    pytest-flask's shared app context would leak one user's theme into another
-    user's request.
-    """
-    memo = getattr(g, "_clu_theme", None)
-    if memo is not None:
-        return memo
-
-    theme = None
-    try:
-        user = getattr(g, "current_user", None)
-        if user:
-            theme = get_user_setting_override("bootstrap_theme", user_id=user["id"])
-    except Exception:
-        # This runs on every render, including error pages — a DB hiccup here
-        # must degrade to the site default, not break the whole app.
-        theme = None
-
-    theme = theme or app.config.get("BOOTSTRAP_THEME", "default")
-    g._clu_theme = theme
-    return theme
+# too, and the theme template globals are injected by routes/auth.py. Re-bound
+# here because other modules already read app.DARK_BOOTSWATCH_THEMES.
+from core.themes import BOOTSWATCH_THEMES, DARK_THEMES as DARK_BOOTSWATCH_THEMES  # noqa: E402,F401
 
 
 @app.context_processor
 def inject_global_vars():
-    theme = _resolve_request_theme()
     return {
-        "monitor": os.getenv("MONITOR", "no"),
+        "monitor": "yes" if monitor_enabled() else "no",
         "version": __version__,
-        "bootstrap_theme": theme,
-        "theme_is_dark": theme in DARK_BOOTSWATCH_THEMES,
-        "bootswatch_themes": BOOTSWATCH_THEMES,
     }
 
 
@@ -4758,9 +4716,7 @@ def inject_metron_available():
 
 # app_logger, APP_LOG, and MONITOR_LOG are now imported from app_logging module
 # Set log level from config (default to INFO = debug disabled)
-debug_enabled = (
-    config.get("SETTINGS", "ENABLE_DEBUG_LOGGING", fallback="False") == "True"
-)
+debug_enabled = get_bool("ENABLE_DEBUG_LOGGING")
 app_logger.setLevel(logging.DEBUG if debug_enabled else logging.INFO)
 app_logger.info(
     f"App started successfully! (Debug logging: {'enabled' if debug_enabled else 'disabled'})"
@@ -4861,12 +4817,9 @@ def auto_fetch_comicvine_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check: Is this a non-root /data directory? (must have at least 2 path components after /data)
-        data_dir = DATA_DIR
-        rel_path = os.path.relpath(folder_path, data_dir)
-        # Normalize path separators for cross-platform compatibility
-        rel_path_normalized = rel_path.replace("\\", "/")
-        if rel_path == "." or "/" not in rel_path_normalized:
+        # Check: Is this a series folder inside a library? (at least 2 path
+        # components below the library root)
+        if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping auto-metadata for root-level directory: {folder_path}"
             )
@@ -4955,11 +4908,8 @@ def auto_fetch_metron_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check 3: Is this a non-root /data directory?
-        data_dir = DATA_DIR
-        rel_path = os.path.relpath(folder_path, data_dir)
-        rel_path_normalized = rel_path.replace("\\", "/")
-        if rel_path == "." or "/" not in rel_path_normalized:
+        # Check 3: Is this a series folder inside a library?
+        if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping Metron metadata for root-level directory: {folder_path}"
             )
@@ -5154,11 +5104,8 @@ def auto_fetch_comicvine_sqlite_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check: Is this a non-root /data directory?
-        data_dir = DATA_DIR
-        rel_path = os.path.relpath(folder_path, data_dir)
-        rel_path_normalized = rel_path.replace("\\", "/")
-        if rel_path == "." or "/" not in rel_path_normalized:
+        # Check: Is this a series folder inside a library?
+        if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping local ComicVine metadata for root-level directory: {folder_path}"
             )
@@ -6150,7 +6097,10 @@ def get_thumbnail():
         if served is not None:
             return served
 
-    if job and job["status"] == "processing":
+    # Trust a 'processing' row only while this process really has the job. The
+    # executor queue is in memory, so a restart orphans every queued row, and
+    # answering loading.svg for those meant a spinner that never ended.
+    if job and job["status"] == "processing" and is_in_flight(file_path):
         return redirect(url_for("static", filename="images/loading.svg"))
 
     if job and job["status"] == "error" and not file_changed_since(
@@ -6184,7 +6134,9 @@ def get_thumbnail():
         conn.close()
 
     # Submit task
-    thumbnail_executor.submit(generate_thumbnail_task, file_path, cache_path)
+    submit_thumbnail_job(
+        thumbnail_executor, generate_thumbnail_task, file_path, cache_path
+    )
 
     return redirect(url_for("static", filename="images/loading.svg"))
 
@@ -6433,6 +6385,14 @@ def restart_app():
         shutdown_checkpoint(timeout=5.0)
     except Exception as e:
         app_logger.warning(f"Restart checkpoint failed: {e}")
+    # execv keeps our pid, so the monitor would not notice its parent went
+    # away and the new process's monitor would find the lock still held.
+    try:
+        from core import monitor_supervisor
+
+        monitor_supervisor.stop()
+    except Exception as e:
+        app_logger.warning(f"Could not stop the folder monitor before restart: {e}")
     os.execv(sys.executable, ["python"] + sys.argv)
 
 
@@ -6544,11 +6504,9 @@ def save_file_processing_config():
         if not data:
             return jsonify({"success": False, "error": "No data provided"}), 400
 
-        # Ensure SETTINGS section exists
-        if "SETTINGS" not in config:
-            config["SETTINGS"] = {}
+        from core.settings import set_setting
 
-        # WATCH / TARGET live in user_preferences (not config.ini).
+        # WATCH / TARGET live in user_preferences.
         from core.database import set_user_preference as _set_pref_path
         new_watch = sanitize_config_value(data.get("watch", ""))
         new_target = sanitize_config_value(data.get("target", ""))
@@ -6570,32 +6528,21 @@ def save_file_processing_config():
         _set_pref_path("target", new_target, category="file_processing")
         app.config["WATCH"] = new_watch or "/downloads/temp"
         app.config["TARGET"] = new_target or "/downloads/processed"
-        from core.config import _mirror_watch_target_into_memory_config
-        _mirror_watch_target_into_memory_config()
 
-        config["SETTINGS"]["AUTOCONVERT"] = str(data.get("autoConvert", False))
-        config["SETTINGS"]["READ_SUBDIRECTORIES"] = str(
-            data.get("readSubdirectories", False)
-        )
-        config["SETTINGS"]["AUTO_RENAME_MONITOR"] = str(
-            data.get("autoRenameMonitor", True)
-        )
-        config["SETTINGS"]["MOVE_DIRECTORY"] = str(data.get("moveDirectory", False))
-        config["SETTINGS"]["CONSOLIDATE_DIRECTORIES"] = str(
-            data.get("consolidateDirectories", False)
-        )
-        config["SETTINGS"]["IGNORED_EXTENSIONS"] = data.get("ignored_extensions", "")
-        config["SETTINGS"]["AUTO_CLEANUP_ORPHAN_FILES"] = str(
-            data.get("autoCleanupOrphanFiles", False)
-        )
-        config["SETTINGS"]["CLEANUP_INTERVAL_HOURS"] = data.get(
-            "cleanupIntervalHours", "24"
-        )
-        config["SETTINGS"]["CONVERT_SUBDIRECTORIES"] = str(
-            data.get("convertSubdirectories", False)
-        )
-        config["SETTINGS"]["SKIPPED_FILES"] = data.get("skippedFiles", "")
-        config["SETTINGS"]["DELETED_FILES"] = data.get("deletedFiles", "")
+        # Absent means "not on this form", never "off".
+        if "monitorEnabled" in data:
+            set_setting("MONITOR_ENABLED", bool(data.get("monitorEnabled")))
+        set_setting("AUTOCONVERT", bool(data.get("autoConvert", False)))
+        set_setting("READ_SUBDIRECTORIES", bool(data.get("readSubdirectories", False)))
+        set_setting("AUTO_RENAME_MONITOR", bool(data.get("autoRenameMonitor", True)))
+        set_setting("MOVE_DIRECTORY", bool(data.get("moveDirectory", False)))
+        set_setting("CONSOLIDATE_DIRECTORIES", bool(data.get("consolidateDirectories", False)))
+        set_setting("IGNORED_EXTENSIONS", sanitize_config_value(data.get("ignored_extensions", "")))
+        set_setting("AUTO_CLEANUP_ORPHAN_FILES", bool(data.get("autoCleanupOrphanFiles", False)))
+        set_setting("CLEANUP_INTERVAL_HOURS", data.get("cleanupIntervalHours", "24"))
+        set_setting("CONVERT_SUBDIRECTORIES", bool(data.get("convertSubdirectories", False)))
+        set_setting("SKIPPED_FILES", sanitize_config_value(data.get("skippedFiles", "")))
+        set_setting("DELETED_FILES", sanitize_config_value(data.get("deletedFiles", "")))
 
         # Save hidden directories preference
         hidden_dirs_raw = data.get("hiddenDirectories", ["@eaDir"])
@@ -6610,29 +6557,12 @@ def save_file_processing_config():
         from helpers import reload_hidden_directories
         reload_hidden_directories()
 
-        config["SETTINGS"]["ENABLE_CUSTOM_RENAME"] = str(
-            data.get("enableCustomRename", False)
-        )
-        config["SETTINGS"]["CUSTOM_RENAME_PATTERN"] = data.get(
-            "customRenamePattern", ""
-        )
-        config["SETTINGS"]["ENABLE_AUTO_RENAME"] = str(
-            data.get("enableAutoRename", False)
-        )
+        set_setting("ENABLE_CUSTOM_RENAME", bool(data.get("enableCustomRename", False)))
+        set_setting("CUSTOM_RENAME_PATTERN", data.get("customRenamePattern", "") or "")
+        set_setting("ENABLE_AUTO_RENAME", bool(data.get("enableAutoRename", False)))
 
-        # Also persist custom rename settings to user_preferences DB
         from core.database import set_user_preference
 
-        set_user_preference(
-            "enable_custom_rename",
-            data.get("enableCustomRename", False),
-            category="file_processing",
-        )
-        set_user_preference(
-            "custom_rename_pattern",
-            data.get("customRenamePattern", ""),
-            category="file_processing",
-        )
         # Issue-number leading-zero width: none | 3 | 4 (allowlist; default 3).
         _issue_pad = str(data.get("issuePadWidth", "3")).strip().lower()
         if _issue_pad not in ("none", "3", "4"):
@@ -6774,16 +6704,20 @@ def save_file_processing_config():
             category="file_processing",
         )
 
-        config["SETTINGS"]["ENABLE_AUTO_MOVE"] = str(data.get("enableAutoMove", False))
-        config["SETTINGS"]["CUSTOM_MOVE_PATTERN"] = data.get(
-            "customMovePattern", "{publisher}/{series_name}/v{year}"
+        set_setting("ENABLE_AUTO_MOVE", bool(data.get("enableAutoMove", False)))
+        set_setting(
+            "CUSTOM_MOVE_PATTERN",
+            data.get("customMovePattern", "{publisher}/{series_name}/v{year}"),
         )
-        config["SETTINGS"]["TRASH_ENABLED"] = str(data.get("trashEnabled", True))
-        config["SETTINGS"]["TRASH_DIR"] = data.get("trashDir", "")
-        config["SETTINGS"]["TRASH_MAX_SIZE_MB"] = str(data.get("trashMaxSizeMb", 1024))
+        set_setting("TRASH_ENABLED", bool(data.get("trashEnabled", True)))
+        set_setting("TRASH_DIR", data.get("trashDir", "") or "")
+        set_setting("TRASH_MAX_SIZE_MB", data.get("trashMaxSizeMb", 1024))
 
-        write_config()
         load_flask_config(app)
+        # Apply a Folder Monitoring toggle now rather than at the next poll.
+        from core import monitor_supervisor
+
+        monitor_supervisor.poke()
         payload = {"success": True, "message": "File processing settings saved"}
         if path_warnings:
             # Saved, but the layout changes what the wanted scan will do. Say
@@ -6806,33 +6740,24 @@ def save_download_api_config():
         if not data:
             return jsonify({"success": False, "error": "No data provided"}), 400
 
-        # Ensure SETTINGS section exists
-        if "SETTINGS" not in config:
-            config["SETTINGS"] = {}
+        from core.settings import set_setting
 
-        # Update config values
-        set_user_preference("custom_headers", data.get("customHeaders", ""), category="downloads")
-        config["SETTINGS"]["PIXELDRAIN_API_KEY"] = sanitize_config_value(
-            data.get("pixeldrainApiKey", "")
-        )
-        config["SETTINGS"]["COMICVINE_API_KEY"] = sanitize_config_value(
-            data.get("comicvineApiKey", "")
-        )
-        config["SETTINGS"]["DOWNLOAD_PROVIDER_PRIORITY"] = data.get(
-            "downloadProviderPriority", "pixeldrain,download_now,mega"
+        set_setting("HEADERS", data.get("customHeaders", "") or "")
+        set_setting("PIXELDRAIN_API_KEY", sanitize_config_value(data.get("pixeldrainApiKey", "")))
+        set_setting(
+            "DOWNLOAD_PROVIDER_PRIORITY",
+            data.get("downloadProviderPriority", "pixeldrain,download_now,mega"),
         )
         # The Search Variant Settings fields share this tab's Save button but
-        # were never sent, so every edit to them was silently dropped. They
-        # stay in config.ini, where the scorer and bulk metadata read them, and
-        # are written only when sent so an older page cannot blank them.
+        # were never sent, so every edit to them was silently dropped. They are
+        # written only when sent so an older page cannot blank them.
         for field, key in (
             ("publicationTypes", "PUBLICATION_TYPES"),
             ("variantTypes", "VARIANT_TYPES"),
             ("oneshotFolders", "ONESHOT_FOLDERS"),
         ):
             if field in data:
-                config["SETTINGS"][key] = sanitize_config_value(str(data[field] or ""))
-        # config.ini is deprecated for new settings; this lives in user_preferences.
+                set_setting(key, sanitize_config_value(str(data[field] or "")))
         from core.config import PREF_DOWNLOAD_PACKS
         set_user_preference(
             PREF_DOWNLOAD_PACKS,
@@ -6859,7 +6784,6 @@ def save_download_api_config():
         except Exception:
             pass
 
-        write_config()
         load_flask_config(app)
         return jsonify({"success": True, "message": "Download & API settings saved"})
     except Exception as e:
@@ -6896,35 +6820,27 @@ def save_system_perf_config():
         if not data:
             return jsonify({"success": False, "error": "No data provided"}), 400
 
-        # Ensure SETTINGS section exists
-        if "SETTINGS" not in config:
-            config["SETTINGS"] = {}
+        from core.settings import set_setting, get_bool
 
-        # Update config values
-        config["SETTINGS"]["OPERATION_TIMEOUT"] = data.get("operationTimeout", "3600")
-        config["SETTINGS"]["LARGE_FILE_THRESHOLD"] = data.get(
-            "largeFileThreshold", "500"
-        )
+        set_setting("OPERATION_TIMEOUT", data.get("operationTimeout", "3600"))
+        set_setting("LARGE_FILE_THRESHOLD", data.get("largeFileThreshold", "500"))
         set_user_preference(
             "timezone", data.get("timezone", "UTC"), category="personalization"
         )
         # Schedule fields (REBUILD_*, SYNC_*, GETCOMICS_*) are owned by the
         # dedicated /api/save-*-schedule endpoints driven from the Schedules page.
-        config["SETTINGS"]["IGNORED_TERMS"] = data.get("ignored_terms", "")
-        config["SETTINGS"]["IGNORED_FILES"] = data.get("ignored_files", "")
-        config["SETTINGS"]["ENABLE_DEBUG_LOGGING"] = str(
-            data.get("enableDebugLogging", False)
-        )
-        config["SETTINGS"]["XML_YEAR"] = str(data.get("xmlYear", False))
-        config["SETTINGS"]["XML_MARKDOWN"] = str(data.get("xmlMarkdown", False))
-        config["SETTINGS"]["XML_LIST"] = str(data.get("xmlList", False))
-        write_config()
+        set_setting("IGNORED_TERMS", data.get("ignored_terms", "") or "")
+        set_setting("IGNORED_FILES", data.get("ignored_files", "") or "")
+        set_setting("ENABLE_DEBUG_LOGGING", bool(data.get("enableDebugLogging", False)))
+        set_setting("XML_YEAR", bool(data.get("xmlYear", False)))
+        set_setting("XML_MARKDOWN", bool(data.get("xmlMarkdown", False)))
+        set_setting("XML_LIST", bool(data.get("xmlList", False)))
         load_flask_config(app)
 
         # Update logger level dynamically
         import logging
 
-        if config["SETTINGS"]["ENABLE_DEBUG_LOGGING"] == "True":
+        if get_bool("ENABLE_DEBUG_LOGGING"):
             app_logger.setLevel(logging.DEBUG)
         else:
             app_logger.setLevel(logging.INFO)
@@ -7041,243 +6957,11 @@ def users_page():
     return render_template("users.html", current_page="/users")
 
 
-@app.route("/setup-owner")
-def setup_owner_page():
-    """First-run screen to set the Store Owner's credentials.
-
-    Only meaningful while the owner is a needs_setup placeholder; otherwise it
-    redirects home.
-    """
-    from core.database import get_owner_user
-
-    owner = get_owner_user()
-    if not owner or not owner.get("needs_setup"):
-        return redirect(url_for("index"))
-    return render_template("setup_owner.html", current_page="/setup-owner")
-
-
-@app.route("/config", methods=["GET", "POST"])
+@app.route("/config", methods=["GET"])
 def config_page():
-    if request.method == "POST":
-        # Ensure SETTINGS section exists
-        if "SETTINGS" not in config:
-            config["SETTINGS"] = {}
-
-        # Safely update config values
-        new_watch = sanitize_config_value(request.form.get("watch", ""))
-        new_target = sanitize_config_value(request.form.get("target", ""))
-
-        # Validate that watch and target are not the same
-        if new_watch and new_target and new_watch == new_target:
-            return jsonify(
-                {"error": "Watch and target folders cannot be the same"}
-            ), 400
-
-        # Validate that watch and target are not subdirectories of each other
-        if new_watch and new_target and (
-            new_watch.startswith(new_target + "/") or new_target.startswith(new_watch + "/")
-        ):
-            return jsonify(
-                {
-                    "error": "Watch and target folders cannot be subdirectories of each other"
-                }
-            ), 400
-
-        # /data is refused; a configured library root is saved with a warning.
-        # Same predicate as the other save handler and as the scan's own guard.
-        path_warnings = []
-        for label, value in (("WATCH", new_watch), ("TARGET", new_target)):
-            blocked, message = watch_target_verdict(label, value)
-            if blocked:
-                return jsonify({"error": message}), 400
-            if message:
-                path_warnings.append(message)
-
-        # WATCH / TARGET live in user_preferences (not config.ini).
-        from core.database import set_user_preference as _set_pref_path
-        _set_pref_path("watch", new_watch, category="file_processing")
-        _set_pref_path("target", new_target, category="file_processing")
-        app.config["WATCH"] = new_watch or "/downloads/temp"
-        app.config["TARGET"] = new_target or "/downloads/processed"
-        from core.config import _mirror_watch_target_into_memory_config
-        _mirror_watch_target_into_memory_config()
-
-        config["SETTINGS"]["IGNORED_TERMS"] = request.form.get("ignored_terms", "")
-        config["SETTINGS"]["IGNORED_FILES"] = request.form.get("ignored_files", "")
-        config["SETTINGS"]["IGNORED_EXTENSIONS"] = request.form.get(
-            "ignored_extensions", ""
-        )
-        config["SETTINGS"]["AUTOCONVERT"] = str(request.form.get("autoConvert") == "on")
-        config["SETTINGS"]["READ_SUBDIRECTORIES"] = str(
-            request.form.get("readSubdirectories") == "on"
-        )
-        config["SETTINGS"]["CONVERT_SUBDIRECTORIES"] = str(
-            request.form.get("convertSubdirectories") == "on"
-        )
-        config["SETTINGS"]["XML_YEAR"] = str(request.form.get("xmlYear") == "on")
-        config["SETTINGS"]["XML_MARKDOWN"] = str(
-            request.form.get("xmlMarkdown") == "on"
-        )
-        config["SETTINGS"]["XML_LIST"] = str(request.form.get("xmlList") == "on")
-        config["SETTINGS"]["MOVE_DIRECTORY"] = str(
-            request.form.get("moveDirectory") == "on"
-        )
-        config["SETTINGS"]["CONSOLIDATE_DIRECTORIES"] = str(
-            request.form.get("consolidateDirectories") == "on"
-        )
-        config["SETTINGS"]["AUTO_RENAME_MONITOR"] = str(
-            request.form.get("autoRenameMonitor") == "on"
-        )
-        config["SETTINGS"]["AUTO_CLEANUP_ORPHAN_FILES"] = str(
-            request.form.get("autoCleanupOrphanFiles") == "on"
-        )
-        config["SETTINGS"]["CLEANUP_INTERVAL_HOURS"] = request.form.get(
-            "cleanupIntervalHours", "1"
-        )
-        set_user_preference("custom_headers", request.form.get("customHeaders", ""), category="downloads")
-        config["SETTINGS"]["SKIPPED_FILES"] = request.form.get("skippedFiles", "")
-        config["SETTINGS"]["DELETED_FILES"] = request.form.get("deletedFiles", "")
-
-        # Save hidden directories preference
-        hidden_dirs_str = request.form.get("hiddenDirectories", "@eaDir")
-        hidden_dirs_list = [d.strip() for d in hidden_dirs_str.split(",") if d.strip()]
-        set_user_preference("hidden_directories", hidden_dirs_list, category="file_processing")
-        from helpers import reload_hidden_directories
-        reload_hidden_directories()
-        config["SETTINGS"]["OPERATION_TIMEOUT"] = request.form.get(
-            "operationTimeout", "3600"
-        )
-        config["SETTINGS"]["LARGE_FILE_THRESHOLD"] = request.form.get(
-            "largeFileThreshold", "500"
-        )
-        config["SETTINGS"]["PIXELDRAIN_API_KEY"] = sanitize_config_value(
-            request.form.get("pixeldrainApiKey", "")
-        )
-        config["SETTINGS"]["COMICVINE_API_KEY"] = sanitize_config_value(
-            request.form.get("comicvineApiKey", "")
-        )
-        # Save API credentials to DB (provider_credentials)
-        try:
-            from core.database import save_provider_credentials
-
-            metron_u = sanitize_config_value(request.form.get("metronUsername", ""))
-            metron_p = sanitize_config_value(request.form.get("metronPassword", ""))
-            if metron_u and metron_p:
-                # Merge: save_provider_credentials replaces the whole encrypted
-                # blob, so writing only the pair here would silently drop a
-                # saved API token.
-                existing = get_provider_credentials("metron") or {}
-                existing.update({"username": metron_u, "password": metron_p})
-                save_provider_credentials("metron", existing)
-            cv_key = sanitize_config_value(request.form.get("comicvineApiKey", ""))
-            if cv_key:
-                save_provider_credentials("comicvine", {"api_key": cv_key})
-        except Exception:
-            pass
-
-        config["SETTINGS"]["ENABLE_CUSTOM_RENAME"] = str(
-            request.form.get("enableCustomRename") == "on"
-        )
-        config["SETTINGS"]["CUSTOM_RENAME_PATTERN"] = request.form.get(
-            "customRenamePattern", ""
-        )
-        config["SETTINGS"]["ENABLE_AUTO_RENAME"] = str(
-            request.form.get("enableAutoRename") == "on"
-        )
-        # Issue-number leading-zero width: none | 3 | 4 (allowlist; default 3).
-        _issue_pad = str(request.form.get("issuePadWidth", "3")).strip().lower()
-        if _issue_pad not in ("none", "3", "4"):
-            _issue_pad = "3"
-        set_user_preference(
-            "issue_pad_width", _issue_pad, category="file_processing"
-        )
-        # PDF → CBZ page image format: jpeg | webp (allowlist; default jpeg).
-        _pdf_fmt = str(request.form.get("pdfImageFormat", "jpeg")).strip().lower()
-        if _pdf_fmt not in ("jpeg", "webp"):
-            _pdf_fmt = "jpeg"
-        set_user_preference(
-            "pdf_image_format", _pdf_fmt, category="file_processing"
-        )
-        config["SETTINGS"]["ENABLE_AUTO_MOVE"] = str(
-            request.form.get("enableAutoMove") == "on"
-        )
-        config["SETTINGS"]["CUSTOM_MOVE_PATTERN"] = request.form.get(
-            "customMovePattern", "{publisher}/{series_name}/v{year}"
-        )
-        config["SETTINGS"]["DOWNLOAD_PROVIDER_PRIORITY"] = request.form.get(
-            "downloadProviderPriority", "pixeldrain,download_now,mega"
-        )
-        config["SETTINGS"]["PUBLICATION_TYPES"] = request.form.get(
-            "publicationTypes", "annual,quarterly"
-        )
-        config["SETTINGS"]["VARIANT_TYPES"] = request.form.get(
-            "variantTypes", "annual,quarterly,tpB,oneshot,one-shot,o.s.,os,trade paperback,trade-paperback,omni,omnibus,omb,hardcover,deluxe,prestige,gallery,absolute"
-        )
-        config["SETTINGS"]["ONESHOT_FOLDERS"] = request.form.get(
-            "oneshotFolders", "oneshots,one-shots,specials"
-        )
-        config["SETTINGS"]["ENABLE_DEBUG_LOGGING"] = str(
-            request.form.get("enableDebugLogging") == "on"
-        )
-        set_user_preference(
-            "timezone", request.form.get("timezone", "UTC"), category="personalization"
-        )
-
-        # Styling and Recommendations are saved to user_preferences DB
-        set_user_preference(
-            "bootstrap_theme",
-            request.form.get("bootstrapTheme", "default"),
-            category="personalization",
-        )
-        app.config["BOOTSTRAP_THEME"] = request.form.get("bootstrapTheme", "default")
-
-        set_user_preference(
-            "rec_enabled",
-            request.form.get("recEnabled") == "on",
-            category="personalization",
-        )
-        set_user_preference(
-            "rec_provider",
-            request.form.get("recProvider", "gemini"),
-            category="personalization",
-        )
-        set_user_preference(
-            "rec_api_key", request.form.get("recApiKey", ""), category="personalization"
-        )
-        set_user_preference(
-            "rec_model",
-            request.form.get("recModel", "gemini-2.0-flash"),
-            category="personalization",
-        )
-        if "recBaseUrl" in request.form:
-            set_user_preference(
-                "rec_base_url",
-                request.form.get("recBaseUrl", "").strip(),
-                category="personalization",
-            )
-
-        write_config()  # Save changes to config.ini
-        load_flask_config(app)  # Reload into Flask config
-
-        # Update logger level dynamically
-        import logging
-
-        if config["SETTINGS"]["ENABLE_DEBUG_LOGGING"] == "True":
-            app_logger.setLevel(logging.DEBUG)
-            app_logger.info("Debug logging enabled")
-        else:
-            app_logger.setLevel(logging.INFO)
-            app_logger.info("Debug logging disabled")
-
-        # This handler redirects rather than returning JSON, so the warning can
-        # only go to the log. Said once per save, not per pass.
-        for message in path_warnings:
-            app_logger.warning(message)
-
-        return redirect(url_for("config_page"))
-
-    # Ensure SETTINGS section is a dictionary before accessing
-    settings = config["SETTINGS"] if "SETTINGS" in config else {}
+    # Saves go through the per-tab /api/config/* endpoints (core.settings).
+    # Typed stored settings; numbers the template interpolates stay strings.
+    st = all_settings()
 
     from core.database import get_user_preference
     from core import folder_thumbnails
@@ -7299,28 +6983,27 @@ def config_page():
         "config.html",
         watch=get_watch_dir() or "/downloads/temp",
         target=get_target_dir() or "/downloads/processed",
-        ignored_terms=settings.get("IGNORED_TERMS", ""),
-        ignored_files=settings.get("IGNORED_FILES", ""),
-        ignored_extensions=settings.get("IGNORED_EXTENSIONS", ""),
-        autoConvert=settings.get("AUTOCONVERT", "False") == "True",
-        readSubdirectories=settings.get("READ_SUBDIRECTORIES", "False") == "True",
-        convertSubdirectories=settings.get("CONVERT_SUBDIRECTORIES", "False") == "True",
+        ignored_terms=st["IGNORED_TERMS"],
+        ignored_files=st["IGNORED_FILES"],
+        ignored_extensions=st["IGNORED_EXTENSIONS"],
+        autoConvert=st["AUTOCONVERT"],
+        readSubdirectories=st["READ_SUBDIRECTORIES"],
+        convertSubdirectories=st["CONVERT_SUBDIRECTORIES"],
         pdfImageFormat=str(get_user_preference("pdf_image_format", default="jpeg") or "jpeg"),
-        xmlYear=settings.get("XML_YEAR", "False") == "True",
-        xmlMarkdown=settings.get("XML_MARKDOWN", "False") == "True",
-        xmlList=settings.get("XML_LIST", "False") == "True",
-        moveDirectory=settings.get("MOVE_DIRECTORY", "False") == "True",
-        consolidateDirectories=settings.get("CONSOLIDATE_DIRECTORIES", "False")
-        == "True",
-        autoRenameMonitor=settings.get("AUTO_RENAME_MONITOR", "True") == "True",
-        autoCleanupOrphanFiles=settings.get("AUTO_CLEANUP_ORPHAN_FILES", "False")
-        == "True",
-        cleanupIntervalHours=settings.get("CLEANUP_INTERVAL_HOURS", "1"),
-        trashEnabled=settings.get("TRASH_ENABLED", "True") == "True",
-        trashDir=settings.get("TRASH_DIR", ""),
-        trashMaxSizeMb=settings.get("TRASH_MAX_SIZE_MB", "1024"),
-        skippedFiles=settings.get("SKIPPED_FILES", ""),
-        deletedFiles=settings.get("DELETED_FILES", ""),
+        xmlYear=st["XML_YEAR"],
+        xmlMarkdown=st["XML_MARKDOWN"],
+        xmlList=st["XML_LIST"],
+        moveDirectory=st["MOVE_DIRECTORY"],
+        consolidateDirectories=st["CONSOLIDATE_DIRECTORIES"],
+        autoRenameMonitor=st["AUTO_RENAME_MONITOR"],
+        monitorEnabled=st["MONITOR_ENABLED"],
+        autoCleanupOrphanFiles=st["AUTO_CLEANUP_ORPHAN_FILES"],
+        cleanupIntervalHours=str(st["CLEANUP_INTERVAL_HOURS"]),
+        trashEnabled=st["TRASH_ENABLED"],
+        trashDir=st["TRASH_DIR"],
+        trashMaxSizeMb=str(st["TRASH_MAX_SIZE_MB"]),
+        skippedFiles=st["SKIPPED_FILES"],
+        deletedFiles=st["DELETED_FILES"],
         hiddenDirectories=get_user_preference("hidden_directories", ["@eaDir"]),
         autoFolderThumbnails=get_user_preference(
             "auto_folder_thumbnails", default=True
@@ -7329,19 +7012,18 @@ def config_page():
         folderThumbnailNestedOverlay=folder_thumbnails.nested_overlay_enabled(),
         folderThumbnailStyles=folder_thumbnails.style_choices(),
         customHeaders=get_user_preference("custom_headers", ""),
-        operationTimeout=settings.get("OPERATION_TIMEOUT", "3600"),
+        operationTimeout=str(st["OPERATION_TIMEOUT"]),
         autoMetadataOnMove=is_auto_metadata_on_move_enabled(),
         dateCheckMode=get_user_preference("date_check_mode", default="off"),
         dateCheckToleranceYears=get_user_preference(
             "date_check_tolerance_years", default=2),
-        largeFileThreshold=settings.get("LARGE_FILE_THRESHOLD", "500"),
-        pixeldrainApiKey=settings.get("PIXELDRAIN_API_KEY", ""),
-        comicvineApiKey=(_cv_creds.get("api_key", "") if _cv_creds else "")
-        or settings.get("COMICVINE_API_KEY", ""),
+        largeFileThreshold=str(st["LARGE_FILE_THRESHOLD"]),
+        pixeldrainApiKey=st["PIXELDRAIN_API_KEY"],
+        comicvineApiKey=(_cv_creds.get("api_key", "") if _cv_creds else ""),
         metronUsername=_metron_creds.get("username", "") if _metron_creds else "",
         metronPassword=_metron_creds.get("password", "") if _metron_creds else "",
-        enableCustomRename=settings.get("ENABLE_CUSTOM_RENAME", "False") == "True",
-        customRenamePattern=settings.get("CUSTOM_RENAME_PATTERN", ""),
+        enableCustomRename=st["ENABLE_CUSTOM_RENAME"],
+        customRenamePattern=st["CUSTOM_RENAME_PATTERN"],
         issuePadWidth=str(get_user_preference("issue_pad_width", default="3") or "3"),
         renameCleanSpacesEnabled=get_user_preference(
             "rename_clean_spaces_enabled", default=False
@@ -7363,25 +7045,20 @@ def config_page():
         smartRenameExcludeTerms=get_user_preference(
             "smart_rename_exclude_terms", default="Annual,Special"
         ) or "",
-        enableAutoRename=settings.get("ENABLE_AUTO_RENAME", "False") == "True",
-        enableAutoMove=settings.get("ENABLE_AUTO_MOVE", "False") == "True",
-        customMovePattern=settings.get(
-            "CUSTOM_MOVE_PATTERN", "{publisher}/{series_name}/v{year}"
-        ),
-        downloadProviderPriority=settings.get(
-            "DOWNLOAD_PROVIDER_PRIORITY", "pixeldrain,download_now,mega"
-        ),
-        publicationTypes=settings.get("PUBLICATION_TYPES", "annual,quarterly"),
-        variantTypes=settings.get("VARIANT_TYPES", "annual,quarterly,tpB,oneshot,one-shot,o.s.,os,trade paperback,trade-paperback,omni,omnibus,omb,hardcover,deluxe,prestige,gallery"),
-        oneshotFolders=settings.get("ONESHOT_FOLDERS", "oneshots,one-shots,specials"),
+        enableAutoRename=st["ENABLE_AUTO_RENAME"],
+        enableAutoMove=st["ENABLE_AUTO_MOVE"],
+        customMovePattern=st["CUSTOM_MOVE_PATTERN"],
+        downloadProviderPriority=st["DOWNLOAD_PROVIDER_PRIORITY"],
+        publicationTypes=st["PUBLICATION_TYPES"],
+        variantTypes=st["VARIANT_TYPES"],
+        oneshotFolders=st["ONESHOT_FOLDERS"],
         downloadPacks=is_download_packs_enabled(),
-        enableDebugLogging=settings.get("ENABLE_DEBUG_LOGGING", "False") == "True",
+        enableDebugLogging=st["ENABLE_DEBUG_LOGGING"],
         bootstrapTheme=get_user_preference("bootstrap_theme", default="default"),
         timezone=get_user_preference("timezone", default="UTC"),
         # Named exactly, for the Komga schedule card: the preference is a fixed
         # offset with no DST.
         timezone_label=user_offset_label(),
-        config=settings,  # Pass full settings dictionary
         rec_enabled=get_user_preference("rec_enabled", default=True),
         rec_provider=get_user_preference("rec_provider", default="gemini"),
         rec_api_key=get_user_preference("rec_api_key", default=""),
@@ -7408,6 +7085,31 @@ def config_page():
 def stream_logs(script_type):
     file_path = request.args.get("file_path")  # Get file_path for single_file script
     directory = request.args.get("directory")  # Get directory for rebuild/rename script
+
+    # GHSA-4v7f-qm46-8fw4: this is a state-changing GET (it deletes, rewrites
+    # and converts files), so a cross-site request must never reach it. Browsers
+    # label every request with Sec-Fetch-Site; EventSource cannot set a custom
+    # header, so this is the CSRF check that works for a GET-driven SSE stream.
+    if request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+        return Response("Cross-site requests are not allowed.", status=403)
+    origin = request.headers.get("Origin")
+    if origin and origin != request.host_url.rstrip("/"):
+        return Response("Cross-origin requests are not allowed.", status=403)
+
+    # Confine the target to the libraries / WATCH / TARGET (realpath, so a
+    # symlink out is refused too), then apply the per-user folder grants. Both
+    # run before any existence check so a denied path looks like a missing one.
+    # The deny messages are deliberately the same for both parameters.
+    for target in (file_path, directory):
+        if target is None:
+            continue
+        if not is_allowed_path(target):
+            return Response("Invalid path.", status=400)
+        if script_type == "delete" and is_critical_path(target):
+            return Response("Invalid path.", status=400)
+        refusal = file_op_refusal(os.path.realpath(target))
+        if refusal:
+            return Response(refusal[0], status=refusal[1])
 
     # Define supported script types for single file actions
     single_file_scripts = [
@@ -7530,9 +7232,7 @@ def stream_logs(script_type):
 
         def generate_logs():
             # Set longer timeout for large file operations
-            timeout_seconds = int(
-                config.get("SETTINGS", "OPERATION_TIMEOUT", fallback="3600")
-            )
+            timeout_seconds = get_int("OPERATION_TIMEOUT")
 
             # Track conversion/rebuild operations
             op_id = None
@@ -7671,12 +7371,11 @@ def index():
     from routes.collection import get_dashboard_sections
 
     # These environment variables are set/updated by load_config_into_env()
-    watch = config.get("SETTINGS", "WATCH", fallback="/temp")
-    convert_subdirectories = config.getboolean(
-        "SETTINGS", "CONVERT_SUBDIRECTORIES", fallback=False
-    )
+    watch = get_watch_dir() or "/downloads/temp"
+    convert_subdirectories = get_bool("CONVERT_SUBDIRECTORIES")
     return render_template(
         "collection.html",
+        default_library_root=get_default_library_root(),
         watch=watch,
         config=app.config,
         convertSubdirectories=convert_subdirectories,
@@ -7778,36 +7477,8 @@ app.add_url_rule("/save", view_func=save_cbz, methods=["POST"])
 #########################
 #    Monitor Process    #
 #########################
-monitor_process = None  # Track subprocess
-
-
-def run_monitor():
-    global monitor_process
-    app_logger.info("Attempting to start monitor.py...")
-
-    monitor_process = subprocess.Popen(
-        [sys.executable, "monitor.py"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = monitor_process.communicate()
-    if stdout:
-        app_logger.info(f"monitor.py stdout:\n{stdout}")
-    if stderr:
-        app_logger.error(f"monitor.py stderr:\n{stderr}")
-
-
-def cleanup():
-    """Terminate monitor.py before shutdown."""
-    if monitor_process and monitor_process.poll() is None:
-        app_logger.info("Terminating monitor.py process...")
-        monitor_process.terminate()
-        try:
-            monitor_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            app_logger.warning("Monitor did not terminate in time. Force killing...")
-            monitor_process.kill()
+# monitor.py is started and stopped by core.monitor_supervisor, following the
+# monitor_enabled setting -- see that module.
 
 
 def shutdown_server():
@@ -7831,7 +7502,9 @@ def shutdown_server():
     """
     app_logger.info("Shutting down Flask...")
     try:
-        cleanup()
+        from core import monitor_supervisor
+
+        monitor_supervisor.stop()
     except Exception as e:
         app_logger.warning(f"Monitor cleanup failed during shutdown: {e}")
     try:
@@ -7878,9 +7551,8 @@ def watch_count():
     if _watch_count_cache["value"] is not None and (now - _watch_count_cache["ts"]) < _WATCH_COUNT_TTL:
         return jsonify({"total_files": _watch_count_cache["value"]})
 
-    watch_dir = config.get("SETTINGS", "WATCH", fallback="/temp")
-    ignored_exts = config.get("SETTINGS", "IGNORED_EXTENSIONS", fallback=".crdownload")
-    ignored = set(ext.strip().lower() for ext in ignored_exts.split(",") if ext.strip())
+    watch_dir = get_watch_dir() or "/downloads/temp"
+    ignored = set(ext.lower() for ext in get_list("IGNORED_EXTENSIONS"))
 
     total = 0
     for root, _, files in os.walk(watch_dir):
@@ -8140,7 +7812,7 @@ def api_wrapped_image(year, slide_num):
 
     # Get current theme from config
     # Get current theme from config
-    theme = config.get("SETTINGS", "BOOTSTRAP_THEME", fallback="default")
+    theme = get_setting("BOOTSTRAP_THEME")
 
     try:
         if slide_num == 1:
@@ -8165,7 +7837,7 @@ def api_wrapped_download(year):
     from wrapped import generate_all_wrapped_images
     import zipfile
 
-    theme = config.get("SETTINGS", "BOOTSTRAP_THEME", fallback="default")
+    theme = get_setting("BOOTSTRAP_THEME")
 
     try:
         slides = generate_all_wrapped_images(year, theme)
@@ -8218,7 +7890,7 @@ def api_monthly_wrapped_image(year, month, slide_num):
     if slide_num not in (1, 2):
         return jsonify({"error": "Invalid slide number (1-2)"}), 400
 
-    theme = config.get("SETTINGS", "BOOTSTRAP_THEME", fallback="default")
+    theme = get_setting("BOOTSTRAP_THEME")
 
     try:
         if slide_num == 1:
@@ -8241,7 +7913,7 @@ def api_monthly_wrapped_download(year, month):
     if month < 1 or month > 12:
         return jsonify({"error": "Invalid month (1-12)"}), 400
 
-    theme = config.get("SETTINGS", "BOOTSTRAP_THEME", fallback="default")
+    theme = get_setting("BOOTSTRAP_THEME")
 
     try:
         slides = generate_all_monthly_wrapped(year, month, theme)
@@ -8307,33 +7979,36 @@ def cache_maintenance_background():
 
 # Pre-build browse cache for root directory
 def prebuild_browse_cache():
-    """Pre-build browse cache for DATA_DIR root on startup."""
-    try:
-        app_logger.info(f"🔄 Pre-building browse cache for {DATA_DIR}...")
-        # Trigger a browse request internally to build and cache
-        from routes.collection import api_browse
+    """Pre-build browse cache for every library root on startup."""
+    from urllib.parse import quote
+    from routes.collection import api_browse
 
-        with app.test_request_context(f"/api/browse?path={DATA_DIR}"):
-            api_browse()
-        app_logger.info(f"✅ Browse cache pre-built for {DATA_DIR}")
-    except Exception as e:
-        app_logger.error(f"❌ Error pre-building browse cache: {e}")
+    for root in get_library_roots():
+        try:
+            app_logger.info(f"🔄 Pre-building browse cache for {root}...")
+            # Trigger a browse request internally to build and cache
+            with app.test_request_context(f"/api/browse?path={quote(root)}"):
+                api_browse()
+            app_logger.info(f"✅ Browse cache pre-built for {root}")
+        except Exception as e:
+            app_logger.error(f"❌ Error pre-building browse cache for {root}: {e}")
 
 
-# Start file watcher for /data directory in background
+# Start a file watcher for each library root in background
 def start_file_watcher_background():
-    try:
-        app_logger.info(f"Initializing file watcher for {DATA_DIR}...")
-        file_watcher = FileWatcher(watch_path=DATA_DIR, debounce_seconds=2)
-        if file_watcher.start():
-            app_logger.info(
-                f"👁️ File watcher started for {DATA_DIR} (tracking recent files)..."
-            )
-        else:
-            app_logger.warning("⚠️ File watcher failed to start")
-    except Exception as e:
-        app_logger.error(f"❌ Failed to initialize file watcher: {e}")
-        app_logger.error(f"Traceback: {traceback.format_exc()}")
+    for root in get_library_roots():
+        try:
+            app_logger.info(f"Initializing file watcher for {root}...")
+            file_watcher = FileWatcher(watch_path=root, debounce_seconds=2)
+            if file_watcher.start():
+                app_logger.info(
+                    f"👁️ File watcher started for {root} (tracking recent files)..."
+                )
+            else:
+                app_logger.warning(f"⚠️ File watcher failed to start for {root}")
+        except Exception as e:
+            app_logger.error(f"❌ Failed to initialize file watcher for {root}: {e}")
+            app_logger.error(f"Traceback: {traceback.format_exc()}")
 
 
 def start_metadata_scanner_background():
@@ -8382,6 +8057,18 @@ def scheduled_db_backup():
     backup_database(max_backups=3)
 
 
+def scheduled_library_health():
+    """Wrapper. The body is core.library_health.run_scheduled_scan.
+
+    A wrapper on purpose: app.py cannot be imported in tests, so a body left
+    here would be assertable only through the AST. Same reason
+    scheduled_db_health_check is one. Opt-in and interval-gated inside the body.
+    """
+    from core.library_health import run_scheduled_scan
+
+    run_scheduled_scan()
+
+
 def scheduled_comicvine_db_update():
     """Wrapper. The body is core.comicvine_db_update.run_scheduled_update.
 
@@ -8414,6 +8101,18 @@ def start_background_services():
         trigger=CronTrigger(hour=3, minute=17),
         id="db_backup",
         name="Daily Database Backup",
+        replace_existing=True,
+    )
+
+    # Library health scan: a heartbeat. Whether it does anything, and how often,
+    # is the opt-in and interval inside run_scheduled_scan() (gated on a persisted
+    # timestamp, for the reason given for the ComicVine job below).
+    app_state.scheduler.add_job(
+        scheduled_library_health,
+        trigger=IntervalTrigger(minutes=30, jitter=120),
+        id="library_health_scan",
+        name="Library Health Scan",
+        next_run_time=datetime.now() + timedelta(minutes=20),
         replace_existing=True,
     )
 
@@ -8521,10 +8220,11 @@ def start_background_services():
     # Configure Reading List sync schedule from database
     configure_reading_list_sync_schedule()
 
-    # Start monitor if enabled
-    if os.environ.get("MONITOR", "").strip().lower() == "yes":
-        app_logger.info("MONITOR=yes detected. Starting monitor.py...")
-        threading.Thread(target=run_monitor, daemon=True).start()
+    # Folder Monitoring: runs monitor.py while the monitor_enabled setting is
+    # on, and applies a change to it without a restart.
+    from core import monitor_supervisor
+
+    monitor_supervisor.start()
 
     if pwd is not None:
         user_name = pwd.getpwuid(os.geteuid()).pw_name

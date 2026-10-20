@@ -146,13 +146,9 @@ done
 
 # Ensure new sub-folders inherit the share's group (NAS-friendly, avoids needing 777).
 # setgid is inherited by child dirs, so this propagates to future folders automatically.
-# Guard the read: on a fresh install /config/config.ini may not exist yet, and under
-# `set -euo pipefail` a failing awk (exit 2) would otherwise terminate the container.
-CFG_TARGET=""
-if [ -f /config/config.ini ]; then
-  CFG_TARGET="$(awk -F= '/^TARGET/ {print $2}' /config/config.ini 2>/dev/null | tr -d '\r' || true)"
-fi
-for p in /data /downloads /cache "${CFG_TARGET}"; do
+# TARGET lives in the database now (user_preferences), not config.ini, so it is
+# not read here; /downloads (its default parent) is covered by the list below.
+for p in /data /downloads /cache; do
   [ -n "$p" ] || continue
   [ -d "$p" ] || continue
   chmod g+s "$p" 2>/dev/null || true   # non-recursive, fast; failures on Windows mounts are harmless
@@ -257,10 +253,6 @@ done
 
 # Show who we plan to run as (helps with Unraid troubleshooting)
 echo "Starting as UID:GID ${PUID}:${PGID} (umask ${UMASK})"
-# Defaulted, not bare: the image sets ENV MONITOR=no, but under `set -u` a
-# container started without it would abort on this echo -- one more way to die
-# mid-script with nothing useful in the log.
-echo "MONITOR=${MONITOR:-no}"
 
 # Decide who to run as based on writability of key paths
 TARGET_USER="${PUID}:${PGID}"
@@ -270,7 +262,7 @@ RUN_AS_ROOT=0
 can_write() { gosu "${TARGET_USER}" sh -c "touch \"$1\"/.writetest && rm -f \"$1\"/.writetest"; }
 
 NEED_ROOT=0
-for p in /downloads/temp /downloads/processed /data /cache "${CFG_TARGET}" ; do
+for p in /downloads/temp /downloads/processed /data /cache ; do
   [ -n "$p" ] || continue
   [ -d "$p" ] || continue
   if ! can_write "$p" 2>/dev/null ; then

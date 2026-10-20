@@ -24,7 +24,19 @@
 {% include 'partials/toast_container.html' %}
 
 <div class="container-lg">
-    <h2 class="text-primary-emphasis">App Settings</h2>
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <h2 class="text-primary-emphasis mb-0">App Settings</h2>
+        <div class="d-flex flex-wrap gap-2">
+            <a href="{{ url_for('setup.setup_page') }}" class="btn btn-outline-primary btn-sm"
+                title="Walk through the setup, or check what is configured and what needs attention">
+                <i class="bi bi-signpost-split me-1"></i>Run Guided Setup
+            </a>
+            <a href="{{ url_for('mylar_import.mylar_import_page') }}" class="btn btn-outline-secondary btn-sm"
+                title="Import the watchlist, download client, indexers and ComicVine key from Mylar3">
+                <i class="bi bi-box-arrow-in-down me-1"></i>Import from Mylar3
+            </a>
+        </div>
+    </div>
     <div class="mt-4">
 
         <!-- Navigation Tabs -->
@@ -121,6 +133,25 @@
                     <p class="text-muted">Configure the <code>Watched</code> and <code>Target</code> folders. Other
                         monitoring features can be adjusted here as well.</p>
 
+                    <div class="row mb-3">
+                        <div class="col-12">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="monitorEnabled"
+                                    name="monitorEnabled" {% if monitorEnabled %}checked{% endif %}>
+                                <label class="form-check-label" for="monitorEnabled">
+                                    Enable Folder Monitoring
+                                </label>
+                                <span id="monitorStatusBadge" class="badge bg-secondary ms-2">Checking...</span>
+                                <small class="form-text text-muted">
+                                    <br />Watches your <code>WATCH</code> folder and renames, converts and moves
+                                    anything that lands there into <code>TARGET</code>. Needed for Usenet, DC++
+                                    and files you drop into the folder yourself; CLU's own downloads are
+                                    processed either way. Takes effect when you save, without a restart.
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="row">
                         <div class="col-md-6">
                             <label for="watch" class="form-label">WATCH:</label>
@@ -205,12 +236,14 @@
                                     id="autoRenameMonitor" name="autoRenameMonitor" {% if
                                     autoRenameMonitor %}checked{% endif %}>
                                 <label class="form-check-label" for="autoRenameMonitor">
-                                    Auto-Rename on Move
+                                    Clean Up File Names as They Are Processed
                                 </label>
                                 <small class="form-text text-muted">
-                                    <br />When enabled, files will be automatically renamed using
-                                    the built-in naming rules when moved from your
-                                    <code>{{ watch }}</code> folder.
+                                    <br />Files leaving your <code>{{ watch }}</code> folder have scanner
+                                    and release-group tags and other clutter removed, leaving a name like
+                                    <code>Series 001 (2024).cbz</code>. Works from the file name alone, so no
+                                    metadata is needed. This is not renaming from metadata; with
+                                    <em>Name Files with My Own Pattern</em> on, your pattern is used instead.
                                 </small>
                             </div>
                         </div>
@@ -382,8 +415,8 @@
                 <!-- Custom Rename Pattern Configuration -->
                 <div class="container p-4 border rounded shadow-sm mb-4">
                     <h4>Custom Naming Settings</h4>
-                    <p class="text-muted">Configure custom patterns for renaming comic files. You can use variables to
-                        create your own naming convention, or leave empty to use the default rename logic.</p>
+                    <p class="text-muted">Your own naming convention for comic files, built from variables. Without
+                        one, CLU uses its built-in clean-up name (<code>Series 001 (2024)</code>).</p>
 
                     <div class="row">
                         <!-- Enable Custom Rename -->
@@ -391,11 +424,13 @@
                             <div class="form-check form-switch mb-3">
                                 <input class="form-check-input" type="checkbox" role="switch" id="enableCustomRename"
                                     name="enableCustomRename" {% if enableCustomRename %}checked{% endif %}>
-                                <label class="form-check-label" for="enableCustomRename">Use Custom Rename
-                                    Patterns</label>
+                                <label class="form-check-label" for="enableCustomRename">Name Files with My Own
+                                    Pattern</label>
                                 <small class="form-text text-muted">
-                                    <br />If enabled, files will be renamed using your custom pattern instead of the
-                                    default rename logic.
+                                    <br />Bulk and automatic tagging rename each comic they tag to this pattern,
+                                    filled from its metadata. With <em>Clean Up File Names</em> on, files leaving
+                                    WATCH use it too, filled from the file name and any ComicInfo.xml. A token
+                                    with nothing to fill it is left out.
                                 </small>
                             </div>
                         </div>
@@ -404,9 +439,11 @@
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch" id="enableAutoRename"
                                     name="enableAutoRename" {% if enableAutoRename %}checked{% endif %}>
-                                <label class="form-check-label" for="enableAutoRename">Auto-Rename Files</label>
+                                <label class="form-check-label" for="enableAutoRename">Rename a Comic When I Tag It</label>
                                 <small class="form-text text-muted">
-                                    <br />Automatically rename files after metadata is fetched from the API.
+                                    <br />After you fetch metadata for a single comic, rename it from that metadata,
+                                    to your pattern or else to <code>Series 001</code>. Bulk and automatic
+                                    tagging follow <em>Name Files with My Own Pattern</em> instead.
                                 </small>
                             </div>
                         </div>
@@ -419,12 +456,14 @@
                                 value="{{ customRenamePattern }}" class="form-control"
                                 placeholder="e.g., {series_name} {issue_number} ({volume_year})">
                             <small class="form-text text-muted">
-                                Use variables to create your naming pattern. Available variables:
-                                <code>{series_name}</code>, <code>{volume_number}</code>,
-                                <code>{volume_year}</code> (series/volume start year),
-                                <code>{issue_year}</code> (this issue's year, from ComicInfo.xml),
-                                <code>{issue_month_M}</code> (June), <code>{issue_month_m}</code> (06),
-                                <code>{issue_number}</code>, <code>{issue_title}</code>.
+                                Available variables:
+                                <code>{series_name}</code>, <code>{issue_number}</code>, <code>{volume_number}</code>
+                                (can come from the file name);
+                                <code>{issue_title}</code>, <code>{issue_year}</code> (this issue's year),
+                                <code>{issue_month_M}</code> (June), <code>{issue_month_m}</code> (06)
+                                (need metadata: ComicInfo.xml or a tag);
+                                <code>{volume_year}</code> (the series start year from metadata; without it,
+                                the year in the file name).
                             </small>
                         </div>
                         <div class="col-md-4">
@@ -1251,8 +1290,9 @@
                 <!-- Source Priority -->
                 <div class="container p-4 border rounded shadow-sm mb-4">
                     <h4>Source Priority</h4>
-                    <p class="text-muted">Order in which download sources are tried when searching for issues.
-                        Used by the auto-download engine.</p>
+                    <p class="text-muted">Which download sources the auto-download engine uses, and the
+                        order it tries them in. A source that is off is never tried automatically, but can
+                        still be searched by hand.</p>
 
                     <div id="sourcePriorityList" class="mb-3">
                         <div class="text-center py-3">
@@ -2085,6 +2125,30 @@
 </div>
 <!-- End of Local ComicVine DB modal -->
 
+<!-- Offer Folder Monitoring after Metron credentials are saved -->
+<div class="modal fade" id="enableFolderMonitorModal" tabindex="-1" aria-labelledby="enableFolderMonitorModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="enableFolderMonitorModalLabel"><i class="bi bi-folder-check me-2"></i>Enable Folder Monitoring?</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p>With Metron connected you can subscribe to series, and new issues are downloaded automatically.</p>
+        <p class="mb-0">Folder Monitoring is off. Turn it on to watch your <code>WATCH</code> folder and file
+          everything that arrives there (from Usenet, DC++ or your own downloads) into <code>TARGET</code>.
+          You can change this at any time under File Processing &rarr; Folder Monitoring.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Not now</button>
+        <button type="button" class="btn btn-primary" id="confirmEnableFolderMonitorBtn">
+          <i class="bi bi-folder-check me-1"></i>Enable
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
 {% include 'partials/modal_regenerate_thumbnails.html' %}
 {% include 'partials/modal_database_confirm.html' %}
 
@@ -2093,6 +2157,7 @@
 {% block scripts %}
 {{ super() }}
 <script src="{{ url_for('static', filename='js/clu-utils.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-rename-preview.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/clu-streaming.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/clu-personalization.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/database_panel.js') }}?v={{ range(1000, 9999) | random }}"></script>
@@ -2212,6 +2277,7 @@
         const data = {
             watch: document.getElementById('watch')?.value || '',
             target: document.getElementById('target')?.value || '',
+            monitorEnabled: document.getElementById('monitorEnabled')?.checked || false,
             autoConvert: document.getElementById('autoConvert')?.checked || false,
             readSubdirectories: document.getElementById('readSubdirectories')?.checked || false,
             autoRenameMonitor: document.getElementById('autoRenameMonitor')?.checked ?? true,
@@ -2257,6 +2323,7 @@
 
             if (result.success) {
                 showToast('File processing settings saved', 'success');
+                refreshMonitorStatusSoon();
             } else {
                 showToast('Error: ' + (result.error || 'Failed to save'), 'error');
             }
@@ -2267,6 +2334,81 @@
             btn.innerHTML = originalHtml;
         }
     }
+
+    // =========================================
+    // Folder Monitoring status
+    // =========================================
+
+    function renderMonitorStatus(status) {
+        const badge = document.getElementById('monitorStatusBadge');
+        if (!badge) return;
+        if (!status) {
+            badge.className = 'badge bg-secondary ms-2';
+            badge.textContent = 'Unknown';
+        } else if (status.running) {
+            badge.className = 'badge bg-success ms-2';
+            badge.textContent = 'Running';
+        } else if (status.enabled) {
+            badge.className = 'badge bg-warning text-dark ms-2';
+            badge.textContent = 'Starting...';
+        } else {
+            badge.className = 'badge bg-secondary ms-2';
+            badge.textContent = 'Stopped';
+        }
+    }
+
+    async function loadMonitorStatus() {
+        try {
+            const response = await fetch('/api/config/folder-monitor');
+            const data = await response.json();
+            renderMonitorStatus(data.success ? data : null);
+            return data.success ? data : null;
+        } catch (e) {
+            renderMonitorStatus(null);
+            return null;
+        }
+    }
+
+    // The supervisor applies a change within a few seconds of the save, so
+    // check a few times rather than once.
+    function refreshMonitorStatusSoon() {
+        [1500, 5000, 10000].forEach(ms => setTimeout(loadMonitorStatus, ms));
+    }
+
+    function offerFolderMonitor() {
+        const el = document.getElementById('enableFolderMonitorModal');
+        if (el) bootstrap.Modal.getOrCreateInstance(el).show();
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadMonitorStatus();
+        const btn = document.getElementById('confirmEnableFolderMonitorBtn');
+        if (!btn) return;
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            try {
+                const response = await fetch('/api/config/folder-monitor', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: true })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    const toggle = document.getElementById('monitorEnabled');
+                    if (toggle) toggle.checked = true;
+                    showToast('Folder Monitoring enabled', 'success');
+                    refreshMonitorStatusSoon();
+                } else {
+                    showToast('Error: ' + (data.error || 'Could not enable Folder Monitoring'), 'error');
+                }
+            } catch (e) {
+                showToast('Error enabling Folder Monitoring: ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                bootstrap.Modal.getOrCreateInstance(document.getElementById('enableFolderMonitorModal')).hide();
+            }
+        });
+    });
 
     // Provider priority list with up/down arrows
     const providerLabels = { pixeldrain: 'Pixeldrain', download_now: 'GetComics', mega: 'Mega' };
@@ -3288,106 +3430,14 @@
         render();
     }
 
+    // The pattern itself lives in static/js/clu-rename-preview.js, shared with
+    // the Guided Setup; this page passes its live (unsaved) cleanup form.
     function updateRenamePreview() {
         const patternInput = document.getElementById('customRenamePattern');
         const previewElement = document.getElementById('renamePreview');
 
         if (!patternInput || !previewElement) return;
-
-        const pattern = patternInput.value.trim();
-        if (!pattern) {
-            previewElement.textContent = 'Enter a pattern to see preview...';
-            return;
-        }
-
-        // Sample values for preview
-        const sampleValues = {
-            publisher: 'Marvel',
-            series_name: 'Spider-Man 2099',
-            volume_number: 'v2',
-            volume_year: '1992',
-            year: '1992',
-            issue_year: '1992',
-            issue_month_M: 'June',
-            issue_month_m: '06',
-            issue_number: '044',
-            issue_title: 'The Last Dance'
-        };
-
-        try {
-            const preview = applyCustomPattern(sampleValues, pattern);
-            previewElement.textContent = preview + '.cbz';
-        } catch (error) {
-            previewElement.textContent = 'Invalid pattern';
-        }
-    }
-
-    // `isPath` distinguishes the two previews that share this body. A rename
-    // pattern is one filename and gets the whole cleanup. A move pattern is a
-    // folder *path*, and mirrors models.comicvine.auto_move_file instead: the
-    // pattern's own '/' are separators, so each *value* is sanitized with the
-    // character map alone (helpers.sanitize_path_segment — no spaces option; a
-    // folder name never gets one) BEFORE it is substituted in, and empty
-    // segments are dropped afterwards.
-    //
-    // Both halves of that order matter. Cleaning the assembled path as one
-    // string would strip the separators and preview "MarvelSpider-Man 2099/";
-    // cleaning it per segment after substitution would let a '/' inside a
-    // value become a separator, previewing "Armageddon / X-Men" as two
-    // folders — the #588 bug the map exists to prevent.
-    function applyCustomPattern(values, pattern, isPath) {
-        if (isPath) {
-            const map = collectCharMap();
-            const cleaned = {};
-            Object.keys(values).forEach(k => {
-                cleaned[k] = (CLU.applyCharMap(String(values[k] ?? ''), map) || '').trim();
-            });
-            values = cleaned;
-        }
-
-        // Simple pattern replacement for preview
-        let result = pattern;
-
-        // Replace variables with sample values
-        result = result.replace(/\{publisher\}/g, values.publisher || '');
-        result = result.replace(/\{series_name\}/g, values.series_name || '');
-        result = result.replace(/\{volume_number\}/g, values.volume_number || '');
-        result = result.replace(/\{volume_year\}/g, values.volume_year || values.year || '');  // For rename patterns
-        result = result.replace(/\{year\}/g, values.year || '');  // Legacy rename token
-        result = result.replace(/\{start_year\}/g, values.start_year || '');  // For move patterns
-        result = result.replace(/\{issue_year\}/g, values.issue_year || '');
-        result = result.replace(/\{issue_month_M\}/g, values.issue_month_M || '');
-        result = result.replace(/\{issue_month_m\}/g, values.issue_month_m || '');
-        result = result.replace(/\{issue_number\}/g, values.issue_number || '');
-        result = result.replace(/\{issue_title\}/g, values.issue_title || '');
-
-        // Drop any leftover {token} we don't recognize (mirrors apply_custom_pattern)
-        result = result.replace(/\{[A-Za-z_][^}]*\}/g, '');
-
-        // Clean up extra spaces
-        result = result.replace(/\s+/g, ' ').trim();
-
-        // Remove a separator left dangling against a parenthesis boundary
-        // (e.g. "(2020-)" -> "(2020)", "(, 2026)" -> "(2026)") when a token resolved empty
-        result = result.replace(/\(\s*[-,]\s*/g, '(');
-        result = result.replace(/\s*[-,]\s*\)/g, ')');
-
-        // Remove empty parentheses
-        result = result.replace(/\s*\(\s*\)/g, '').trim();
-
-        // Remove orphaned separators (e.g., trailing " - " when issue_title is empty)
-        result = result.replace(/\s*-\s*(?=\(|$)/g, ' ').replace(/\s+/g, ' ').trim();
-
-        if (isPath) {
-            // Values are already sanitized above; only empty segments are left
-            // to drop, as auto_move_file does.
-            return result.split('/').filter(seg => seg.trim()).join('/');
-        }
-
-        // Filename character cleanup — one shared mirror of
-        // cbz_ops/rename.py:apply_filename_cleanup, so this preview cannot
-        // drift from what the renamer actually writes.
-        return CLU.applyFilenameCleanup(result, collectCleanupConfig());
+        previewElement.textContent = CLU.renamePreviewText(patternInput.value, collectCleanupConfig());
     }
 
     // Custom Move Pattern Preview Functions
@@ -3421,28 +3471,7 @@
         const previewElement = document.getElementById('movePreview');
 
         if (!patternInput || !previewElement) return;
-
-        const pattern = patternInput.value.trim();
-        if (!pattern) {
-            previewElement.textContent = 'Enter a pattern to see preview...';
-            return;
-        }
-
-        // Sample values for preview
-        const sampleValues = {
-            publisher: 'Marvel',
-            series_name: 'Spider-Man 2099',
-            volume_number: 'v2',
-            start_year: '1992',
-            issue_number: '044'
-        };
-
-        try {
-            const preview = applyCustomPattern(sampleValues, pattern, true);
-            previewElement.textContent = preview + '/';
-        } catch (error) {
-            previewElement.textContent = 'Invalid pattern';
-        }
+        previewElement.textContent = CLU.movePreviewText(patternInput.value, collectCleanupConfig());
     }
 
     // Theme preview lives in static/js/clu-personalization.js (shared with /account).
@@ -4586,6 +4615,9 @@
                     );
                 } else {
                     showToast(`Credentials saved for ${providerType}`, 'success');
+                    if (data.suggest_enable_monitor) {
+                        offerFolderMonitor();
+                    }
                 }
                 // Clear form fields after successful save
                 form.querySelectorAll('input').forEach(input => input.value = '');
@@ -4714,13 +4746,17 @@
             const inputType = isSecret ? 'password' : (field === 'port' || field === 'priority' ? 'number' : 'text');
             const val = (cfg[field] !== undefined && cfg[field] !== null) ? String(cfg[field]) : '';
             const valueAttr = val ? `value="${escapeHtml(val)}"` : '';
+            // Secrets never come back from the server; a blank field keeps the
+            // saved one, because Save and Test send only non-blank fields.
+            const placeholder = (isSecret && (client.secrets_set || []).includes(field))
+                ? 'Saved (leave blank to keep)' : `Enter ${fieldLabel.toLowerCase()}`;
             html += `
                 <div class="mb-2">
                     <label for="${fieldId}" class="form-label small">${fieldLabel}</label>
                     <div class="input-group input-group-sm">
                         <input type="${inputType}" class="form-control ${isSecret ? 'password-field' : ''}"
                                id="${fieldId}" name="${field}" ${valueAttr}
-                               placeholder="Enter ${fieldLabel.toLowerCase()}" autocomplete="off">
+                               placeholder="${placeholder}" autocomplete="off">
                         ${isSecret ? `
                         <button class="btn btn-outline-secondary toggle-password" type="button" data-target="${fieldId}">
                             <i class="bi bi-eye"></i>
@@ -5123,38 +5159,56 @@
         dcpp: 'DC++ (Hubs)',
     };
 
+    // Being in the stored list is what turns a source on for auto-download,
+    // so the list shows every source with a switch: the ones that are on, in
+    // order, then the ones that are off. Only the ones that are on are saved.
+    // The order comes from the server (default: GetComics alone), never from a
+    // hard-coded list here: one used to show all three and append any missing
+    // ones, so the first reorder silently switched Usenet and DC++ on.
     async function loadSourcePriority() {
         const container = document.getElementById('sourcePriorityList');
         if (!container) return;
-        let order = ['getcomics', 'usenet', 'dcpp'];
+        let enabled = null;
         try {
-            const resp = await fetch('/api/preferences/download_source_priority');
+            const resp = await fetch('/api/download-clients/sources');
             const data = await resp.json();
-            if (data.success && data.value) {
-                const parsed = typeof data.value === 'string' ? JSON.parse(data.value) : data.value;
-                if (Array.isArray(parsed) && parsed.length) {
-                    // Keep known sources, append any missing ones.
-                    order = parsed.filter(s => SOURCE_LABELS[s]);
-                    for (const s of Object.keys(SOURCE_LABELS)) {
-                        if (!order.includes(s)) order.push(s);
-                    }
-                }
+            if (data.success && Array.isArray(data.order)) {
+                enabled = data.order.filter(s => SOURCE_LABELS[s]);
             }
-        } catch (e) { /* fall back to default order */ }
+        } catch (e) { /* reported below */ }
+        if (!enabled) {
+            container.innerHTML = '<div class="alert alert-danger">Could not load the source priority.</div>';
+            return;
+        }
 
-        window._sourceOrder = order;
+        const disabled = Object.keys(SOURCE_LABELS).filter(s => !enabled.includes(s));
+        window._sourceOrder = enabled;
         let html = '<div class="list-group">';
-        order.forEach((src, i) => {
+        enabled.forEach((src, i) => {
             html += `
                 <div class="list-group-item d-flex justify-content-between align-items-center">
-                    <span><i class="bi bi-list-ol me-2"></i>${i + 1}. ${escapeHtml(SOURCE_LABELS[src] || src)}</span>
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch" id="source-on-${src}" checked
+                               onchange="toggleSource('${src}', this.checked)">
+                        <label class="form-check-label" for="source-on-${src}">${i + 1}. ${escapeHtml(SOURCE_LABELS[src] || src)}</label>
+                    </div>
                     <div class="btn-group btn-group-sm">
                         <button type="button" class="btn btn-outline-secondary" onclick="moveSource(${i}, -1)" ${i === 0 ? 'disabled' : ''}>
                             <i class="bi bi-arrow-up"></i>
                         </button>
-                        <button type="button" class="btn btn-outline-secondary" onclick="moveSource(${i}, 1)" ${i === order.length - 1 ? 'disabled' : ''}>
+                        <button type="button" class="btn btn-outline-secondary" onclick="moveSource(${i}, 1)" ${i === enabled.length - 1 ? 'disabled' : ''}>
                             <i class="bi bi-arrow-down"></i>
                         </button>
+                    </div>
+                </div>`;
+        });
+        disabled.forEach(src => {
+            html += `
+                <div class="list-group-item">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch" id="source-on-${src}"
+                               onchange="toggleSource('${src}', this.checked)">
+                        <label class="form-check-label text-muted" for="source-on-${src}">${escapeHtml(SOURCE_LABELS[src] || src)} (off)</label>
                     </div>
                 </div>`;
         });
@@ -5162,11 +5216,26 @@
         container.innerHTML = html;
     }
 
-    async function moveSource(index, direction) {
-        const order = window._sourceOrder || [];
+    function toggleSource(src, on) {
+        const order = (window._sourceOrder || []).filter(s => s !== src);
+        if (on) order.push(src);
+        if (!order.length) {
+            showToast('At least one download source must stay on.', 'error');
+            loadSourcePriority();
+            return;
+        }
+        saveSourcePriority(order);
+    }
+
+    function moveSource(index, direction) {
+        const order = (window._sourceOrder || []).slice();
         const swap = index + direction;
         if (swap < 0 || swap >= order.length) return;
         [order[index], order[swap]] = [order[swap], order[index]];
+        saveSourcePriority(order);
+    }
+
+    async function saveSourcePriority(order) {
         try {
             const resp = await fetch('/api/preferences/download_source_priority', {
                 method: 'POST',
@@ -5174,14 +5243,14 @@
                 body: JSON.stringify({ value: JSON.stringify(order), category: 'downloads' })
             });
             const data = await resp.json();
-            if (data.success) {
-                loadSourcePriority();
-            } else {
+            if (!data.success) {
                 showToast('Error saving source priority: ' + (data.error || 'Unknown error'), 'error');
             }
         } catch (e) {
             showToast('Error saving source priority: ' + e.message, 'error');
         }
+        // Re-read either way: on a failure this puts the switches back.
+        loadSourcePriority();
     }
 
     async function loadLibraryProviders() {
@@ -5459,5 +5528,14 @@
             btn.innerHTML = '<i class="bi bi-play-circle me-1"></i> Run Simulation';
         }
     }
+
+    // Open the tab named in the URL hash (/config#metadata-providers), so the
+    // Guided Setup can link straight to the full settings for a section.
+    document.addEventListener('DOMContentLoaded', function () {
+        const id = (window.location.hash || '').slice(1);
+        if (!/^[a-z-]+$/.test(id)) return;
+        const tab = document.getElementById(id + '-tab');
+        if (tab && tab.dataset.bsToggle === 'tab') bootstrap.Tab.getOrCreateInstance(tab).show();
+    });
 </script>
 {% endblock %}

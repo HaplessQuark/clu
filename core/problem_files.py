@@ -57,10 +57,22 @@ SOURCE_UNPACK = "unpack"
 # failed, so core/series_json_check.py walks the library on request. The path is
 # the series.json itself, and the folder it sits in holds healthy comics.
 SOURCE_SERIES_JSON = "series-json"
+# Found by the rolling library scan (core/library_health.py), not by an
+# operation failing: the scan opened the archive and its checksums disagreed.
+SOURCE_INTEGRITY = "integrity"
+# Also scan-driven. Not damage: a file that is where it should not be (a .cbr
+# beside its own .cbz, a comic left in WATCH for a day). Never TARGET, where
+# files are expected to wait.
+SOURCE_ORPHAN = "orphan"
+# Also scan-driven, and the one source whose path is a *directory*: a library
+# folder holding no comics -- nothing at all, or only cvinfo / series.json /
+# folder art, typically what a move or a delete elsewhere left behind.
+SOURCE_EMPTY_FOLDER = "empty-folder"
 
 KNOWN_SOURCES = (
     SOURCE_THUMBNAIL, SOURCE_REBUILD, SOURCE_METADATA_WRITE, SOURCE_CONVERT,
-    SOURCE_UNPACK, SOURCE_SERIES_JSON,
+    SOURCE_UNPACK, SOURCE_SERIES_JSON, SOURCE_INTEGRITY, SOURCE_ORPHAN,
+    SOURCE_EMPTY_FOLDER,
 )
 
 SOURCE_LABELS = {
@@ -70,6 +82,9 @@ SOURCE_LABELS = {
     SOURCE_CONVERT: "CBR conversion",
     SOURCE_UNPACK: "Unpack",
     SOURCE_SERIES_JSON: "series.json",
+    SOURCE_INTEGRITY: "Integrity scan",
+    SOURCE_ORPHAN: "Stray file",
+    SOURCE_EMPTY_FOLDER: "Empty folder",
 }
 
 # Our own classes, for failures that are not exceptions. They must stay
@@ -80,6 +95,10 @@ CLASS_CORRUPT_ENTRIES = "PartialCRCSalvage"
 CLASS_RAR_FAILED = "RarConversionFailed"
 CLASS_SERIES_JSON_BLANK = "SeriesJsonBlankFields"
 CLASS_SERIES_JSON_INVALID = "SeriesJsonInvalid"
+CLASS_CBR_BESIDE_CBZ = "CbrBesideCbz"
+CLASS_STRAY_STAGING = "StrayInStaging"
+CLASS_EMPTY_FOLDER = "EmptyFolder"
+CLASS_SIDECAR_ONLY_FOLDER = "SidecarOnlyFolder"
 
 # A systemic failure — a mount whose permissions get revoked mid-scan — turns
 # every file in the library into an OSError. A 40,000-row table behind an
@@ -215,6 +234,33 @@ def clear_problem(path, source=None):
             conn.close()
     except Exception as e:
         app_logger.error(f"Could not clear problem file {path} ({source}): {e}")
+        return 0
+
+
+def clear_problems_under(folder):
+    """Drop every row for a path inside ``folder`` (not the folder's own rows).
+
+    For a folder the page has just deleted: a series.json row inside it would
+    otherwise be listed as unreachable for good, because a missing parent is
+    exactly what ``_is_definitely_gone`` refuses to treat as proof. A prefix
+    compare rather than ``LIKE``, which would read ``%`` and ``_`` in a path as
+    wildcards. Never raises; returns the number of rows removed.
+    """
+    try:
+        from core.database import db_conn
+
+        prefix = os.path.join(folder, "")
+        with db_conn() as conn:
+            if not conn:
+                return 0
+            cur = conn.execute(
+                "DELETE FROM problem_files WHERE substr(path, 1, ?) = ?",
+                (len(prefix), prefix),
+            )
+            conn.commit()
+            return cur.rowcount
+    except Exception as e:
+        app_logger.error(f"Could not clear problem files under {folder}: {e}")
         return 0
 
 
@@ -395,7 +441,8 @@ def list_problems(
                 row["dismissed"] = bool(row.get("dismissed_at"))
                 row["reachable"] = os.path.exists(row["path"])
                 row["can_retry"] = row["source"] in (
-                    SOURCE_THUMBNAIL, SOURCE_SERIES_JSON
+                    SOURCE_THUMBNAIL, SOURCE_SERIES_JSON,
+                    SOURCE_INTEGRITY, SOURCE_ORPHAN, SOURCE_EMPTY_FOLDER,
                 )
                 row["classification"] = classify(
                     row.get("error_class"), row.get("error_message")
@@ -445,6 +492,9 @@ def count_problems():
 # Honesty is the whole point. Rebuild extracts every entry inside one try, so a
 # bad CRC on page 12 of 40 aborts the lot; it cannot recreate bytes that are
 # gone. Its one real repair is the archive that is a RAR wearing a .cbz name.
+# A bad CRC is instead marked `salvageable`: Salvage rebuild
+# (cbz_ops/salvage.py) reads the page past its checksum and keeps it only if
+# the image still decodes, so it is offered without promising anything.
 # Offering it as a cure-all would walk the user through a destructive operation
 # that has no chance of helping, and `healthy_file` exists so the page never
 # offers to delete a comic whose only problem is a cache-permissions error.
@@ -470,8 +520,10 @@ _RULES = (
         (),
         "A page inside the archive is physically damaged. The file list is "
         "intact; the page data no longer matches its checksum.",
-        "Replace the file. Rebuilding cannot recreate the damaged bytes — it "
-        "will abort on the same page. The rest of the comic is still readable.",
+        "Try Salvage rebuild: if the damaged page still decodes it is kept "
+        "and the archive is rewritten. If it does not, open the comic in Edit "
+        "and remove that page, or replace the file. A plain Rebuild aborts on "
+        "the same page.",
         ACTION_REPLACE, False, False,
     ),
     (
@@ -551,6 +603,40 @@ _RULES = (
         ACTION_REFRESH, False, True,
     ),
     (
+        (),
+        (CLASS_CBR_BESIDE_CBZ.lower(),),
+        "A .cbz with the same name sits beside this archive, so the library "
+        "holds the same issue twice. This is what a conversion that kept its "
+        "source leaves behind.",
+        "Check the .cbz opens, then delete this one.",
+        ACTION_INSPECT, False, False,
+    ),
+    (
+        (),
+        (CLASS_STRAY_STAGING.lower(),),
+        "This comic has been sitting in a download folder for over a day "
+        "without being filed. Nothing is wrong with it; it did not match "
+        "anything CLU was waiting for.",
+        "Map the series, move it into the library by hand, or delete it.",
+        ACTION_INSPECT, False, True,
+    ),
+    (
+        (),
+        (CLASS_EMPTY_FOLDER.lower(),),
+        "This library folder is empty: no comics and no subfolders with any.",
+        "Delete it, or Dismiss it if you are about to fill it.",
+        ACTION_INSPECT, False, False,
+    ),
+    (
+        (),
+        (CLASS_SIDECAR_ONLY_FOLDER.lower(),),
+        "This library folder holds no comics, only metadata left behind "
+        "(listed in Details) -- usually after its issues were moved or deleted.",
+        "Delete it, or Dismiss it if you are about to fill it. The leftover "
+        "files go to the trash with the folder.",
+        ACTION_INSPECT, False, False,
+    ),
+    (
         ("permission denied",),
         ("permissionerror",),
         "CLU is not allowed to read this file.",
@@ -572,13 +658,16 @@ _RULES = (
 def classify(error_class, error_message=""):
     """Map a stored failure onto a plain-English cause and a recommended action.
 
-    Returns ``{cause, advice, action, repairable, healthy_file}``. Always
+    Returns ``{cause, advice, action, repairable, healthy_file,
+    salvageable}``. ``salvageable`` means a per-entry CRC mismatch, the one
+    damage Salvage rebuild can sometimes undo. Always
     returns something: an unrecognised error falls back to neutral wording
     rather than inventing a diagnosis, and the fallback claims no
     repairability it cannot justify.
     """
     message = (error_message or "").lower()
     klass = (error_class or "").lower()
+    salvageable = "bad crc-32" in message
 
     for substrings, classes, cause, advice, action, repairable, healthy in _RULES:
         if any(s in message for s in substrings) or (klass and klass in classes):
@@ -588,6 +677,7 @@ def classify(error_class, error_message=""):
                 "action": action,
                 "repairable": repairable,
                 "healthy_file": healthy,
+                "salvageable": salvageable,
             }
 
     return {
@@ -596,6 +686,7 @@ def classify(error_class, error_message=""):
         "action": ACTION_INSPECT,
         "repairable": False,
         "healthy_file": False,
+        "salvageable": salvageable,
     }
 
 
@@ -654,5 +745,23 @@ def retry_problem(path, source):
 
         ok = recheck_file(path)
         return ok, "series.json is complete" if ok else "Still has blank fields"
+
+    if source == SOURCE_INTEGRITY:
+        # One file, but it is a full read: hash plus every entry's CRC. The
+        # check records or clears its own row, like every retry here.
+        from core.library_health import recheck_file
+
+        ok, message = recheck_file(path)
+        return ok, message
+
+    if source == SOURCE_ORPHAN:
+        from core.library_health import recheck_orphan
+
+        return recheck_orphan(path)
+
+    if source == SOURCE_EMPTY_FOLDER:
+        from core.library_health import recheck_empty_folder
+
+        return recheck_empty_folder(path)
 
     return False, f"Unknown source: {source}"

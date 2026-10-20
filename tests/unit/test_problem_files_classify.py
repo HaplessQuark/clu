@@ -46,6 +46,21 @@ class TestRealWorldLogLines:
         # cannot recreate the lost bytes, so it must never be the advice.
         assert result["repairable"] is False
         assert "rebuild" in result["advice"].lower()
+        # ...but Salvage rebuild can read past the checksum, so it is offered.
+        assert result["salvageable"] is True
+        assert "salvage" in result["advice"].lower()
+
+    @pytest.mark.parametrize(
+        "error_class,message",
+        [
+            ("error", "Error -3 while decompressing data: invalid stored block lengths"),
+            ("BadZipFile", "File is not a zip file"),
+            (CLASS_NO_PAGES, "Archive opened but contains no page images"),
+            (None, None),
+        ],
+    )
+    def test_only_a_bad_crc_is_salvageable(self, error_class, message):
+        assert classify(error_class, message)["salvageable"] is False
 
     def test_bad_magic_number_is_the_repairable_case(self):
         result = classify("BadZipFile", "Bad magic number for file header")
@@ -130,6 +145,7 @@ class TestFallback:
                 "action",
                 "repairable",
                 "healthy_file",
+                "salvageable",
             }
 
 
@@ -179,3 +195,41 @@ class TestSourceCatalogStaysInSync:
             _ok, message = retry_problem(str(comic), source)
             assert "unknown source" not in message.lower(), \
                 "%s has no retry branch" % source
+
+
+class TestScanDrivenClasses:
+    """Rows written by the library health scan (core/library_health.py)."""
+
+    def test_cbr_beside_cbz_may_be_deleted_but_not_rebuilt(self):
+        from core.problem_files import CLASS_CBR_BESIDE_CBZ, classify
+
+        c = classify(CLASS_CBR_BESIDE_CBZ, "A .cbz with the same name is in the same folder")
+        assert c["healthy_file"] is False  # the surplus copy: Delete is offered
+        assert c["action"] == "inspect"
+
+    def test_a_stray_in_staging_is_not_damage(self):
+        from core.problem_files import CLASS_STRAY_STAGING, classify
+
+        c = classify(CLASS_STRAY_STAGING, "Unfiled in TARGET for over a day")
+        # Nothing is wrong with the file, so the page must not offer to delete it.
+        assert c["healthy_file"] is True
+
+    def test_empty_folders_offer_delete(self):
+        from core.problem_files import (
+            CLASS_EMPTY_FOLDER, CLASS_SIDECAR_ONLY_FOLDER, classify,
+        )
+
+        for klass in (CLASS_EMPTY_FOLDER, CLASS_SIDECAR_ONLY_FOLDER):
+            c = classify(klass, "Only cvinfo")
+            assert c["healthy_file"] is False and c["action"] == "inspect"
+            assert "folder" in c["cause"]
+
+    def test_scan_messages_reach_the_damage_rules(self):
+        """inspect_archive's wording has to hit the rules classify() already has,
+        or the page falls back to "CLU could not read this file"."""
+        from core import library_health as lh
+        from core.problem_files import classify
+
+        assert classify("BadCRC", "Bad CRC-32 for file 'p1.jpg'")["action"] == "replace"
+        assert classify("BadZipFile", "File is not a zip file")["repairable"] is True
+        assert classify(lh.CLASS_NO_PAGES, "Archive contains no page images")["action"] == "inspect"

@@ -319,6 +319,10 @@ _OWNER_PREFIXES = (
     "/problem-files",          # damaged-file worklist (page + its API)
     "/api/problem-files",
     "/setup-owner",            # first-run owner setup page
+    "/import",                 # Mylar3 importer page (writes client/indexer secrets)
+    "/api/import",
+    "/api/setup",              # Guided Setup (preflight reads paths, uid, owner state)
+    "/setup",                  # Guided Setup page (also covers /setup-owner above)
 )
 
 # GET is Reader (browsing), but creating/editing/deleting requires Owner.
@@ -366,6 +370,7 @@ _CLERK_PREFIXES = (
     "/api/source-wall",
     "/api/weekly-packs",
     "/logs/tail",              # raw app/monitor log content (can expose system info)
+    "/stream/",                # runs delete/convert/rebuild scripts over GET (GHSA-4v7f-qm46-8fw4)
 )
 
 # Browser *pages* that are Clerk features (file management, pull list,

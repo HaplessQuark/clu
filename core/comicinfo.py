@@ -7,18 +7,7 @@ import xml.etree.ElementTree as ET
 import defusedxml.ElementTree as SafeET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.app_logging import app_logger
-from core.config import config, load_config
-
-load_config()
-
-ignore = config.get("SETTINGS", "IGNORED_FILES", fallback=".DS_Store,cover.jpg")
-xml_year = config.getboolean("SETTINGS", "XML_YEAR", fallback=False)
-xml_markdown = config.getboolean("SETTINGS", "XML_MARKDOWN", fallback=False)
-xml_list = config.getboolean("SETTINGS", "XML_LIST", fallback=False)
-
-app_logger.info(f"************* XML Settings *************")
-app_logger.info(f"Markdown: {xml_markdown}")
-app_logger.info(f"List: {xml_list}")
+from core.settings import get_bool, get_setting
 
 
 #########################
@@ -108,7 +97,7 @@ def get_year_from_file(directory):
         
     If no match is found, returns None.
     """
-    ignore_list_str=ignore
+    ignore_list_str = get_setting("IGNORED_FILES")
     # Parse the comma-separated ignore list into a set for faster lookups
     ignore_list = {ignore_name.strip() for ignore_name in ignore_list_str.split(',') if ignore_name.strip()}
     app_logger.info(f"Ignore these files: {ignore_list}")
@@ -348,6 +337,118 @@ def has_trusted_notes(notes) -> bool:
 
 MANUAL_EDIT_NOTES_PREFIX = "Metadata entered manually in CLU"
 
+# ---------------------------------------------------------------------------
+# Which provider wrote a file's metadata?
+#
+# Notes is the only record, and every provider words it differently. This is
+# the ONE table that maps that wording to a ProviderType value. Order matters:
+# a more specific label must precede one it contains ("ComicVine (Local DB)"
+# before "ComicVine", "GCD REST API" before "GCD").
+# ---------------------------------------------------------------------------
+
+PROVIDER_NOTES_MARKERS = (
+    ('comicvine (local db)', 'comicvine_sqlite'),
+    ('comicvine cvdb', 'comicvine_sqlite'),
+    ('comicvine', 'comicvine'),
+    ('metron', 'metron'),
+    ('gcd rest api', 'gcd_api'),
+    ('grand comic', 'gcd'),
+    ('gcd', 'gcd'),
+    ('inducks', 'inducks'),
+    ('anilist', 'anilist'),
+    ('bedetheque', 'bedetheque'),
+    ('mangadex', 'mangadex'),
+    ('mangaupdates', 'mangaupdates'),
+)
+
+PROVIDER_MANUAL = 'manual'
+
+
+def provider_from_notes(notes):
+    """Return the ProviderType value that wrote ``notes``, or None.
+
+    ``'manual'`` marks a hand-typed file (see :func:`manual_edit_notes`). None
+    means untagged, untrusted-scraper or unrecognised -- the file counts as
+    having no provider. Only text of the form ``Metadata from <X>`` is read, so
+    a provider name inside a free-text note is not mistaken for provenance.
+    """
+    text = (notes or '').strip()
+    if not text or not has_trusted_notes(text):
+        return None
+    lowered = text.lower()
+    if lowered.startswith(MANUAL_EDIT_NOTES_PREFIX.lower()):
+        return PROVIDER_MANUAL
+    marker = 'metadata from '
+    idx = lowered.find(marker)
+    if idx < 0:
+        return None
+    label = lowered[idx + len(marker):]
+    for needle, provider in PROVIDER_NOTES_MARKERS:
+        if label.startswith(needle):
+            return provider
+    return None
+
+
+# ComicVine issue ids as taggers write them. Web is the strongest signal; the
+# explicit ComicVine forms in Notes are CLU's own urn ("[Issue ID 4000-N]
+# urn:comicvine:4000-N") and ComicTagger's older "[CVDB N]". A bare "Issue ID:
+# N" is read only when provider_from_notes says ComicVine wrote the Notes --
+# Metron and GCD write the same words with their own ids.
+_CV_WEB_RE = re.compile(r"comicvine\.gamespot\.com/[^\s]*?4000-(\d+)", re.I)
+_CV_URN_RE = re.compile(r"urn:comicvine:4000-(\d+)|\[CVDB\s*(\d+)\]", re.I)
+_COMICVINE_PROVIDERS = ("comicvine", "comicvine_sqlite")
+
+# The one Notes -> issue-id parser, shared by the metadata backfill and the
+# reading-list matcher.
+_NOTES_ISSUE_ID = re.compile(r"Issue ID:\s*([A-Za-z0-9_\-]+)")
+_METRON_URL_ID = re.compile(r"/issue/(\d+)")
+
+
+def extract_issue_id(provider, info):
+    """The provider's own issue id for a file, from what the file already says.
+
+    ``info`` is a ComicInfo dict (``MetronId``, ``Notes``). Returns a string,
+    or None when the file carries no id for that provider.
+    """
+    if provider == "metron":
+        mid = str(info.get("MetronId") or "").strip()
+        if mid.isdigit() and int(mid) > 0:
+            return mid
+    notes = str(info.get("Notes") or "")
+    m = _NOTES_ISSUE_ID.search(notes)
+    if m:
+        return m.group(1)
+    if provider == "metron":
+        m = _METRON_URL_ID.search(notes)
+        if m:
+            return m.group(1)
+    return None
+
+
+def comicvine_issue_id(web=None, notes=None):
+    """The ComicVine issue id a ComicInfo.xml records, or None.
+
+    "Issue ID: N" alone is not enough: Metron, GCD and ComicTagger-from-Metron
+    write the same words with their own ids, and a merged or hand-edited Notes
+    can mention ComicVine anywhere. It counts only when
+    :func:`provider_from_notes` -- the one Notes-to-provider table -- says the
+    Notes were written by ComicVine.
+    """
+    m = _CV_WEB_RE.search(web or "")
+    if m:
+        return int(m.group(1))
+    notes = notes or ""
+    m = _CV_URN_RE.search(notes)
+    if m:
+        return int(m.group(1) or m.group(2))
+    provider = provider_from_notes(notes)
+    if provider in _COMICVINE_PROVIDERS:
+        raw = extract_issue_id(provider, {"Notes": notes}) or ""
+        m = re.fullmatch(r"(?:4000-)?(\d+)", raw)
+        if m and int(m.group(1)) > 0:
+            return int(m.group(1))
+    return None
+
 
 def manual_edit_notes(today=None) -> str:
     """Notes stamp for a file whose metadata a user typed in by hand.
@@ -359,6 +460,50 @@ def manual_edit_notes(today=None) -> str:
     """
     from datetime import date
     return f"{MANUAL_EDIT_NOTES_PREFIX} on {(today or date.today()).isoformat()}."
+
+
+# What a provider is called in the Notes stamp CLU writes when the USER says
+# which provider tagged a file. Each label must round-trip through
+# provider_from_notes (a test asserts it for every entry).
+NOTES_LABELS = {
+    'metron': 'Metron',
+    'comicvine': 'ComicVine',
+    'comicvine_sqlite': 'ComicVine (Local DB)',
+    'gcd': 'GCD (Grand Comics Database)',
+    'gcd_api': 'GCD REST API',
+    'inducks': 'INDUCKS',
+    'anilist': 'AniList',
+    'bedetheque': 'Bedetheque',
+    'mangadex': 'MangaDex',
+    'mangaupdates': 'MangaUpdates',
+}
+SETTABLE_PROVIDERS = tuple(NOTES_LABELS) + (PROVIDER_MANUAL,)
+
+
+def notes_for_provider(provider, existing_notes=None, today=None):
+    """The Notes value that makes a file read as tagged by ``provider``.
+
+    Used when a file's provider is Unknown and the user supplies it. Provenance
+    lives only in Notes (the scanner re-derives ``ci_provider`` from it on every
+    scan), so recording it anywhere else would be undone by the next rescan.
+
+    Free-text Notes are kept after the stamp rather than destroyed. A scraper
+    marker (:data:`UNTRUSTED_NOTES_MARKERS`) is dropped: that Notes is exactly
+    what the auto-taggers are allowed to overwrite.
+
+    Raises ValueError for a provider outside :data:`SETTABLE_PROVIDERS`.
+    """
+    from datetime import date
+    if provider == PROVIDER_MANUAL:
+        return manual_edit_notes(today)
+    if provider not in NOTES_LABELS:
+        raise ValueError(f"unknown provider: {provider}")
+    stamp = (f"Metadata from {NOTES_LABELS[provider]}. "
+             f"Provider set manually in CLU on {(today or date.today()).isoformat()}.")
+    existing = (existing_notes or '').strip()
+    if existing and has_trusted_notes(existing):
+        return f"{stamp} {existing}"
+    return stamp
 
 
 def update_comicinfo_xml(xml_data: bytes, updates: dict, drop_empty: bool = False) -> bytes:
@@ -494,6 +639,63 @@ def merge_comicinfo_bytes(new_xml: bytes, existing_xml=None) -> bytes:
     app_logger.info(f"merge_comicinfo_bytes: preserved existing tags {', '.join(carried)}")
     ET.indent(new_root)
     return ET.tostring(new_root, encoding='utf-8', xml_declaration=True)
+
+
+def fill_blank_comicinfo_bytes(existing_xml: bytes, new_xml: bytes):
+    """The inverse of :func:`merge_comicinfo_bytes`: the file's own values win.
+
+    Starts from ``existing_xml`` and copies in only the tags that are absent or
+    blank there and non-blank in ``new_xml``. A value the user changed by hand
+    (a cover date, a rewritten summary) is therefore never touched. ``Notes`` is
+    never filled -- it is the provenance record and the existing one stays.
+
+    :return: ``(xml_bytes, filled_tags)``. ``existing_xml`` is returned
+             unchanged with ``[]`` when nothing was filled or either side cannot
+             be parsed -- a failed backfill must be a no-op, never a rewrite.
+    """
+    if not existing_xml or not new_xml:
+        return existing_xml, []
+    try:
+        old_root = SafeET.fromstring(existing_xml)
+        new_root = SafeET.fromstring(new_xml)
+    except Exception as e:
+        app_logger.warning(f"fill_blank_comicinfo_bytes: XML unparseable, not filling: {e}")
+        return existing_xml, []
+
+    def _local(tag):
+        return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else tag
+
+    def _blank(el):
+        return not (el.text or '').strip() and len(el) == 0
+
+    import copy
+    have = {}
+    for child in old_root:
+        have.setdefault(_local(child.tag), child)
+
+    filled = []
+    for child in new_root:
+        tag = _local(child.tag)
+        if tag == 'Notes' or _blank(child):
+            continue
+        current = have.get(tag)
+        if current is not None and not _blank(current):
+            continue
+        new_child = copy.deepcopy(child)
+        for sub in new_child.iter():
+            sub.tag = _local(sub.tag)
+        if current is not None:
+            old_root.remove(current)
+        old_root.append(new_child)
+        have[tag] = new_child
+        filled.append(tag)
+
+    if not filled:
+        return existing_xml, []
+    for el in old_root.iter():
+        el.tag = _local(el.tag)
+    ET.indent(old_root)
+    return ET.tostring(old_root, encoding='utf-8', xml_declaration=True), filled
 
 
 def _as_text(val):
@@ -782,10 +984,11 @@ if __name__ == "__main__":
             xml_updates = {}
 
             # Update xml_updates based on settings
-            if xml_year:
+            if get_bool("XML_YEAR"):
                 xml_updates["Volume"] = file_year
 
-            if xml_markdown and not xml_list:
+            xml_list = get_bool("XML_LIST")
+            if get_bool("XML_MARKDOWN") and not xml_list:
                 xml_updates["Comments"] = clean_markdown(comments)
             elif xml_list:
                 xml_updates["Comments"] = clean_markdown_list(comments)

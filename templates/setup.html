@@ -1,0 +1,158 @@
+{% extends 'base.html' %}
+
+{% block title %}CLU: Guided Setup{% endblock %}
+
+{% block extra_css %}
+<style>
+  .setup-rail .list-group-item { cursor: pointer; }
+  .setup-rail .list-group-item.disabled { cursor: default; }
+  .setup-rail .rail-badge { font-size: .7rem; }
+  .setup-step .step-what { max-width: 62ch; }
+</style>
+{% endblock %}
+
+{% block content %}
+{#
+  The Guided Setup wizard (readme/guided-setup.md). Each step is a partial
+  under templates/setup/; static/js/setup-wizard.js owns the step registry,
+  navigation and saving. A step that is not built yet has no partial and is
+  not in the registry: the Summary links it to its Settings tab instead.
+#}
+<div class="container-lg py-4">
+  <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+    <h2 class="text-primary-emphasis mb-0"><i class="bi bi-signpost-split me-2"></i>Guided Setup</h2>
+    <div class="d-flex gap-2">
+      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('config_page') }}">
+        <i class="bi bi-gear me-1"></i>All Settings
+      </a>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="setup-skip">Skip setup</button>
+    </div>
+  </div>
+
+  <div class="row g-4">
+    <div class="col-md-3">
+      <div class="list-group setup-rail" id="setup-rail" aria-label="Setup steps"></div>
+    </div>
+    <div class="col-md-9">
+      {% include 'setup/_preflight.html' %}
+      {% include 'setup/_usecase.html' %}
+      {% include 'setup/_libraries.html' %}
+      {% include 'setup/_metadata.html' %}
+      {% include 'setup/_mylar_import.html' %}
+      {% include 'setup/_pull_list_scan.html' %}
+      {% include 'setup/_folder_monitoring.html' %}
+      {% include 'setup/_downloads.html' %}
+      {% include 'setup/_schedules.html' %}
+      {% include 'setup/_users.html' %}
+      {% include 'setup/_notifications.html' %}
+      {% include 'setup/_personalization.html' %}
+      {% include 'setup/_repair.html' %}
+      {% include 'setup/_summary.html' %}
+
+      <div class="d-flex justify-content-between align-items-center mt-3" id="setup-nav">
+        <button type="button" class="btn btn-outline-secondary" id="setup-back">
+          <i class="bi bi-arrow-left me-1"></i>Back
+        </button>
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-link text-decoration-none" id="setup-skip-step">Skip this step</button>
+          <button type="button" class="btn btn-primary" id="setup-next">
+            Next<i class="bi bi-arrow-right ms-1"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# Folder picker over /api/setup/browse (it can pick paths not configured yet). #}
+<div class="modal fade" id="browseModal" tabindex="-1" aria-labelledby="browseModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="browseModalLabel">Choose a folder</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2 text-break" id="browse-current">Mapped volumes</div>
+        <div class="list-group" id="browse-list"></div>
+        <div class="small text-warning mt-2 d-none" id="browse-readonly">
+          <i class="bi bi-exclamation-triangle me-1"></i>This folder is read-only for CLU. Renaming,
+          metadata writes and conversion will fail inside it.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="browse-select" disabled>Use this folder</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% include 'partials/toast_container.html' %}
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/clu-utils.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-rename-preview.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-personalization.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script>
+  window.SETUP_CONFIG = {{ {
+    'state': setup_state,
+    'docs': docs,
+    'renameCleanup': rename_cleanup,
+    'urls': {
+      'state': url_for('setup.api_setup_state_save'),
+      'preflight': url_for('setup.api_setup_preflight'),
+      'browse': url_for('setup.api_setup_browse'),
+      'status': url_for('setup.api_setup_status'),
+      'settings': url_for('setup.api_setup_settings'),
+      'libraries': url_for('series.api_get_libraries'),
+      'providers': url_for('metadata.list_providers'),
+      'providerTest': url_for('metadata.test_provider_connection', provider_type='__TYPE__'),
+      'providerCreds': url_for('metadata.save_provider_creds', provider_type='__TYPE__'),
+      'cvUpdate': url_for('metadata.comicvine_sqlite_run_update'),
+      'cvUpdateStatus': url_for('metadata.comicvine_sqlite_update_status'),
+      'cvAutoUpdate': url_for('metadata.comicvine_sqlite_set_auto_update'),
+      'operation': url_for('downloads.api_operation_status', op_id='__ID__'),
+      'config': url_for('config_page'),
+      'schedules': url_for('schedules_page'),
+      'users': url_for('users_page'),
+      'index': url_for('index'),
+      'folderPaths': url_for('folder_monitor.api_folder_paths_get'),
+      'folderMonitor': url_for('folder_monitor.api_folder_monitor_status'),
+      'downloadClients': url_for('download_clients.list_download_clients'),
+      'clientConfig': url_for('download_clients.save_download_client_config_route', client_type='__TYPE__'),
+      'clientTest': url_for('download_clients.test_download_client', client_type='__TYPE__'),
+      'clientActivate': url_for('download_clients.activate_download_client', client_type='__TYPE__'),
+      'indexers': url_for('download_clients.list_indexers'),
+      'indexerTest': url_for('download_clients.test_unsaved_indexer'),
+      'simulate': url_for('downloads.api_getcomics_simulate'),
+      'schedRebuildGet': url_for('api_get_rebuild_schedule'),
+      'schedRebuildSave': url_for('api_save_rebuild_schedule'),
+      'schedScrapeGet': url_for('api_get_scrape_index_schedule'),
+      'schedScrapeSave': url_for('api_save_scrape_index_schedule'),
+      'schedSyncGet': url_for('downloads.api_get_sync_schedule'),
+      'schedSyncSave': url_for('downloads.api_save_sync_schedule'),
+      'schedGetcomicsGet': url_for('downloads.api_get_getcomics_schedule'),
+      'schedGetcomicsSave': url_for('downloads.api_save_getcomics_schedule'),
+      'schedReadingListGet': url_for('api_get_reading_list_sync_schedule'),
+      'schedReadingListSave': url_for('api_save_reading_list_sync_schedule'),
+      'weeklyPacks': url_for('downloads.api_get_weekly_packs_config'),
+      'setupOwner': url_for('admin.setup_owner_route'),
+      'adminUsers': url_for('admin.create_user_route'),
+      'notifySave': url_for('notifications.save_notification_config'),
+      'notifyTest': url_for('notifications.test_notification_config'),
+      'styling': url_for('save_styling_config'),
+      'mylarPage': url_for('mylar_import.mylar_import_page', **{'from': 'setup'}),
+      'pullScan': url_for('series.scan_library_automap'),
+      'pullScanStatus': url_for('series.scan_library_automap_status'),
+      'pullList': url_for('series.pull_list'),
+      'healthSettings': url_for('library_health.api_settings'),
+      'healthScan': url_for('library_health.api_scan'),
+      'healthSummary': url_for('library_health.api_summary'),
+    }
+  } | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/setup-wizard.js') }}?v={{ range(1000, 9999) | random }}"></script>
+{% endblock %}

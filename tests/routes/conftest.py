@@ -155,6 +155,12 @@ def app(db_connection, tmp_path):
     test_app.config["METRON_USERNAME"] = ""
     test_app.config["METRON_PASSWORD"] = ""
 
+    # Every test DB is a fresh install, which init_db stamps for the Guided
+    # Setup redirect; without this every owner GET / would go to /setup.
+    # tests/routes/test_setup.py puts the state back to "none" where it tests that.
+    from core.setup_state import STATE_COMPLETED, set_setup_state
+    set_setup_state(state=STATE_COMPLETED)
+
     # Provide a signed int converter for publisher IDs (must be before blueprints)
     from werkzeug.routing import IntegerConverter
 
@@ -182,7 +188,11 @@ def app(db_connection, tmp_path):
     from routes.reading import reading_bp
     from routes.notifications import notifications_bp
     from routes.problem_files import problem_files_bp
+    from routes.library_health import library_health_bp
     from routes.database import database_bp
+    from routes.folder_monitor import folder_monitor_bp
+    from routes.mylar_import import mylar_import_bp
+    from routes.setup import setup_bp
 
     test_app.register_blueprint(auth_bp)
     test_app.register_blueprint(favorites_bp)
@@ -202,7 +212,11 @@ def app(db_connection, tmp_path):
     test_app.register_blueprint(reading_bp)
     test_app.register_blueprint(notifications_bp)
     test_app.register_blueprint(problem_files_bp)
+    test_app.register_blueprint(library_health_bp)
     test_app.register_blueprint(database_bp)
+    test_app.register_blueprint(folder_monitor_bp)
+    test_app.register_blueprint(mylar_import_bp)
+    test_app.register_blueprint(setup_bp)
 
     # Stub routes that app.py defines but aren't in any blueprint.
     # Templates reference these via url_for().
@@ -247,6 +261,23 @@ def app(db_connection, tmp_path):
     @test_app.route("/schedules")
     def schedules_page():
         return "stub", 200
+
+    @test_app.route("/users")
+    def users_page():
+        return "stub", 200
+
+    # app.py routes the Guided Setup's Schedules and Personalization steps
+    # build URLs for (templates/setup.html).
+    for rule, endpoint, methods in (
+        ("/api/get-rebuild-schedule", "api_get_rebuild_schedule", ["GET"]),
+        ("/api/save-rebuild-schedule", "api_save_rebuild_schedule", ["POST"]),
+        ("/api/get-scrape-index-schedule", "api_get_scrape_index_schedule", ["GET"]),
+        ("/api/save-scrape-index-schedule", "api_save_scrape_index_schedule", ["POST"]),
+        ("/api/get-reading-list-sync-schedule", "api_get_reading_list_sync_schedule", ["GET"]),
+        ("/api/save-reading-list-sync-schedule", "api_save_reading_list_sync_schedule", ["POST"]),
+        ("/api/config/styling", "save_styling_config", ["POST"]),
+    ):
+        test_app.add_url_rule(rule, endpoint, lambda: ("stub", 200), methods=methods)
 
     @test_app.route("/timeline")
     def timeline():
@@ -296,6 +327,11 @@ def app(db_connection, tmp_path):
 
         return jsonify({"success": True, "items": items, "total_count": len(items)})
 
+    # The legacy library mount is tmp/data here, so a route that falls back to
+    # it (no library configured) lands inside the test sandbox, not on /data.
+    data_dir_patch = patch("core.config.get_data_dir", return_value=data_dir)
+    data_dir_patch.start()
+
     # Inject mock ``app`` module so ``from app import X`` works in routes ---
     mock_app_module = _make_mock_app_module(data_dir, target_dir)
     old_app = sys.modules.get("app")
@@ -313,6 +349,7 @@ def app(db_connection, tmp_path):
     yield test_app
 
     # Restore
+    data_dir_patch.stop()
     if old_app is not None:
         sys.modules["app"] = old_app
     else:
@@ -327,6 +364,27 @@ def app(db_connection, tmp_path):
 def client(app):
     """Flask test client."""
     return app.test_client()
+
+
+@pytest.fixture
+def data_dir_library(app, db_connection):
+    """Make the test's DATA_DIR the one enabled library.
+
+    ``init_db`` seeds a ``/data`` library whenever that folder exists, which
+    makes route behaviour depend on the machine running the tests. Routes that
+    resolve paths against the library roots need a deterministic one.
+    """
+    from core.database import get_db_connection, add_library
+
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM libraries")
+        conn.commit()
+    finally:
+        conn.close()
+    data_dir = app.config["DATA_DIR"]
+    assert add_library("Test Library", data_dir)
+    return data_dir
 
 
 @pytest.fixture

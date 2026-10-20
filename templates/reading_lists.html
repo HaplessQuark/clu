@@ -7,8 +7,8 @@
 
 {% block content %}
 {# Role gating: create/import/edit/delete are Clerk/Owner features. Readers get a
-   view-only page (browse + open/read). In implicit-owner mode current_user is the
-   owner, so everything shows exactly as before. #}
+view-only page (browse + open/read). In implicit-owner mode current_user is the
+owner, so everything shows exactly as before. #}
 {% set _can_manage = (g.current_user.role if g.get('current_user') else 'owner') in ['clerk', 'owner'] %}
 <div class="container py-5">
     <!-- Header Section -->
@@ -35,19 +35,20 @@
                 <span>GitHub Import</span>
             </button>
             <div class="dropdown">
-                <button class="btn btn-outline-info d-flex align-items-center gap-2 dropdown-toggle" data-bs-toggle="dropdown">
+                <button class="btn btn-outline-info d-flex align-items-center gap-2 dropdown-toggle"
+                    data-bs-toggle="dropdown">
                     <i class="bi bi-cloud-arrow-down"></i>
                     <span>Metron Import</span>
                 </button>
                 <ul class="dropdown-menu">
                     <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#importMetronModal"
-                        onclick="activateMetronTab('reading-lists')">
-                        <i class="bi bi-journal-bookmark me-2"></i>Reading Lists
-                    </a></li>
+                            onclick="activateMetronTab('reading-lists')">
+                            <i class="bi bi-journal-bookmark me-2"></i>Reading Lists
+                        </a></li>
                     <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#importMetronModal"
-                        onclick="activateMetronTab('story-arcs')">
-                        <i class="bi bi-signpost-split me-2"></i>Story Arcs
-                    </a></li>
+                            onclick="activateMetronTab('story-arcs')">
+                            <i class="bi bi-signpost-split me-2"></i>Story Arcs
+                        </a></li>
                 </ul>
             </div>
             <button class="btn btn-outline-warning d-flex align-items-center gap-2" data-bs-toggle="modal"
@@ -60,8 +61,8 @@
                 <i class="bi bi-check2-square"></i>
                 <span>Select</span>
             </button>
-            <button class="btn btn-outline-danger d-flex align-items-center gap-2"
-                onclick="confirmDeleteAll()" {% if not lists %}disabled{% endif %}>
+            <button class="btn btn-outline-danger d-flex align-items-center gap-2" onclick="confirmDeleteAll()" {% if
+                not lists %}disabled{% endif %}>
                 <i class="bi bi-trash3"></i>
                 <span>Delete All</span>
             </button>
@@ -104,6 +105,17 @@
             <button class="sort-btn" data-sort="name-desc">
                 <i class="bi bi-sort-alpha-up me-1"></i>Name (Z-A)
             </button>
+            <div class="input-group input-group-sm flex-nowrap ms-auto" style="width: auto;">
+                <label class="input-group-text bg-body border-0" for="rlPerPage">Per page</label>
+                <select class="form-select border-0 shadow-none bg-body text-body" id="rlPerPage" style="width: auto;">
+                    {# Multiples of 4 (and 5): a full last row of cards #}
+                    <option value="20">20</option>
+                    <option value="40" selected>40</option>
+                    <option value="80">80</option>
+                    <option value="160">160</option>
+                    <option value="300">300</option>
+                </select>
+            </div>
         </div>
     </div>
     {% endif %}
@@ -136,15 +148,15 @@
             <div class="card-stack-container">
                 {% if _can_manage %}
                 <div class="card-select-checkbox" onclick="event.stopPropagation();">
-                    <input type="checkbox" class="form-check-input list-select-cb"
-                           data-list-id="{{ list.id }}" onchange="onListCheckboxChange(this)">
+                    <input type="checkbox" class="form-check-input list-select-cb" data-list-id="{{ list.id }}"
+                        onchange="onListCheckboxChange(this)">
                 </div>
                 {% endif %}
                 {# Outside the _can_manage gate on purpose: bookmarking a list is
-                   personal data, so Readers get it too (the endpoint sits under
-                   /api/favorites, which core/auth.py allows Readers to write). #}
+                personal data, so Readers get it too (the endpoint sits under
+                /api/favorites, which core/auth.py allows Readers to write). #}
                 {# Single-quoted onclick: tojson escapes ' but not ", so a list
-                   name containing a quote would break a double-quoted attribute. #}
+                name containing a quote would break a double-quoted attribute. #}
                 <button type="button" class="want-to-read-button want-to-read-toggle" data-list-id="{{ list.id }}"
                     onclick='event.stopPropagation(); toggleReadingListWantToRead({{ list.id }}, {{ list.name|tojson }}, this)'
                     title="Add to Want to Read" aria-label="Add to Want to Read">
@@ -172,21 +184,27 @@
 
             <!-- Content -->
             <div class="card-content text-primary">
-                <h3 class="card-title-lg text-truncate"
-                    {% if _can_manage %}onclick="event.stopPropagation(); editTitle({{ list.id }}, this)" title="Click to edit"{% endif %}>
-                    {% if list.source %}<i class="bi bi-cloud-download me-1" title="Imported from {{ list.source }}"></i>{% else %}<i class="bi bi-pencil me-1" title="User-created"></i>{% endif %}
+                <h3 class="card-title-lg text-truncate" {% if _can_manage
+                    %}onclick="event.stopPropagation(); editTitle({{ list.id }}, this)" title="Click to edit" {% endif
+                    %}>
+                    {% if list.source %}<i class="bi bi-cloud-download me-1"
+                        title="Imported from {{ list.source }}"></i>{% else %}<i class="bi bi-pencil me-1"
+                        title="User-created"></i>{% endif %}
                     {{ list.name }}
                 </h3>
 
                 <div class="card-meta">
-                    <span title="Read {{ list.read_count }} of {{ list.entry_count }} issues">
-                        <i class="bi bi-collection-fill me-1"></i> {{ list.read_count }}/{{ list.entry_count }}
+                    <span class="card-count" title="Read {{ list.read_count }} of {{ list.entry_count }} issues">
+                        <i class="bi bi-collection-fill me-1"></i>{{ list.read_count }}/{{ list.entry_count }}
                     </span>
                     {% if list.tags %}
-                    <div class="card-tags">
+                    {# One line, always: fitCardTags() in reading_list.js hides
+                    what does not fit behind the "+N" chip. #}
+                    <div class="card-tags" title="{{ list.tags|join(', ') }}">
                         {% for tag in list.tags %}
                         <span class="tag-badge" data-tag="{{ tag }}">{{ tag }}</span>
                         {% endfor %}
+                        <span class="tag-badge tag-more" hidden></span>
                     </div>
                     {% endif %}
                 </div>
@@ -220,6 +238,9 @@
         </div>
         {% endfor %}
     </div>
+    <nav id="rlPagination" class="mt-4" aria-label="Reading list pagination" style="display:none;">
+        <ul class="pagination justify-content-center"></ul>
+    </nav>
     {% else %}
     <!-- Empty State -->
     <div class="text-center py-5 fade-in-up">
@@ -280,7 +301,7 @@
                 <form id="uploadCBLForm">
                     <div class="mb-4 text-center">
                         <i class="bi bi-filetype-xml display-4 text-primary mb-3"></i>
-                        <p class="text-muted">Select a ComicBookLover reading list file (.cbl)</p>
+                        <p class="text-muted">Select a CBL reading list file (.cbl)</p>
                     </div>
                     <div class="mb-3">
                         <input class="form-control form-control-lg" type="file" id="cblFile" accept=".cbl,.xml"
@@ -315,12 +336,14 @@
                 <!-- Tabs -->
                 <ul class="nav nav-tabs px-3 pt-3" role="tablist">
                     <li class="nav-item">
-                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#browseRepoTab" type="button" role="tab" onclick="loadGithubTree()">
+                        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#browseRepoTab"
+                            type="button" role="tab" onclick="loadGithubTree()">
                             <i class="bi bi-folder2-open me-1"></i>Browse Repository
                         </button>
                     </li>
                     <li class="nav-item">
-                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#importUrlTab" type="button" role="tab">
+                        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#importUrlTab" type="button"
+                            role="tab">
                             <i class="bi bi-link-45deg me-1"></i>Import by URL
                         </button>
                     </li>
@@ -332,17 +355,20 @@
                         <div class="mb-3">
                             <div class="input-group">
                                 <span class="input-group-text"><i class="bi bi-search"></i></span>
-                                <input type="text" class="form-control" id="githubTreeFilter" placeholder="Filter lists..." oninput="filterTree(this.value)">
+                                <input type="text" class="form-control" id="githubTreeFilter"
+                                    placeholder="Filter lists..." oninput="filterTree(this.value)">
                             </div>
                         </div>
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-outline-secondary" onclick="selectAllVisible()">Select All</button>
+                                <button class="btn btn-outline-secondary" onclick="selectAllVisible()">Select
+                                    All</button>
                                 <button class="btn btn-outline-secondary" onclick="deselectAll()">Deselect All</button>
                             </div>
                             <span class="text-muted small" id="selectedCount">0 files selected</span>
                         </div>
-                        <div id="githubTreeContainer" style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
+                        <div id="githubTreeContainer"
+                            style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
                             <div class="text-center py-5 text-muted" id="githubTreeLoading">
                                 <span class="spinner-border spinner-border-sm me-2"></span>Loading repository...
                             </div>
@@ -403,12 +429,14 @@
                 <!-- Tabs -->
                 <ul class="nav nav-tabs px-3 pt-3" id="metronTabs" role="tablist">
                     <li class="nav-item">
-                        <button class="nav-link active" id="metronRLTab" data-bs-toggle="tab" data-bs-target="#metronRLPane" type="button" role="tab">
+                        <button class="nav-link active" id="metronRLTab" data-bs-toggle="tab"
+                            data-bs-target="#metronRLPane" type="button" role="tab">
                             <i class="bi bi-journal-bookmark me-1"></i>Reading Lists
                         </button>
                     </li>
                     <li class="nav-item">
-                        <button class="nav-link" id="metronArcTab" data-bs-toggle="tab" data-bs-target="#metronArcPane" type="button" role="tab">
+                        <button class="nav-link" id="metronArcTab" data-bs-toggle="tab" data-bs-target="#metronArcPane"
+                            type="button" role="tab">
                             <i class="bi bi-signpost-split me-1"></i>Story Arcs
                         </button>
                     </li>
@@ -420,27 +448,33 @@
                         <div class="mb-3">
                             <div class="input-group">
                                 <span class="input-group-text"><i class="bi bi-search"></i></span>
-                                <input type="text" class="form-control" id="metronSearchInput" placeholder="Search reading lists..." oninput="searchMetronLists()">
+                                <input type="text" class="form-control" id="metronSearchInput"
+                                    placeholder="Search reading lists..." oninput="searchMetronLists()">
                             </div>
                         </div>
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-outline-secondary" onclick="selectAllMetronVisible()">Select All</button>
-                                <button class="btn btn-outline-secondary" onclick="deselectAllMetron()">Deselect All</button>
+                                <button class="btn btn-outline-secondary" onclick="selectAllMetronVisible()">Select
+                                    All</button>
+                                <button class="btn btn-outline-secondary" onclick="deselectAllMetron()">Deselect
+                                    All</button>
                             </div>
                             <span class="text-muted small" id="metronSelectedCount">0 lists selected</span>
                         </div>
-                        <div id="metronListContainer" style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
+                        <div id="metronListContainer"
+                            style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
                             <div class="text-center py-5 text-muted" id="metronListLoading">
                                 <span class="spinner-border spinner-border-sm me-2"></span>Loading reading lists...
                             </div>
                             <div id="metronListContent" class="d-none"></div>
                             <div id="metronListError" class="text-center py-4 text-danger d-none"></div>
-                            <div id="metronListEmpty" class="text-center py-4 text-muted d-none">No reading lists found</div>
+                            <div id="metronListEmpty" class="text-center py-4 text-muted d-none">No reading lists found
+                            </div>
                         </div>
                         <div id="metronNotConfigured" class="alert alert-warning mt-3 d-none">
                             <i class="bi bi-exclamation-triangle me-2"></i>
-                            Metron credentials not configured. <a href="/settings">Go to Settings</a> to add your Metron username and password.
+                            Metron credentials not configured. <a href="/settings">Go to Settings</a> to add your Metron
+                            username and password.
                         </div>
                     </div>
 
@@ -449,23 +483,28 @@
                         <div class="mb-3">
                             <div class="input-group">
                                 <span class="input-group-text"><i class="bi bi-search"></i></span>
-                                <input type="text" class="form-control" id="metronArcSearchInput" placeholder="Search story arcs..." oninput="searchMetronArcs()">
+                                <input type="text" class="form-control" id="metronArcSearchInput"
+                                    placeholder="Search story arcs..." oninput="searchMetronArcs()">
                             </div>
                         </div>
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <div class="btn-group btn-group-sm">
-                                <button class="btn btn-outline-secondary" onclick="selectAllMetronArcsVisible()">Select All</button>
-                                <button class="btn btn-outline-secondary" onclick="deselectAllMetronArcs()">Deselect All</button>
+                                <button class="btn btn-outline-secondary" onclick="selectAllMetronArcsVisible()">Select
+                                    All</button>
+                                <button class="btn btn-outline-secondary" onclick="deselectAllMetronArcs()">Deselect
+                                    All</button>
                             </div>
                             <span class="text-muted small" id="metronArcSelectedCount">0 arcs selected</span>
                         </div>
-                        <div id="metronArcListContainer" style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
+                        <div id="metronArcListContainer"
+                            style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
                             <div class="text-center py-5 text-muted" id="metronArcListLoading">
                                 <span class="spinner-border spinner-border-sm me-2"></span>Loading story arcs...
                             </div>
                             <div id="metronArcListContent" class="d-none"></div>
                             <div id="metronArcListError" class="text-center py-4 text-danger d-none"></div>
-                            <div id="metronArcListEmpty" class="text-center py-4 text-muted d-none">No story arcs found</div>
+                            <div id="metronArcListEmpty" class="text-center py-4 text-muted d-none">No story arcs found
+                            </div>
                             <div id="metronArcScrollSentinel" class="d-none">
                                 <div class="text-center py-2" id="metronArcSentinelSpinner">
                                     <span class="spinner-border spinner-border-sm me-1"></span>
@@ -476,21 +515,25 @@
                         <div class="text-muted small text-center py-1 d-none" id="metronArcPageInfo"></div>
                         <div id="metronArcNotConfigured" class="alert alert-warning mt-3 d-none">
                             <i class="bi bi-exclamation-triangle me-2"></i>
-                            Metron credentials not configured. <a href="/settings">Go to Settings</a> to add your Metron username and password.
+                            Metron credentials not configured. <a href="/settings">Go to Settings</a> to add your Metron
+                            username and password.
                         </div>
                     </div>
                 </div>
             </div>
             <div class="modal-footer bg-light">
-                <button type="button" class="btn btn-link text-decoration-none text-muted" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-info px-4" onclick="importSelectedMetronLists()" id="importMetronBtn">
+                <button type="button" class="btn btn-link text-decoration-none text-muted"
+                    data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-info px-4" onclick="importSelectedMetronLists()"
+                    id="importMetronBtn">
                     <span class="btn-text">Import Selected</span>
                     <span class="btn-loading d-none">
                         <span class="spinner-border spinner-border-sm me-1"></span>
                         Importing...
                     </span>
                 </button>
-                <button type="button" class="btn btn-info px-4 d-none" onclick="importSelectedMetronArcs()" id="importMetronArcBtn">
+                <button type="button" class="btn btn-info px-4 d-none" onclick="importSelectedMetronArcs()"
+                    id="importMetronArcBtn">
                     <span class="btn-text">Import Selected</span>
                     <span class="btn-loading d-none">
                         <span class="spinner-border spinner-border-sm me-1"></span>
@@ -515,7 +558,8 @@
                 <div class="mb-3">
                     <div class="input-group">
                         <span class="input-group-text"><i class="bi bi-search"></i></span>
-                        <input type="text" class="form-control" id="cvArcSearchInput" placeholder="Search story arcs..." oninput="searchCVArcs()">
+                        <input type="text" class="form-control" id="cvArcSearchInput" placeholder="Search story arcs..."
+                            oninput="searchCVArcs()">
                     </div>
                 </div>
                 <div class="d-flex justify-content-between align-items-center mb-2">
@@ -525,7 +569,8 @@
                     </div>
                     <span class="text-muted small" id="cvArcSelectedCount">0 arcs selected</span>
                 </div>
-                <div id="cvArcListContainer" style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
+                <div id="cvArcListContainer"
+                    style="max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; border-radius: 0.375rem;">
                     <div class="text-center py-5 text-muted" id="cvArcListLoading">
                         <span class="spinner-border spinner-border-sm me-2"></span>Loading story arcs...
                     </div>
@@ -539,7 +584,8 @@
                 </div>
             </div>
             <div class="modal-footer bg-light">
-                <button type="button" class="btn btn-link text-decoration-none text-muted" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-link text-decoration-none text-muted"
+                    data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-warning px-4" onclick="importSelectedCVArcs()" id="importCVArcBtn">
                     <span class="btn-text">Import Selected</span>
                     <span class="btn-loading d-none">
@@ -563,11 +609,13 @@
             <div class="modal-body p-4">
                 <div class="mb-3">
                     <label for="newListName" class="form-label fw-bold">List Name</label>
-                    <input type="text" class="form-control" id="newListName" placeholder="e.g. Batman Essentials" required>
+                    <input type="text" class="form-control" id="newListName" placeholder="e.g. Batman Essentials"
+                        required>
                 </div>
             </div>
             <div class="modal-footer bg-light">
-                <button type="button" class="btn btn-link text-decoration-none text-muted" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-link text-decoration-none text-muted"
+                    data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-success px-4" onclick="createNewList()">Create</button>
             </div>
         </div>
@@ -611,79 +659,81 @@
 
 {% block scripts %}
 {{ super() }}
+<script src="{{ url_for('static', filename='js/clu-utils.js') }}?v={{ range(1, 10000) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-pager.js') }}?v={{ range(1, 10000) | random }}"></script>
 <script src="{{ url_for('static', filename='js/reading_list.js') }}?v={{ range(1, 10000) | random }}"></script>
 <script>
-// Load Metron data on tab shown
-document.addEventListener('DOMContentLoaded', function() {
-    const metronRLTab = document.getElementById('metronRLTab');
-    const metronArcTab = document.getElementById('metronArcTab');
-    const importMetronBtn = document.getElementById('importMetronBtn');
-    const importMetronArcBtn = document.getElementById('importMetronArcBtn');
+    // Load Metron data on tab shown
+    document.addEventListener('DOMContentLoaded', function () {
+        const metronRLTab = document.getElementById('metronRLTab');
+        const metronArcTab = document.getElementById('metronArcTab');
+        const importMetronBtn = document.getElementById('importMetronBtn');
+        const importMetronArcBtn = document.getElementById('importMetronArcBtn');
 
-    if (metronRLTab) {
-        metronRLTab.addEventListener('shown.bs.tab', function() {
-            loadMetronLists();
-            importMetronBtn.classList.remove('d-none');
-            importMetronArcBtn.classList.add('d-none');
-        });
-    }
-    if (metronArcTab) {
-        metronArcTab.addEventListener('shown.bs.tab', function() {
-            loadMetronArcs();
-            importMetronBtn.classList.add('d-none');
-            importMetronArcBtn.classList.remove('d-none');
-        });
-    }
-
-    // Load data when modal first opens based on active tab
-    const metronModal = document.getElementById('importMetronModal');
-    if (metronModal) {
-        metronModal.addEventListener('shown.bs.modal', function() {
-            if (metronArcTab && metronArcTab.classList.contains('active')) {
-                loadMetronArcs();
-            } else {
+        if (metronRLTab) {
+            metronRLTab.addEventListener('shown.bs.tab', function () {
                 loadMetronLists();
-            }
-        });
-    }
-});
+                importMetronBtn.classList.remove('d-none');
+                importMetronArcBtn.classList.add('d-none');
+            });
+        }
+        if (metronArcTab) {
+            metronArcTab.addEventListener('shown.bs.tab', function () {
+                loadMetronArcs();
+                importMetronBtn.classList.add('d-none');
+                importMetronArcBtn.classList.remove('d-none');
+            });
+        }
 
-// Load CV arcs when modal opens
-document.addEventListener('DOMContentLoaded', function() {
-    const cvModal = document.getElementById('importCVModal');
-    if (cvModal) {
-        cvModal.addEventListener('shown.bs.modal', function() {
-            loadCVArcs();
-        });
-    }
-});
+        // Load data when modal first opens based on active tab
+        const metronModal = document.getElementById('importMetronModal');
+        if (metronModal) {
+            metronModal.addEventListener('shown.bs.modal', function () {
+                if (metronArcTab && metronArcTab.classList.contains('active')) {
+                    loadMetronArcs();
+                } else {
+                    loadMetronLists();
+                }
+            });
+        }
+    });
 
-// Pre-load GitHub tree when modal opens (not just on tab click)
-document.addEventListener('DOMContentLoaded', function() {
-    const githubModal = document.getElementById('importGithubModal');
-    if (githubModal) {
-        githubModal.addEventListener('shown.bs.modal', function() {
-            loadGithubTree();
-        });
-    }
-});
+    // Load CV arcs when modal opens
+    document.addEventListener('DOMContentLoaded', function () {
+        const cvModal = document.getElementById('importCVModal');
+        if (cvModal) {
+            cvModal.addEventListener('shown.bs.modal', function () {
+                loadCVArcs();
+            });
+        }
+    });
 
-// Toggle import buttons based on active tab
-document.addEventListener('DOMContentLoaded', function() {
-    const importBtn = document.getElementById('importBtn');
-    const importBatchBtn = document.getElementById('importBatchBtn');
+    // Pre-load GitHub tree when modal opens (not just on tab click)
+    document.addEventListener('DOMContentLoaded', function () {
+        const githubModal = document.getElementById('importGithubModal');
+        if (githubModal) {
+            githubModal.addEventListener('shown.bs.modal', function () {
+                loadGithubTree();
+            });
+        }
+    });
 
-    document.querySelectorAll('#importGithubModal .nav-link').forEach(tab => {
-        tab.addEventListener('shown.bs.tab', function(e) {
-            if (e.target.getAttribute('data-bs-target') === '#importUrlTab') {
-                importBtn.classList.remove('d-none');
-                importBatchBtn.classList.add('d-none');
-            } else {
-                importBtn.classList.add('d-none');
-                importBatchBtn.classList.remove('d-none');
-            }
+    // Toggle import buttons based on active tab
+    document.addEventListener('DOMContentLoaded', function () {
+        const importBtn = document.getElementById('importBtn');
+        const importBatchBtn = document.getElementById('importBatchBtn');
+
+        document.querySelectorAll('#importGithubModal .nav-link').forEach(tab => {
+            tab.addEventListener('shown.bs.tab', function (e) {
+                if (e.target.getAttribute('data-bs-target') === '#importUrlTab') {
+                    importBtn.classList.remove('d-none');
+                    importBatchBtn.classList.add('d-none');
+                } else {
+                    importBtn.classList.add('d-none');
+                    importBatchBtn.classList.remove('d-none');
+                }
+            });
         });
     });
-});
 </script>
 {% endblock %}

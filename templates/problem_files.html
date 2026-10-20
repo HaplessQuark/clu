@@ -6,26 +6,44 @@
 {% include 'partials/toast_container.html' %}
 
 {# A corrected file's row flashes green, then fades before the list reloads
-   (static/js/problem_files.js: celebrateFixed). Bootstrap paints table cells
-   with an inset box-shadow, so the highlight overrides that, not background. #}
+(static/js/problem_files.js: celebrateFixed). Bootstrap paints table cells
+with an inset box-shadow, so the highlight overrides that, not background. #}
 <style>
-  #pf-tbody tr.pf-fixed > td {
+  #pf-tbody tr.pf-fixed>td {
     box-shadow: inset 0 0 0 9999px rgba(25, 135, 84, 0.28);
     transition: box-shadow 0.25s ease;
   }
-  #pf-tbody tr.pf-fixed.pf-fading > td {
+
+  #pf-tbody tr.pf-fixed.pf-fading>td {
     opacity: 0;
     transition: opacity 0.6s ease, box-shadow 0.25s ease;
   }
-  #pf-tbody tr > td { transition: box-shadow 0.6s ease; }
-  #pf-tbody tr.pf-warn > td {
+
+  #pf-tbody tr>td {
+    transition: box-shadow 0.6s ease;
+  }
+
+  #pf-tbody tr.pf-warn>td {
     box-shadow: inset 0 0 0 9999px rgba(255, 193, 7, 0.35);
     transition: box-shadow 0.15s ease;
   }
+
+  /* Row actions stack two to a line, so the cause/advice column keeps the
+     width instead of a long strip of buttons. 1fr columns make each pair
+     the same width. */
+  #pf-tbody .pf-actions {
+    display: inline-grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.25rem;
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    #pf-tbody tr > td,
-    #pf-tbody tr.pf-fixed > td,
-    #pf-tbody tr.pf-fixed.pf-fading > td { transition: none; }
+
+    #pf-tbody tr>td,
+    #pf-tbody tr.pf-fixed>td,
+    #pf-tbody tr.pf-fixed.pf-fading>td {
+      transition: none;
+    }
   }
 </style>
 
@@ -34,8 +52,17 @@
     <h2 class="mb-0"><i class="bi bi-exclamation-triangle me-2"></i>Problem Files</h2>
     <div class="d-flex gap-2">
       <button class="btn btn-outline-primary btn-sm" id="pf-scan-seriesjson"
-              title="Check every series.json for a blank name, description or cover">
+        title="Check every series.json for a blank name, description or cover">
         <i class="bi bi-search me-1"></i>Scan series.json
+      </button>
+      <button class="btn btn-outline-primary btn-sm" id="pf-scan-empty"
+        title="Find library folders with no comics in them (empty, or only cvinfo / series.json / folder art)">
+        <i class="bi bi-folder-x me-1"></i>Scan empty folders
+      </button>
+      <button class="btn btn-outline-success btn-sm d-none" id="pf-refresh-sj-all"
+        title="Rewrite every listed series.json from Metron or ComicVine">
+        <i class="bi bi-cloud-download me-1"></i>Refresh all series.json
+        <span class="badge bg-success ms-1" id="pf-refresh-sj-count"></span>
       </button>
       <button class="btn btn-outline-secondary btn-sm" id="pf-refresh">
         <i class="bi bi-arrow-clockwise me-1"></i>Refresh
@@ -43,15 +70,79 @@
     </div>
   </div>
 
+  {# Library health. The scan is opt-in and rolling, so the card states coverage
+  rather than "clean": 40% checked means 60% unknown. #}
+  <div class="card mb-3" id="pf-health">
+    <div class="card-body py-3">
+      <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+        <div>
+          <h5 class="card-title mb-1">
+            <i class="bi bi-heart-pulse me-2"></i>Library health
+            <span class="badge ms-2 d-none" id="pf-health-score"></span>
+          </h5>
+          <div class="small text-muted" id="pf-health-line">Loading&hellip;</div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <a class="btn btn-outline-primary btn-sm" href="/problem-files/duplicates">
+            <i class="bi bi-files me-1"></i>Review duplicates
+            <span class="badge bg-secondary ms-1 d-none" id="pf-health-dups"></span>
+          </a>
+          <button class="btn btn-primary btn-sm" id="pf-health-scan"
+            title="Check the next batch of files now, plus series.json, stray files, empty folders and ComicInfo counts">
+            <i class="bi bi-play-fill me-1"></i>Run scan now
+          </button>
+        </div>
+      </div>
+      <div class="progress mt-2" style="height: 6px;" title="Share of the library with a current result">
+        <div class="progress-bar" id="pf-health-bar" role="progressbar" style="width: 0%"></div>
+      </div>
+      <div class="d-flex align-items-center gap-3 flex-wrap mt-3">
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="pf-health-enabled">
+          <label class="form-check-label small" for="pf-health-enabled">Scan automatically</label>
+        </div>
+        <label class="small text-muted d-flex align-items-center gap-1 mb-0">Every
+          <select class="form-select form-select-sm w-auto" id="pf-health-interval">
+            <option value="1">hour</option>
+            <option value="6">6 hours</option>
+            <option value="12">12 hours</option>
+            <option value="24">day</option>
+            <option value="168">week</option>
+          </select>
+        </label>
+        <label class="small text-muted d-flex align-items-center gap-1 mb-0">Files per run
+          <select class="form-select form-select-sm w-auto" id="pf-health-batch">
+            <option value="50">50</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+            <option value="2500">2500</option>
+          </select>
+        </label>
+        <span class="small text-muted" id="pf-health-note">Reads every comic once, then re-checks it periodically. Off
+          by default.</span>
+      </div>
+    </div>
+  </div>
+
   {# "Report only" is a promise worth making in so many words -- otherwise an
-     empty page reads as "your library is clean" rather than "nothing has
-     failed yet". #}
+  empty page reads as "your library is clean" rather than "nothing has
+  failed yet". #}
   <p class="text-muted small mb-3">
-    Files that failed an operation CLU actually attempted. CLU does not scan
-    your library for damage &mdash; a file appears here when something tried to
-    read it and could not. The one exception is <strong>Scan series.json</strong>,
-    which you run yourself to find series.json files with a blank name,
-    description or cover.
+    Files that failed an operation CLU actually attempted. Unless you turn on
+    the library health scan above, CLU does not look for damage on its own
+    &mdash; a file appears here when something tried to read it and could not,
+    so an empty page means <em>nothing has failed</em>, not that the library is
+    clean. With the scan on, the card shows how much of the library has been
+    checked. <strong>Scan series.json</strong> finds series.json files with a
+    blank name, description or cover; <strong>Scan empty folders</strong> finds
+    library folders left with no comics in them.
+  </p>
+  <p class="text-muted small mb-3">
+    Looking for files tagged by the wrong metadata provider? That is not a failure, so it
+    is not listed here. You can view a breakdown of files tagged by provider on the
+    <a href="/source-wall">Source Wall</a> page and filter by provider. Choose <strong>Re-tag with
+      provider&hellip;</strong> from the folder's dropdown menu to update metadata for all files in that folder.
   </p>
 
   <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
@@ -63,11 +154,14 @@
       <button type="button" class="btn btn-outline-primary" data-source="convert">CBR conversion</button>
       <button type="button" class="btn btn-outline-primary" data-source="unpack">Unpack</button>
       <button type="button" class="btn btn-outline-primary" data-source="series-json">series.json</button>
+      <button type="button" class="btn btn-outline-primary" data-source="integrity">Integrity scan</button>
+      <button type="button" class="btn btn-outline-primary" data-source="orphan">Stray files</button>
+      <button type="button" class="btn btn-outline-primary" data-source="empty-folder">Empty folders</button>
     </div>
 
     <div class="flex-grow-1" style="min-width: 180px;">
-      <input type="search" class="form-control form-control-sm" id="pf-search"
-             placeholder="Filter by path&hellip;" autocomplete="off">
+      <input type="search" class="form-control form-control-sm" id="pf-search" placeholder="Filter by path&hellip;"
+        autocomplete="off">
     </div>
 
     <div class="form-check form-switch mb-0">
@@ -80,42 +174,30 @@
        is fixed), so this banner is the only place the result can be reported. -->
   <div id="pf-replacements"></div>
 
+  <!-- The last "Refresh all series.json" run: what was corrected and, more to
+       the point, which folders still need attention and why. -->
+  <div id="pf-sj-result"></div>
+
   <div class="table-responsive">
     <table class="table table-hover align-middle">
       <thead>
         <tr>
-          <th style="width: 30%;">File</th>
-          <th style="width: 10%;">Source</th>
+          <th style="width: 28%;">File</th>
+          <th style="width: 1%;" class="text-nowrap">Source</th>
           <th>What went wrong</th>
-          <th style="width: 10%;" class="text-nowrap">Seen</th>
+          <th style="width: 1%;" class="text-nowrap">Seen</th>
           <th style="width: 1%;" class="text-end">Actions</th>
         </tr>
       </thead>
       <tbody id="pf-tbody">
-        <tr><td colspan="5" class="text-center text-muted py-4">Loading&hellip;</td></tr>
+        <tr>
+          <td colspan="5" class="text-center text-muted py-4">Loading&hellip;</td>
+        </tr>
       </tbody>
     </table>
   </div>
 
   <p class="text-muted small mb-0" id="pf-summary"></p>
-</div>
-
-<!-- Details -->
-<div class="modal fade" id="pf-details-modal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title"><i class="bi bi-info-circle me-2"></i>Problem details</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <dl class="row mb-0" id="pf-details-body"></dl>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-      </div>
-    </div>
-  </div>
 </div>
 
 <!-- Rebuild confirmation. Carries the honest warning: rebuild repairs a
@@ -134,7 +216,35 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
         <button type="button" class="btn btn-primary" id="pf-rebuild-confirm"
-                data-enter-confirm="pf-rebuild-confirm">Rebuild</button>
+          data-enter-confirm="pf-rebuild-confirm">Rebuild</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Salvage rebuild confirmation. The promise that matters: nothing is written
+     unless every damaged page still decodes (cbz_ops/salvage.py). -->
+<div class="modal fade" id="pf-salvage-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-bandaid me-2"></i>Salvage rebuild?</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p class="mb-2">CLU will read the damaged page of <strong id="pf-salvage-name"></strong>
+          past its checksum and check whether the image still decodes.</p>
+        <ul class="small mb-2">
+          <li>If it does, the archive is rewritten with fresh checksums. The page may show
+            a small glitch where the bytes were damaged.</li>
+          <li>If it does not, <strong>the file is left exactly as it is now</strong>. Use
+            <em>Edit pages</em> to remove that page, or replace the file.</li>
+        </ul>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="pf-salvage-confirm"
+          data-enter-confirm="pf-salvage-confirm">Salvage rebuild</button>
       </div>
     </div>
   </div>
@@ -156,8 +266,8 @@
           the new file is read.
         </p>
         <div class="input-group input-group-sm mb-3">
-          <input type="text" class="form-control" id="pf-sources-query"
-                 placeholder="Series and issue&hellip;" autocomplete="off">
+          <input type="text" class="form-control" id="pf-sources-query" placeholder="Series and issue&hellip;"
+            autocomplete="off">
           <button class="btn btn-primary" type="button" id="pf-sources-go">
             <i class="bi bi-search me-1"></i>Search
           </button>
@@ -171,16 +281,46 @@
   </div>
 </div>
 
+<!-- Refresh all series.json confirmation -->
+<div class="modal fade" id="pf-sj-all-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-cloud-download me-2"></i>Refresh all series.json?</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p>CLU will rewrite <strong id="pf-sj-all-count"></strong> from your metadata
+          providers, one folder at a time, in the background. This can take a while on a
+          large library and uses your provider rate limits.</p>
+        <p class="small text-muted mb-0">Fields you edited by hand are kept; only blank
+          ones are filled. Folders that are still incomplete afterwards are listed here
+          with the reason. Dismissed entries are skipped.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-success" id="pf-sj-all-confirm">Refresh all</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Delete confirmation -->
 <div class="modal fade" id="pf-delete-modal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title text-danger"><i class="bi bi-trash me-2"></i>Delete this file?</h5>
+        <h5 class="modal-title text-danger"><i class="bi bi-trash me-2"></i><span id="pf-delete-title">Delete this
+            file?</span></h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
         <p class="mb-0"><strong id="pf-delete-name"></strong> will be moved to the trash.</p>
+        <p class="small text-muted mb-0 mt-2 d-none" id="pf-delete-folder-note">
+          CLU checks again that the folder holds no comics before deleting it.
+          A completely empty folder, or one holding only <code>cvinfo</code>, is
+          removed outright rather than trashed.
+        </p>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -189,12 +329,18 @@
     </div>
   </div>
 </div>
+{# The ComicInfo viewer/editor, so a row's tags can be checked in place. #}
+{% include 'partials/modal_cbz_info.html' %}
+{# The page editor, for removing a damaged page ("Edit pages"). #}
+{% include 'partials/modal_cbz_edit.html' %}
 {% endblock %}
 
 {% block scripts %}
 {{ super() }}
 <script src="{{ url_for('static', filename='js/clu-utils.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-cbz-info.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/clu-streaming.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-cbz-edit.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/clu-source-search.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/problem_files.js') }}?v={{ range(1000, 9999) | random }}"></script>
 {% endblock %}

@@ -595,6 +595,9 @@ def fetch_cv_arc_issues(api_key, arc_id):
                 resolved.append({
                     'series_name': series_name,
                     'issue_number': issue_number,
+                    # The ComicVine issue id: an exact match against
+                    # file_index.ci_cvid when the file was tagged from CV.
+                    'issue_id': entry['id'],
                     # The ComicVine volume id, NOT a year -- keep the two
                     # apart, the importer used to pass this into a year slot.
                     'volume_id': str(volume_id) if volume_id else None,
@@ -1465,9 +1468,18 @@ def auto_move_file(file_path: str, volume_data: Dict[str, Any], config: Dict[str
 
         app_logger.info(f"📂 Computed folder structure: '{folder_structure}'")
 
-        # Construct the target directory path
-        # Base directory is /data
-        base_dir = '/data'
+        # Construct the target directory path under the library the file is
+        # already in, else the default library. Never a hard-coded /data: on an
+        # install whose library is mounted elsewhere, /data is the container's
+        # own filesystem and anything moved there is lost with the container.
+        from helpers.library import get_library_for_path, get_default_library_root
+        lib = get_library_for_path(file_path)
+        base_dir = lib['path'] if lib else get_default_library_root()
+        if not os.path.isdir(base_dir):
+            app_logger.warning(
+                f"Library root '{base_dir}' does not exist, skipping auto-move"
+            )
+            return None
         target_dir = os.path.join(base_dir, folder_structure)
 
         app_logger.info(f"🎯 Target directory: '{target_dir}'")
@@ -1674,6 +1686,36 @@ def write_cvinfo_fields(cvinfo_path: str, publisher_name: Optional[str], start_y
     except Exception as e:
         app_logger.error(f"Error writing cvinfo fields to {cvinfo_path}: {e}")
         return False
+
+
+def create_cvinfo_file(cvinfo_path: str, cv_id: int, publisher_name: Optional[str] = None,
+                       start_year: Optional[int] = None) -> bool:
+    """
+    Create a cvinfo file for a ComicVine-only series.
+
+    Writes the ``/4050-<id>/`` URL line (read back as the CV volume id) and the
+    optional fields, and deliberately no ``series_id:`` line: that is read back
+    as a Metron id, so a ComicVine id there would be misread.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    from core.config import is_oneshot_folder
+    if is_oneshot_folder(os.path.dirname(cvinfo_path)):
+        app_logger.debug(f"Skipping cvinfo write in one-shot folder: {cvinfo_path}")
+        return False
+    try:
+        with open(cvinfo_path, 'w', encoding='utf-8') as f:
+            f.write(f"https://comicvine.gamespot.com/volume/4050-{cv_id}/")
+
+        from helpers import match_parent_permissions
+        match_parent_permissions(cvinfo_path)
+    except Exception as e:
+        app_logger.error(f"Error creating cvinfo file {cvinfo_path}: {e}")
+        return False
+    write_cvinfo_fields(cvinfo_path, publisher_name, start_year)
+    app_logger.info(f"Created cvinfo file: {cvinfo_path}")
+    return True
 
 
 MANGA_CVINFO_KEYS = [

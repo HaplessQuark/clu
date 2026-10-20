@@ -100,9 +100,9 @@ def _attach_search_context(problems):
         return
 
     for row in problems:
-        # A sidecar is not a comic: there is nothing to search for, and parsing
-        # "series.json" as a comic name only logs a fallback per row.
-        if row.get("source") == "series-json":
+        # A sidecar or a folder is not a comic: there is nothing to search for,
+        # and parsing "series.json" as a comic name only logs a fallback per row.
+        if row.get("source") in ("series-json", "empty-folder"):
             continue
         filename = row.get("filename") or ""
         series, issue, year = "", "", None
@@ -180,6 +180,56 @@ def api_retry():
     )
 
 
+@problem_files_bp.route("/api/problem-files/salvage", methods=["POST"])
+def api_salvage():
+    """Salvage rebuild: rewrite a CBZ whose damaged pages still decode.
+
+    Synchronous, like Retry: one archive, and the original is untouched unless
+    every damaged entry decodes (``cbz_ops.salvage.salvage_cbz``). The archive
+    is rewritten, so every entry for it is cleared once the integrity re-check
+    agrees, the same as a successful Rebuild.
+    """
+    from helpers.library import is_critical_path
+    from core.problem_files import clear_problem, get_problem, has_problem
+
+    path, source, error = _path_and_source()
+    if error:
+        return error
+    if not has_problem(path):
+        return jsonify({"success": False, "error": "Not a listed problem file"}), 404
+    if not path.lower().endswith((".cbz", ".zip")) or not os.path.isfile(path):
+        return jsonify({"success": False, "error": "Only a CBZ archive can be salvaged"}), 400
+    if is_critical_path(path):
+        return jsonify({"success": False, "error": "That path is protected"}), 403
+
+    from cbz_ops.salvage import salvage_cbz
+
+    result = salvage_cbz(path)
+    if result["ok"]:
+        try:
+            from core.thumbnail_cache import regenerate_thumbnail
+
+            regenerate_thumbnail(path)
+        except Exception as e:
+            app_logger.error(f"Thumbnail refresh after salvaging {path} failed: {e}")
+        from core.library_health import recheck_file
+
+        verified, _msg = recheck_file(path)
+        if verified:
+            clear_problem(path)
+
+    remaining = get_problem(path, source)
+    return jsonify(
+        {
+            "success": True,
+            "fixed": result["ok"] and remaining is None,
+            "message": result["message"],
+            "salvaged": result["salvaged"],
+            "failed": result["failed"],
+        }
+    )
+
+
 @problem_files_bp.route("/api/problem-files/dismiss", methods=["POST"])
 def api_dismiss():
     """Hide or un-hide an entry without touching the file."""
@@ -224,7 +274,10 @@ def api_delete():
     """
     from helpers.library import is_critical_path
     from helpers.trash import move_to_trash
-    from core.problem_files import clear_problem, has_problem
+    from core.problem_files import (
+        SOURCE_EMPTY_FOLDER, clear_problem, clear_problems_under, get_problem,
+        has_problem,
+    )
 
     path, _source, error = _path_and_source(require_source=False)
     if error:
@@ -251,6 +304,20 @@ def api_delete():
         app_logger.error(f"Refused to delete critical path from Problem Files: {path}")
         return jsonify({"success": False, "error": "That path is protected"}), 403
 
+    # The only directory this page lists is an empty folder, and the scan that
+    # listed it may be a day old. Look again: a folder that holds a comic now is
+    # not the folder the user agreed to delete.
+    is_folder = os.path.isdir(path)
+    if is_folder:
+        from core.library_health import inspect_folder
+
+        if get_problem(path, SOURCE_EMPTY_FOLDER) is None:
+            return jsonify({"success": False, "error": "Not a listed empty folder"}), 404
+        if inspect_folder(path) is None:
+            clear_problem(path, SOURCE_EMPTY_FOLDER)
+            return jsonify({"success": False,
+                            "error": "That folder is no longer empty"}), 409
+
     try:
         result = move_to_trash(path)
     except Exception as e:
@@ -265,6 +332,8 @@ def api_delete():
         app_logger.error(f"Could not update file index after deleting {path}: {e}")
 
     clear_problem(path)
+    if is_folder:
+        clear_problems_under(path)
     return jsonify({"success": True, "trashed": result.get("trashed", False)})
 
 
@@ -310,6 +379,101 @@ def api_scan_series_json():
 
     threading.Thread(target=_run, daemon=True, name="series-json-scan").start()
     return jsonify({"success": True, "op_id": op_id})
+
+
+@problem_files_bp.route("/api/problem-files/scan-empty-folders", methods=["POST"])
+def api_scan_empty_folders():
+    """Start a background walk for empty library folders.
+
+    The same walk the library health scan runs daily, on its own so it can be
+    run without hashing a batch of comics. The page follows
+    ``/api/operation/<op_id>``, like the series.json scan.
+    """
+    from core.app_state import complete_operation, register_operation
+    from core.library_health import empty_folder_scan_running, scan_empty_folders
+
+    if empty_folder_scan_running():
+        return jsonify({"success": False, "error": "A scan is already running"}), 409
+
+    op_id = register_operation("empty_folder_scan", "Looking for empty folders")
+
+    def _run():
+        failed = False
+        try:
+            # None: another walk took the lock between the check and here.
+            failed = scan_empty_folders(op_id) is None
+        except Exception as e:  # scan_empty_folders swallows; belt and braces
+            failed = True
+            app_logger.error(f"Empty-folder scan crashed: {e}")
+        finally:
+            complete_operation(op_id, error=failed)
+
+    threading.Thread(target=_run, daemon=True, name="empty-folder-scan").start()
+    return jsonify({"success": True, "op_id": op_id})
+
+
+@problem_files_bp.route("/api/problem-files/refresh-series-json-all", methods=["POST"])
+def api_refresh_series_json_all():
+    """Refresh every open series.json row, off-request.
+
+    The single-folder Refresh is one to three provider calls; this is that for
+    every listed folder, which far outlasts gunicorn's timeout. It shares
+    ``_scan_lock`` with the scan: both rewrite the same rows, and a re-scan
+    running underneath a refresh would flag folders the refresh is about to fix.
+    The page follows ``/api/operation/<op_id>`` and then reads the report from
+    ``/api/problem-files/refresh-series-json-all/result``.
+    """
+    from core.app_state import complete_operation, register_operation
+    from core.series_json_builder import PROVIDER_CHOICES
+    from core.series_json_check import count_open_series_json, refresh_all
+
+    data = request.get_json(silent=True) or {}
+    provider = (data.get("provider") or "auto").lower()
+    if provider not in PROVIDER_CHOICES:
+        return jsonify({"success": False, "error": "Unknown provider"}), 400
+
+    if not count_open_series_json():
+        return jsonify({"success": False, "error": "No series.json problems to refresh"}), 400
+
+    if not _scan_lock.acquire(blocking=False):
+        return jsonify({"success": False,
+                        "error": "A series.json scan or refresh is already running"}), 409
+
+    try:
+        op_id = register_operation("series_json_refresh_all", "Refreshing series.json files")
+    except Exception:
+        _scan_lock.release()
+        raise
+
+    # The provider lookups read current_app (settings, credentials, the shared
+    # API clients), and a bare thread has no application context. Without one
+    # every lookup raised "Working outside of application context", which the
+    # lookup swallowed -- so every folder reported "No provider returned data"
+    # while the same refresh from a request worked.
+    app = current_app._get_current_object()
+
+    def _run():
+        failed = False
+        try:
+            with app.app_context():
+                refresh_all(op_id, provider=provider)
+        except Exception as e:
+            failed = True
+            app_logger.error(f"series.json bulk refresh crashed: {e}")
+        finally:
+            complete_operation(op_id, error=failed)
+            _scan_lock.release()
+
+    threading.Thread(target=_run, daemon=True, name="series-json-refresh-all").start()
+    return jsonify({"success": True, "op_id": op_id})
+
+
+@problem_files_bp.route("/api/problem-files/refresh-series-json-all/result", methods=["GET"])
+def api_refresh_series_json_all_result():
+    """The last bulk refresh's report, or ``result: null`` if none has run."""
+    from core.series_json_check import last_bulk_result
+
+    return jsonify({"success": True, "result": last_bulk_result()})
 
 
 # ---------------------------------------------------------------------------

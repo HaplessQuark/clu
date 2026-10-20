@@ -11,7 +11,9 @@ Contents of the ZIP:
     system_info.json    -- version, platform, python, key paths, flags
     root_paths.json     -- library/WATCH/TARGET roots: realpath, device+inode,
                            which of them are one folder, matching mounts
-    config.ini          -- copy of config.ini with secrets redacted
+    preflight.json      -- the Guided Setup preflight checks (volumes, DB,
+                           owner, container user); /data subfolder names omitted
+    config.ini          -- the stored settings (config.ini keys) with secrets redacted
     db_settings.json    -- user_preferences rows + table list (settings only)
     logs/app.log        -- last N lines of app.log
     logs/monitor.log    -- last N lines of monitor.log
@@ -87,6 +89,29 @@ def _sanitize_value(key, value):
     return _redact_blob(value)
 
 
+def _redacted_settings() -> str:
+    """The stored settings, rendered in the old config.ini layout, secrets masked.
+
+    config.ini no longer exists (settings live in user_preferences), but the
+    layout is kept so a support reader finds what they always looked for in
+    the same place under the same name.
+    """
+    try:
+        from core.settings import SETTINGS_SCHEMA, get_setting
+        parser = configparser.RawConfigParser()
+        parser.optionxform = str
+        parser["SETTINGS"] = {}
+        for key in sorted(SETTINGS_SCHEMA):
+            value = get_setting(key)
+            text = "True" if value is True else "False" if value is False else str(value)
+            parser["SETTINGS"][key] = _sanitize_value(key, text)
+        buf = io.StringIO()
+        parser.write(buf)
+        return buf.getvalue()
+    except Exception as e:
+        return f"# Failed to read settings: {e}\n"
+
+
 def _redacted_config_ini(config_path: str = CONFIG_FILE) -> str:
     """Return config.ini as a string with all sensitive values masked."""
     if not os.path.exists(config_path):
@@ -148,6 +173,15 @@ def _db_settings_json() -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def _folder_monitor_status():
+    """The supervisor's view of monitor.py; never raises (this is a debug aid)."""
+    try:
+        from core import monitor_supervisor
+        return monitor_supervisor.status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _system_info_json() -> str:
     """Return non-sensitive runtime/environment info as JSON."""
     info = {
@@ -159,8 +193,11 @@ def _system_info_json() -> str:
             "log_dir": LOG_DIR,
             "config_file": CONFIG_FILE,
         },
+        # The raw env value stays: "I set MONITOR=yes and nothing happens" is
+        # answered by seeing it beside the setting that replaced it.
+        "folder_monitor": _folder_monitor_status(),
         "flags": {
-            "MONITOR": os.environ.get("MONITOR", ""),
+            "MONITOR (deprecated env)": os.environ.get("MONITOR", ""),
             "ENABLE_DEBUG_LOGGING": os.environ.get("ENABLE_DEBUG_LOGGING", ""),
             "PUID": os.environ.get("PUID", ""),
             "PGID": os.environ.get("PGID", ""),
@@ -263,6 +300,26 @@ def _root_paths_json() -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def _preflight_json() -> str:
+    """The setup preflight checks, as the Logs page shows them; never raises.
+
+    ``data_mount`` lists the folders under ``/data`` for the wizard's "Add as
+    library"; those are publisher/series names, so only the count is kept here
+    (the README promises that only the configured roots are listed).
+    """
+    try:
+        from core.setup_preflight import run_preflight
+        data = run_preflight()
+        for check in data.get("checks", []):
+            details = check.get("details")
+            if isinstance(details, dict) and "subfolders" in details:
+                details.pop("subfolders")
+    except Exception as e:
+        app_logger.error(f"Debug package: failed running preflight: {e}")
+        data = {"error": str(e)}
+    return json.dumps(data, indent=2, default=str)
+
+
 def _tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
     """Return the last ``lines`` lines of a text file, or a placeholder."""
     if not path or not os.path.exists(path):
@@ -284,6 +341,7 @@ def _readme() -> str:
         "Contents:\n"
         "  system_info.json  - version, platform, python, key paths, flags\n"
         "  root_paths.json   - library/WATCH/TARGET roots and which are one folder\n"
+        "  preflight.json    - setup checks: volumes writable, database, owner, user\n"
         "  config.ini        - your config with secrets masked\n"
         "  db_settings.json  - user_preferences (settings) + table list\n"
         "  logs/app.log      - last {n} lines of the application log\n"
@@ -303,7 +361,8 @@ def build_debug_package() -> bytes:
         zf.writestr("README.txt", _readme())
         zf.writestr("system_info.json", _system_info_json())
         zf.writestr("root_paths.json", _root_paths_json())
-        zf.writestr("config.ini", _redacted_config_ini())
+        zf.writestr("preflight.json", _preflight_json())
+        zf.writestr("config.ini", _redacted_settings())
         zf.writestr("db_settings.json", _db_settings_json())
         zf.writestr("logs/app.log", _tail(APP_LOG))
         zf.writestr("logs/monitor.log", _tail(MONITOR_LOG))

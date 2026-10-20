@@ -82,6 +82,7 @@ class TestRolePolicy:
         ("POST", "/api/account/dashboard", "reader"),
         ("GET", "/config", "owner"),
         ("POST", "/api/config/file-processing", "owner"),
+        ("POST", "/api/config/folder-paths", "owner"),
         ("GET", "/api/database/stats", "owner"),
         # Local ComicVine DB auto-update. These live under /api/providers, not
         # /api/preferences, precisely so the owner prefix covers them: the
@@ -98,6 +99,7 @@ class TestRolePolicy:
         ("POST", "/api/database/salvage/apply", "owner"),
         ("POST", "/api/database/checkpoint", "owner"),
         ("GET", "/api/database/health", "owner"),
+        ("GET", "/api/setup/preflight", "owner"),
         ("GET", "/api/admin/users", "owner"),
         ("POST", "/api/libraries", "owner"),          # library CRUD → owner
         ("DELETE", "/api/publishers/10", "owner"),

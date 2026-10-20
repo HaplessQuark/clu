@@ -6,20 +6,16 @@ from unittest.mock import patch, MagicMock
 
 class TestFilesPage:
 
-    @patch("routes.collection.config")
-    def test_files_page(self, mock_config, client):
-        mock_config.get.side_effect = lambda s, k, fallback="": fallback
+    def test_files_page(self, client):
         resp = client.get("/files")
         assert resp.status_code == 200
 
-    @patch("routes.collection.config")
-    def test_files_page_modals_confirm_on_enter(self, mock_config, client):
+    def test_files_page_modals_confirm_on_enter(self, client):
         """Confirmation modals opt into Enter-to-confirm via data-enter-confirm.
 
         The attribute names a button id; clu-utils.js clicks that button when
         Enter is pressed inside the annotated scope.
         """
-        mock_config.get.side_effect = lambda s, k, fallback="": fallback
         html = client.get("/files").get_data(as_text=True)
 
         for button_id in (
@@ -35,14 +31,12 @@ class TestFilesPage:
             assert f'data-enter-confirm="{button_id}"' in html
             assert f'id="{button_id}"' in html
 
-    @patch("routes.collection.config")
-    def test_files_page_clear_comicinfo_confirms_via_modal(self, mock_config, client):
+    def test_files_page_clear_comicinfo_confirms_via_modal(self, client):
         """Clearing ComicInfo.xml confirms through a modal, not a native confirm().
 
         The modal ships with partials/modal_cbz_info.html so every page that can
         open the CBZ info viewer can also confirm the delete.
         """
-        mock_config.get.side_effect = lambda s, k, fallback="": fallback
         html = client.get("/files").get_data(as_text=True)
 
         assert 'id="clearComicInfoConfirmModal"' in html
@@ -50,13 +44,11 @@ class TestFilesPage:
         assert 'id="clearComicInfoFileName"' in html
         assert 'data-enter-confirm="confirmClearComicInfoBtn"' in html
 
-    @patch("routes.collection.config")
-    def test_files_page_bulk_rename_enter_targets_preview(self, mock_config, client):
+    def test_files_page_bulk_rename_enter_targets_preview(self, client):
         """Enter must never fire a bulk rename -- it stops at Preview.
 
         The Execute buttons in these two-stage modals stay a deliberate click.
         """
-        mock_config.get.side_effect = lambda s, k, fallback="": fallback
         html = client.get("/files").get_data(as_text=True)
 
         for preview_id, execute_id in (
@@ -71,74 +63,62 @@ class TestFilesPage:
 class TestCollectionPage:
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
-    def test_collection_root(self, mock_config, mock_sections, client):
-        mock_config.get.return_value = "True"
+    def test_collection_root(self, mock_sections, client):
         resp = client.get("/collection")
         assert resp.status_code == 200
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
-    def test_collection_with_subpath(self, mock_config, mock_sections, client):
-        mock_config.get.return_value = "True"
+    def test_collection_with_subpath(self, mock_sections, client):
         resp = client.get("/collection/DC%20Comics/Batman")
         assert resp.status_code == 200
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
-    @patch("routes.collection.get_default_library", return_value=None)
+    @patch("helpers.library.get_default_library", return_value=None)
     def test_collection_subpath_uses_default_library_root(
-            self, mock_lib, mock_config, mock_sections, client):
+            self, mock_lib, mock_sections, client, app):
         """Legacy clean URL /collection/Marvel resolves to <default-lib>/Marvel.
-        With no library configured, fallback prefix is /data."""
-        mock_config.get.return_value = "True"
+        With no library configured, the prefix is the legacy data mount."""
+        import json
         resp = client.get("/collection/Marvel")
         assert resp.status_code == 200
         # The template embeds initial_path via tojson — it appears literally in the HTML.
-        assert b'"/data/Marvel"' in resp.data
+        expected = json.dumps(f'{app.config["DATA_DIR"]}/Marvel')
+        assert expected.encode() in resp.data
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
-    @patch("routes.collection.get_default_library",
+    @patch("helpers.library.get_default_library",
            return_value={"path": "/manga", "name": "Manga"})
     def test_collection_subpath_uses_configured_default_library(
-            self, mock_lib, mock_config, mock_sections, client):
+            self, mock_lib, mock_sections, client):
         """When the default library is /manga, /collection/Naruto -> /manga/Naruto."""
-        mock_config.get.return_value = "True"
         resp = client.get("/collection/Naruto")
         assert resp.status_code == 200
         assert b'"/manga/Naruto"' in resp.data
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
     def test_collection_query_path_preserved_verbatim(
-            self, mock_config, mock_sections, client):
+            self, mock_sections, client):
         """?path= carries an absolute path that doesn't get re-prefixed.
         This is the refresh-survivability path for non-default libraries
         and the default-library root."""
-        mock_config.get.return_value = "True"
         resp = client.get("/collection?path=/manga/Series%20A")
         assert resp.status_code == 200
         assert b'"/manga/Series A"' in resp.data
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
     def test_collection_query_path_wins_over_subpath(
-            self, mock_config, mock_sections, client):
+            self, mock_sections, client):
         """If both ?path= and a subpath are present, ?path= wins."""
-        mock_config.get.return_value = "True"
         resp = client.get("/collection/Marvel?path=/manga/Naruto")
         assert resp.status_code == 200
         assert b'"/manga/Naruto"' in resp.data
         assert b'"/data/Marvel"' not in resp.data
 
     @patch("routes.collection.get_dashboard_sections", return_value=[])
-    @patch("routes.collection.config")
     def test_collection_offers_both_card_sizes(
-            self, mock_config, mock_sections, client):
+            self, mock_sections, client):
         """The card-size toggle drives collection.js's changeCardSize(), whose
         allowlist is keyed on these exact size names."""
-        mock_config.get.return_value = "True"
         html = client.get("/collection").get_data(as_text=True)
 
         for button_id, size in (
@@ -857,6 +837,7 @@ def _seed_file_index(data_dir, files):
     return paths
 
 
+@pytest.mark.usefixtures("data_dir_library")
 class TestBrowseRecursivePagination:
     """Server-side paginated /api/browse-recursive."""
 
@@ -1143,3 +1124,76 @@ class TestBrowseRecursivePagination:
         bogus = os.path.join(data_dir, "DoesNotExist")
         resp = client.get(f"/api/browse-recursive?path={bogus}")
         assert resp.status_code == 400
+
+    def test_returns_absolute_indexed_paths(self, client, app, db_connection):
+        """Paths come back as indexed, not relative to a hard-coded /data: with
+        more than one library a relative path is ambiguous, and reading
+        positions are keyed on the exact path string."""
+        data_dir = app.config["DATA_DIR"]
+        [full_path] = _seed_file_index(data_dir, [
+            ("Batman 001.cbz", "Batman", "2016", "1"),
+        ])
+
+        resp = client.get(f"/api/browse-recursive?path={data_dir}")
+
+        assert resp.get_json()["files"][0]["path"] == full_path
+
+    def test_any_library_root_is_browsable(self, client, app, db_connection,
+                                           tmp_path):
+        """A second library mounted somewhere other than /data (e.g. /comics)
+        must not be rejected as outside the library."""
+        from core.database import add_library
+
+        comics = tmp_path / "comics"
+        comics.mkdir()
+        add_library("Comics", str(comics))
+        _seed_file_index(str(comics), [("Saga 001.cbz", "Saga", "2012", "1")])
+
+        resp = client.get(f"/api/browse-recursive?path={comics}")
+
+        assert resp.status_code == 200
+        assert [f["name"] for f in resp.get_json()["files"]] == ["Saga 001.cbz"]
+
+    def test_defaults_to_the_default_library(self, client, app, db_connection):
+        data_dir = app.config["DATA_DIR"]
+        _seed_file_index(data_dir, [("Batman 001.cbz", "Batman", "2016", "1")])
+
+        resp = client.get("/api/browse-recursive")
+
+        assert resp.status_code == 200
+        assert resp.get_json()["total"] == 1
+
+
+@pytest.mark.usefixtures("data_dir_library")
+class TestApiBrowseLibraryRoots:
+    """/api/browse treats every library root as a root, not just /data."""
+
+    @patch("routes.collection.get_directory_children", return_value=([], []))
+    def test_no_path_starts_at_the_default_library(self, _children, client, app):
+        resp = client.get("/api/browse")
+
+        data = resp.get_json()
+        assert data["current_path"] == app.config["DATA_DIR"]
+        assert data["parent"] is None
+
+    @patch("routes.collection.get_directory_children", return_value=([], []))
+    def test_a_second_library_root_has_no_parent(self, _children, client,
+                                                 tmp_path):
+        from core.database import add_library
+
+        comics = tmp_path / "comics"
+        comics.mkdir()
+        add_library("Comics", str(comics))
+
+        resp = client.get(f"/api/browse?path={comics}")
+
+        assert resp.get_json()["parent"] is None
+
+    @patch("routes.collection.get_directory_children", return_value=([], []))
+    def test_a_subfolder_has_a_parent(self, _children, client, app):
+        series = os.path.join(app.config["DATA_DIR"], "Batman")
+        os.makedirs(series)
+
+        resp = client.get(f"/api/browse?path={series}")
+
+        assert resp.get_json()["parent"] == app.config["DATA_DIR"]

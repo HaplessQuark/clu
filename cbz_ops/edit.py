@@ -9,8 +9,9 @@ from flask import render_template_string, request, jsonify
 from PIL import Image
 from core.app_logging import app_logger
 from core.thumbnail_cache import regenerate_thumbnail
-from core.config import config, load_config
+from core.settings import get_ext_list
 from helpers import create_thumbnail_streaming, safe_image_open, open_zip_for_write
+from cbz_ops.salvage import decodes, first_undecodable_page, is_crc_error, is_page, read_entry_lenient
 import gc
 
 
@@ -35,12 +36,8 @@ def _validate_final_name(name):
     if name in ('.', '..'):
         raise ValueError(f"final_name reserved: {name!r}")
 
-load_config()
-skipped_exts = config.get("SETTINGS", "SKIPPED_FILES", fallback="")
-deleted_exts = config.get("SETTINGS", "DELETED_FILES", fallback="")
-
-skippedFiles = [ext.strip().lower() for ext in skipped_exts.split(",") if ext.strip()]
-deletedFiles = [ext.strip().lower() for ext in deleted_exts.split(",") if ext.strip()]
+# SKIPPED_FILES / DELETED_FILES are read per call: a module constant froze
+# whatever was stored when this module happened to be imported.
 
 # Partial template for the modal body (the grid of Bootstrap Cards)
 modal_body_template = '''
@@ -55,6 +52,11 @@ modal_body_template = '''
             {% endif %}
           </div>
           <div class="card-body d-flex flex-column p-2">
+            {% if card.damaged == 'undecodable' %}
+              <span class="badge bg-danger mb-1 text-wrap" title="This page failed its checksum and the image does not decode">Damaged &mdash; remove this page</span>
+            {% elif card.damaged == 'decoded' %}
+              <span class="badge bg-warning text-dark mb-1 text-wrap" title="This page failed its checksum but the image still decodes; saving rewrites it with a fresh checksum">CRC mismatch, decoded OK</span>
+            {% endif %}
             <p class="card-text small text-break mb-2 cbz-edit-filename-wrap">
                 <span class="editable-filename" data-rel-path="{{ card.rel_path }}" onclick="CLU.enableFilenameEdit(this)">{{ card.filename }}</span>
                 <input type="text" class="form-control d-none filename-input form-control-sm" value="{{ card.filename }}" data-rel-path="{{ card.rel_path }}">
@@ -81,7 +83,9 @@ def process_cbz_file(file_path):
       4. If the ZIP contains a single directory (ignoring files), update folder_name to that inner directory.
          (This is done recursively in case there are multiple nested directories.)
       5. Delete all .nfo, .sfv, .db and .DS_Store files.
-    Returns a dictionary with 'folder_name' and 'zip_file_path'.
+    Returns a dictionary with 'folder_name', 'zip_file_path' and 'damaged'
+    (``{normalised extracted path: 'decoded' | 'undecodable'}`` for every entry
+    that failed its CRC or could not be read).
     Uses memory-efficient streaming extraction.
     """
     app_logger.info("********************// Editing CBZ File //********************")
@@ -94,7 +98,8 @@ def process_cbz_file(file_path):
     folder_name = base_name + '_folder'
     
     app_logger.info(f"Processing CBZ: {file_path} --> {zip_path}")
-    
+    damaged = {}
+
     try:
         # Step 1: Rename .cbz to .zip
         os.rename(file_path, zip_path)
@@ -104,14 +109,24 @@ def process_cbz_file(file_path):
         
         # Step 3: Extract ZIP contents into folder using streaming
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            # Get list of files first to avoid memory issues
-            file_list = zf.namelist()
-            
-            for filename in file_list:
+            for info in zf.infolist():
                 try:
-                    zf.extract(filename, folder_name)
+                    zf.extract(info, folder_name)
                 except Exception as e:
-                    app_logger.warning(f"Failed to extract {filename}: {e}")
+                    target = os.path.normpath(os.path.join(folder_name, info.filename))
+                    if is_crc_error(e):
+                        # Read past the checksum, so the user sees the page and
+                        # can decide; it is flagged either way.
+                        data, _ = read_entry_lenient(zf, info)
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with open(target, 'wb') as out:
+                            out.write(data)
+                        damaged[target] = 'decoded' if decodes(info.filename, data) else 'undecodable'
+                        app_logger.warning(f"{info.filename} failed its CRC ({damaged[target]})")
+                    else:
+                        if is_page(info.filename):
+                            damaged[target] = 'undecodable'
+                        app_logger.warning(f"Failed to extract {info.filename}: {e}")
                     continue
         
         # Step 4: Delete files that match deleted extensions (case-insensitive)
@@ -119,13 +134,13 @@ def process_cbz_file(file_path):
         for root, _, files in os.walk(folder_name):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
-                if ext in deletedFiles:
-                    file_path = os.path.join(root, file)
+                if ext in get_ext_list("DELETED_FILES"):
+                    unwanted = os.path.join(root, file)
                     try:
-                        os.remove(file_path)
-                        app_logger.info(f"Deleted unwanted file: {file_path}")
+                        os.remove(unwanted)
+                        app_logger.info(f"Deleted unwanted file: {unwanted}")
                     except Exception as e:
-                        app_logger.error(f"Error deleting file {file_path}: {e}")
+                        app_logger.error(f"Error deleting file {unwanted}: {e}")
 
         # Step 5: Check if the extracted content contains a single directory.
         # Do this recursively in case the ZIP nests multiple single-directory levels.
@@ -139,16 +154,24 @@ def process_cbz_file(file_path):
                 break
 
         app_logger.info(f"Extraction complete: {folder_name}")
-        return {"folder_name": folder_name, "zip_file_path": zip_path}
-        
+        return {"folder_name": folder_name, "zip_file_path": zip_path, "damaged": damaged}
+
     except Exception as e:
         app_logger.error(f"Error processing CBZ file: {e}")
         # Clean up on error
-        if os.path.exists(folder_name):
+        extract_root = base_name + '_folder'
+        if os.path.exists(extract_root):
             try:
-                shutil.rmtree(folder_name)
+                shutil.rmtree(extract_root)
             except Exception as cleanup_error:
                 app_logger.error(f"Error cleaning up folder on failure: {cleanup_error}")
+        # Put the comic back under its own name: a damaged archive that will
+        # not open must not be stranded as a .zip nothing in the library sees.
+        if zip_path != file_path and os.path.exists(zip_path) and not os.path.exists(file_path):
+            try:
+                os.rename(zip_path, file_path)
+            except Exception as restore_error:
+                app_logger.error(f"Could not restore {file_path} after a failed edit: {restore_error}")
         raise
 
 
@@ -163,6 +186,7 @@ def get_edit_modal(file_path):
     result = process_cbz_file(file_path)
     folder_name = result["folder_name"]
     zip_file_path = result["zip_file_path"]
+    damaged = result.get("damaged", {})
     
     file_cards = []
     # Walk the extraction folder recursively
@@ -170,7 +194,7 @@ def get_edit_modal(file_path):
         for f in files:
             ext = os.path.splitext(f)[1].lower()
             # Skip files based on config
-            if ext in skippedFiles:
+            if ext in get_ext_list("SKIPPED_FILES"):
                 app_logger.info(f"Skipping file in edit modal: {f}")
                 continue
 
@@ -196,7 +220,12 @@ def get_edit_modal(file_path):
                 except Exception as e:
                     app_logger.info(f"Thumbnail generation failed for '{rel_path}': {e}")
 
-            file_cards.append({"filename": filename_only, "rel_path": rel_path, "img_data": img_data})
+            file_cards.append({
+                "filename": filename_only,
+                "rel_path": rel_path,
+                "img_data": img_data,
+                "damaged": damaged.get(os.path.normpath(os.path.join(root, f))),
+            })
             
             # Force garbage collection periodically to prevent memory buildup
             if len(file_cards) % 10 == 0:
@@ -210,6 +239,38 @@ def get_edit_modal(file_path):
         "zip_file_path": zip_file_path,
         "original_file_path": file_path
     }
+
+def _recheck_listed_problems(path):
+    """After a save, re-check a comic that is on the Problem Files page.
+
+    Removing a damaged page in Edit is a repair, so the row should clear -- but
+    only on evidence. The repacked archive has fresh checksums whatever is in
+    it, so ``recheck_file`` (CRCs) is not enough on its own: every page must
+    also decode, or the damage is recorded again with the page named. Gated on
+    an existing row so an ordinary edit does not decode a whole comic.
+    """
+    try:
+        from core.problem_files import (
+            SOURCE_INTEGRITY, SOURCE_REBUILD, clear_problem, has_problem, record_problem,
+        )
+
+        if not has_problem(path):
+            return
+        from core.library_health import recheck_file
+
+        ok, _msg = recheck_file(path)
+        if not ok:
+            return
+        bad = first_undecodable_page(path)
+        if bad:
+            name, reason = bad
+            record_problem(path, SOURCE_INTEGRITY, error_class="UnreadablePage",
+                           error_message=f"{name}: {reason}")
+            return
+        clear_problem(path, SOURCE_REBUILD)
+    except Exception as e:
+        app_logger.error(f"Could not re-check {path} after saving: {e}")
+
 
 def save_cbz():
     """
@@ -366,7 +427,8 @@ def save_cbz():
         gc.collect()
         
         regenerate_thumbnail(original_file_path)
-        
+        _recheck_listed_problems(original_file_path)
+
         return jsonify({"success": True, "message": "CBZ file saved successfully"})
         
     except Exception as e:

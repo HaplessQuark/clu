@@ -139,6 +139,7 @@ Track ongoing series and new weekly comic releases.
 - **Publishers** — publisher list synced from Metron, with filtering.
 - **Create/Update series.json** — from any folder menu (File Manager, collection grid) or the series page, pick Metron, ComicVine or Auto (library provider order). A missing description is filled from the next provider; an existing cvinfo is reused, never re-asked. The default provider is set under Settings → Metadata Providers.
 - **Automap (Scan Library)** — match your existing folders to series automatically using sidecar files, with Mylar-compatible `series.json` support. Ended series default to Monitor off.
+- **Import from Mylar3** — upload Mylar's `mylar.db` and `config.ini` (or drop them in `/cache/mylar_import/`) to bring its watchlist onto the Pull List, with Paused series unmonitored and Skipped/Archived issue marks carried over, plus its SABnzbd/NZBGet client, Newznab indexers and ComicVine key. A series Metron doesn't carry is built from the issue list Mylar already holds, so it costs no ComicVine requests. Everything is previewed first, and settings CLU already has are only replaced when you tick them.
 
 📖 [Pull list docs](https://clucomics.org/features/pull-list/) · [Releases](https://clucomics.org/features/pull-list/releases/) · [Wanted](https://clucomics.org/features/pull-list/wanted/) · [Weekly packs](https://clucomics.org/features/pull-list/weekly/) · [Automap](https://clucomics.org/features/pull-list/automap/)
 
@@ -183,7 +184,7 @@ Point CLU at a downloads folder and let it file new comics automatically.
 - **Empty-folder cleanup** in the target after a move.
 - A debounced file watcher feeds a background metadata scanner that keeps the file index current.
 
-Enable with `MONITOR=yes` in your Docker environment.
+Turn it on under **Settings → File Processing → Folder Monitoring**; the change applies without a restart. (The old `MONITOR=yes` environment variable is imported once on upgrade and then ignored.)
 
 📖 [Folder monitoring docs](https://clucomics.org/features/folder-monitoring/) · [Setup](https://clucomics.org/features/folder-monitoring/setup/)
 
@@ -226,6 +227,7 @@ Optional AI-powered reading recommendations based on your library and reading hi
 ## Administration
 
 - **Schedules** — scheduled jobs for file-index rebuilds, reading-list sync, GetComics runs and the scrape index.
+- **Library health scan** (opt-in, Problem Files page) — a rolling, resumable background pass that hashes and CRC-checks comics in small batches, flags `.cbr` files sitting beside their `.cbz` and comics left unfiled in your download folders, lists library folders left empty or holding only `cvinfo`/`series.json` (with their own filter and a quick **Scan empty folders** button), and finds exact and likely duplicates for review. A coverage bar says how much of the library has been checked, and a health score shows beside Problem Files in the gear menu. Off by default because it reads every comic; nothing is deleted without you choosing which copy to keep.
 - **Database tools** — backup, restore and download the SQLite database from the UI, with corruption detection and a salvage tool. The database lives in `/config`, so it persists across container updates.
 - **Logs** — an in-app log viewer with a polled tail, plus separate application and folder-monitoring logs.
 - **Debug package export** — bundle logs and config with secrets redacted, for bug reports.

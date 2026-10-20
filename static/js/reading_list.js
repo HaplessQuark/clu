@@ -42,24 +42,134 @@ function toggleTagFilter(btn) {
     applyTagFilters();
 }
 
-function applyTagFilters() {
+function applyTagFilters(options) {
+    const resetPage = !(options && options.resetPage === false);
     const cards = document.querySelectorAll('.reading-list-card');
 
     cards.forEach(card => {
         const cardTags = JSON.parse(card.dataset.tags || '[]');
-
-        if (activeTagFilters.size === 0) {
-            card.style.display = '';
-        } else {
-            // Show if card has ALL of the active filter tags (AND logic)
-            const hasAllTags = [...activeTagFilters].every(t => cardTags.includes(t));
-            card.style.display = hasAllTags ? '' : 'none';
+        // Show if card has ALL of the active filter tags (AND logic). The
+        // pager decides what is displayed -- see CLU.createClientPager.
+        const matches = activeTagFilters.size === 0 ||
+            [...activeTagFilters].every(t => cardTags.includes(t));
+        card.dataset.match = matches ? '1' : '0';
+        // A list the filter just hid must not stay in a bulk delete.
+        const cb = card.querySelector('.list-select-cb');
+        if (!matches && cb && cb.checked) {
+            cb.checked = false;
+            onListCheckboxChange(cb);
         }
     });
+    if (readingListPager) readingListPager.refresh({ resetPage });
 }
+
+// ==========================================
+// Pagination (same bar as /library)
+// ==========================================
+
+let readingListPager = null;
+const DEFAULT_LIST_SORT = 'date-desc';
+
+function activeListSort() {
+    const btn = document.querySelector('.sort-btn.active');
+    return btn ? btn.dataset.sort : DEFAULT_LIST_SORT;
+}
+
+// Put back the tag filter and sort a page number was taken from, so a
+// reload or Back shows page N of the same list. Tags and sorts the page no
+// longer offers are ignored.
+function restoreListStateFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+
+    const tagButtons = Array.from(document.querySelectorAll('.tag-filter-btn'));
+    params.getAll('tag').forEach(tag => {
+        const btn = tagButtons.find(b => b.dataset.tag === tag && tag !== 'all');
+        if (btn) {
+            activeTagFilters.add(tag);
+            btn.classList.add('active');
+        }
+    });
+    if (activeTagFilters.size) {
+        tagButtons.filter(b => b.dataset.tag === 'all').forEach(b => b.classList.remove('active'));
+    }
+
+    const sort = params.get('sort');
+    const sortBtn = sort && Array.from(document.querySelectorAll('.sort-btn'))
+        .find(b => b.dataset.sort === sort);
+    if (sortBtn) applySort(sortBtn, { render: false });
+
+    // First render keeps the page from the URL, as on /library
+    applyTagFilters({ resetPage: false });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const grid = document.querySelector('.reading-list-grid');
+    const nav = document.getElementById('rlPagination');
+    if (!grid || !nav || !window.CLU || !CLU.createClientPager) return;
+    readingListPager = CLU.createClientPager({
+        items: () => Array.from(grid.querySelectorAll('.reading-list-card')),
+        nav,
+        perPageSelect: document.getElementById('rlPerPage'),
+        // The grid is 4 cards wide on a typical screen; 50 left a gap.
+        defaultPerPage: 40,
+        scrollTarget: document.querySelector('.sort-bar') || grid,
+        urlState: () => ({
+            tag: [...activeTagFilters],
+            sort: activeListSort() === DEFAULT_LIST_SORT ? '' : activeListSort(),
+        }),
+        // The bulk bar counts selected lists on other pages.
+        onRender: () => updateBulkBar(),
+    });
+    restoreListStateFromUrl();
+});
 
 // Initialize tag filters on page load
 document.addEventListener('DOMContentLoaded', initTagFilters);
+
+// ==========================================
+// Card tag row: one line, overflow as "+N"
+// ==========================================
+
+// The card has a fixed height, so wrapping tags would squeeze the covers.
+// Show what fits, hide the rest from the end, and say how many are hidden;
+// hovering the chip (or the row) lists them.
+function fitCardTags(box) {
+    const tags = [...box.querySelectorAll('.tag-badge:not(.tag-more)')];
+    const more = box.querySelector('.tag-more');
+    if (!more || box.clientWidth === 0) return;  // hidden by a filter
+
+    tags.forEach(t => { t.hidden = false; t.classList.remove('tag-squeeze'); });
+    more.hidden = true;
+    const overflowing = () => box.scrollWidth > box.clientWidth + 1;
+    if (!overflowing()) return;
+
+    const hidden = [];
+    more.hidden = false;
+    // Never hide the first tag: it shrinks to an ellipsis instead (CSS).
+    for (let i = tags.length - 1; i >= 1; i--) {
+        tags[i].hidden = true;
+        hidden.unshift(tags[i].textContent.trim());
+        more.textContent = `+${hidden.length}`;
+        if (!overflowing()) break;
+    }
+    if (hidden.length === 0) more.hidden = true;
+    more.title = hidden.join(', ');
+    // Still too wide with one tag left: let that one ellipsize (CSS).
+    if (overflowing() && tags[0]) tags[0].classList.add('tag-squeeze');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const boxes = document.querySelectorAll('.reading-list-card .card-tags');
+    if (!boxes.length) return;
+    if ('ResizeObserver' in window) {
+        // Fires on first layout, on window resize, and when a tag filter
+        // shows a card again -- every case where the room changes.
+        const ro = new ResizeObserver(entries => entries.forEach(e => fitCardTags(e.target)));
+        boxes.forEach(b => ro.observe(b));
+    } else {
+        boxes.forEach(fitCardTags);
+    }
+});
 
 // ==========================================
 // Sort System
@@ -71,7 +181,7 @@ function initSortButtons() {
     });
 }
 
-function applySort(btn) {
+function applySort(btn, options) {
     document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
 
@@ -96,6 +206,9 @@ function applySort(btn) {
     });
 
     cards.forEach(card => grid.appendChild(card));
+    if (readingListPager && !(options && options.render === false)) {
+        readingListPager.refresh({ resetPage: true });
+    }
 }
 
 document.addEventListener('DOMContentLoaded', initSortButtons);
@@ -611,15 +724,34 @@ function updateBulkBar() {
 
     if (isSelectModeActive()) {
         bar.style.display = 'block';
-        count.textContent = `${selectedListIds.size} list${selectedListIds.size === 1 ? '' : 's'} selected`;
+        const n = selectedListIds.size;
+        // Bulk delete reaches every selected list; say how many are off-screen.
+        const offPage = selectedListsOffPage();
+        count.textContent = `${n} list${n === 1 ? '' : 's'} selected` +
+            (offPage ? ` (${offPage} on other pages)` : '');
     } else {
         bar.style.display = 'none';
     }
 }
 
+// Selected lists the pager has put on another page.
+function selectedListsOffPage() {
+    if (!readingListPager) return 0;
+    return Array.from(document.querySelectorAll('.reading-list-card'))
+        .filter(card => {
+            const cb = card.querySelector('.list-select-cb');
+            return cb && cb.checked && !readingListPager.isOnPage(card);
+        }).length;
+}
+
+// "Select All" means every list matching the tag filter, on every page --
+// style.display only says which page a card is on.
 function selectAllVisibleLists() {
-    document.querySelectorAll('.reading-list-card').forEach(card => {
-        if (card.style.display === 'none') return;
+    const cards = readingListPager
+        ? readingListPager.matching()
+        : Array.from(document.querySelectorAll('.reading-list-card'))
+            .filter(card => card.dataset.match !== '0');
+    cards.forEach(card => {
         const cb = card.querySelector('.list-select-cb');
         if (cb && !cb.checked) {
             cb.checked = true;
@@ -644,13 +776,14 @@ function bulkDeleteSelected() {
     }
 
     const count = selectedListIds.size;
+    const offPage = selectedListsOffPage();
     const toastContainer = getToastContainer();
     const toast = document.createElement('div');
     toast.className = 'toast align-items-center text-white bg-danger border-0 show';
     toast.setAttribute('role', 'alert');
     toast.innerHTML = `
         <div class="toast-body">
-            <div class="mb-2">Delete ${count} selected reading list${count === 1 ? '' : 's'}?</div>
+            <div class="mb-2">Delete ${count} selected reading list${count === 1 ? '' : 's'}?${offPage ? ` ${offPage} of them ${offPage === 1 ? 'is' : 'are'} on other pages.` : ''}</div>
             <div class="d-flex gap-2">
                 <button class="btn btn-warning btn-sm confirm-bulk-delete-btn">Delete</button>
                 <button class="btn btn-light btn-sm cancel-bulk-delete-btn">Cancel</button>
@@ -1078,11 +1211,20 @@ document.addEventListener('click', function (e) {
 let currentEntryId = null;
 let selectedFilePath = null;
 let mapModal = null;
+// The entry the Map Issue modal is for, sent with every search so the server
+// can rank this issue of this series, in the right year, first.
+let mapHints = null;
 
-function openMapModal(entryId, series, number, volume, year) {
+function openMapModal(entryId, series, number, volume, year, issueYear) {
     if (reorderMode) return;
     currentEntryId = entryId;
     selectedFilePath = null;
+    // `year` is the issue's year in a CBL but the volume's start year in a
+    // Metron or ComicVine import, which store the issue's own in issue_year.
+    mapHints = {
+        series: series || '', number: number || '', volume: volume || '',
+        year: year || '', issue_year: issueYear || '',
+    };
     document.getElementById('mapTargetName').textContent = `${series} #${number}`;
 
     const input = document.getElementById('fileSearchInput');
@@ -1132,7 +1274,8 @@ function searchFiles(retryWithoutFirstWord = false) {
     const resultsDiv = document.getElementById('searchResults');
     resultsDiv.innerHTML = '<div class="text-center p-3"><div class="spinner-border text-primary" role="status"></div></div>';
 
-    fetch(`/api/reading-lists/search-file?q=${encodeURIComponent(query)}`)
+    const searchParams = new URLSearchParams({ q: query, ...(mapHints || {}) });
+    fetch(`/api/reading-lists/search-file?${searchParams}`)
         .then(response => response.json())
         .then(results => {
             resultsDiv.innerHTML = '';
@@ -1153,13 +1296,19 @@ function searchFiles(retryWithoutFirstWord = false) {
             results.forEach(file => {
                 const item = document.createElement('div');
                 item.className = 'list-group-item list-group-item-action search-result-item';
+                const fitBadge = file.fit === 'match'
+                    ? '<span class="badge text-bg-success ms-2">Best match</span>'
+                    : file.fit === 'year_mismatch'
+                        ? '<span class="badge text-bg-warning ms-2">Different year</span>'
+                        : '';
+                if (file.fit === 'year_mismatch') item.classList.add('opacity-75');
                 item.innerHTML = `
                 <div class="d-flex flex-column w-100">
                     <div class="d-flex w-100 justify-content-between">
-                        <h6 class="mb-1 text-truncate">${file.name}</h6>
-                        <small class="text-muted">${file.path.split('/').slice(-2, -1)[0]}</small>
+                        <h6 class="mb-1 text-truncate">${CLU.escapeHtml(file.name)}${fitBadge}</h6>
+                        <small class="text-muted">${CLU.escapeHtml(file.path.split('/').slice(-2, -1)[0] || '')}</small>
                     </div>
-                    <small class="text-info-emphasis text-break font-monospace">${file.path}</small>
+                    <small class="text-info-emphasis text-break font-monospace">${CLU.escapeHtml(file.path)}</small>
                 </div>
             `;
                 item.onclick = () => selectFile(file.path, item);
@@ -1356,10 +1505,10 @@ function searchFilesForAdd() {
                 item.innerHTML = `
                     <div class="d-flex flex-column w-100">
                         <div class="d-flex w-100 justify-content-between">
-                            <h6 class="mb-1 text-truncate">${file.name}</h6>
-                            <small class="text-muted">${file.path.split('/').slice(-2, -1)[0]}</small>
+                            <h6 class="mb-1 text-truncate">${CLU.escapeHtml(file.name)}</h6>
+                            <small class="text-muted">${CLU.escapeHtml(file.path.split('/').slice(-2, -1)[0] || '')}</small>
                         </div>
-                        <small class="text-info-emphasis text-break font-monospace">${file.path}</small>
+                        <small class="text-info-emphasis text-break font-monospace">${CLU.escapeHtml(file.path)}</small>
                     </div>
                 `;
                 item.onclick = () => {
@@ -1685,9 +1834,9 @@ function _createFileEl(file, depth) {
     const filename = file.path.split('/').pop().replace(/\.cbl$/i, '');
     div.innerHTML = `
         <div class="form-check mb-0">
-            <input class="form-check-input tree-file-check" type="checkbox" value="${file.path}" id="chk-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}" onchange="updateSelectedCount()">
+            <input class="form-check-input tree-file-check" type="checkbox" value="${CLU.escapeHtml(file.path)}" id="chk-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}" onchange="updateSelectedCount()">
             <label class="form-check-label" for="chk-${file.path.replace(/[^a-zA-Z0-9]/g, '_')}">
-                <i class="bi bi-file-earmark-text me-1 text-primary"></i>${filename}
+                <i class="bi bi-file-earmark-text me-1 text-primary"></i>${CLU.escapeHtml(filename)}
             </label>
         </div>
     `;

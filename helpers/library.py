@@ -9,14 +9,17 @@ def get_library_roots():
 
     Returns:
         List of path strings for enabled libraries.
-        Falls back to ['/data'] if no libraries configured.
+        Falls back to the legacy /data mount (if it exists) when no
+        libraries are configured.
     """
     from core.database import get_libraries
+    from core.config import get_data_dir
     libraries = get_libraries(enabled_only=True)
     if libraries:
         return [lib['path'] for lib in libraries]
     # Fallback for backwards compatibility
-    return ['/data'] if os.path.exists('/data') else []
+    data_dir = get_data_dir()
+    return [data_dir] if os.path.exists(data_dir) else []
 
 
 def get_default_library():
@@ -29,6 +32,28 @@ def get_default_library():
     from core.database import get_libraries
     libraries = get_libraries(enabled_only=True)
     return libraries[0] if libraries else None
+
+
+def get_default_library_root():
+    """Path of the default library, or the legacy ``/data`` mount when none is configured.
+
+    The one answer to "where does a path-less request start?". ``/data`` is
+    only the default mount, not a requirement: a library configured at
+    ``/comics`` must work with no ``/data`` volume at all.
+    """
+    lib = get_default_library()
+    if lib:
+        return lib['path']
+    from core.config import get_data_dir
+    return get_data_dir()
+
+
+def is_library_root(path):
+    """True if *path* is exactly one of the enabled library roots."""
+    if not path:
+        return False
+    normalized = os.path.normpath(path)
+    return any(normalized == os.path.normpath(r) for r in get_library_roots())
 
 
 def is_allowed_path(path):
@@ -237,15 +262,15 @@ def _resolve_trash_dir():
 
     ``helpers.trash.get_trash_dir`` reads ``current_app`` and also *creates* the
     directory, so it is unusable from a scheduler thread. This mirrors its
-    fallback chain against the RawConfigParser instead.
+    fallback chain against the stored settings instead.
     """
-    from core.config import config
+    from core.config import get_cache_dir
+    from core.settings import get_setting
 
     try:
-        trash_dir = config.get("SETTINGS", "TRASH_DIR", fallback="").strip()
+        trash_dir = (get_setting("TRASH_DIR") or "").strip()
         if not trash_dir:
-            cache_dir = config.get("SETTINGS", "CACHE_DIR", fallback="/cache")
-            trash_dir = os.path.join(cache_dir, "trash")
+            trash_dir = os.path.join(get_cache_dir(), "trash")
         return trash_dir
     except Exception:
         return ""
@@ -297,7 +322,8 @@ def is_critical_path(path):
     For automated sweeps use :func:`get_protected_roots` instead — see its
     docstring for why. A new protected location belongs in both.
     """
-    from core.config import config, get_watch_dir, get_target_dir
+    from core.config import get_cache_dir, get_watch_dir, get_target_dir
+    from core.settings import get_setting
 
     if not path:
         return False
@@ -316,10 +342,9 @@ def is_critical_path(path):
 
     # Protect the trash directory root
     try:
-        trash_dir = config.get("SETTINGS", "TRASH_DIR", fallback="").strip()
+        trash_dir = (get_setting("TRASH_DIR") or "").strip()
         if not trash_dir:
-            cache_dir = config.get("SETTINGS", "CACHE_DIR", fallback="/cache")
-            trash_dir = os.path.join(cache_dir, "trash")
+            trash_dir = os.path.join(get_cache_dir(), "trash")
         if os.path.normpath(path) == os.path.normpath(trash_dir):
             return True
     except Exception:

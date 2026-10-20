@@ -6,8 +6,9 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css" />
 
 <script>
-    // Initial path from URL (e.g., /collection/Marvel -> /data/Marvel).
+    // Initial path from URL (e.g., /collection/Marvel -> <default library>/Marvel).
     // If no URL path specified, fall back to the saved library selection.
+    window.DEFAULT_LIBRARY_ROOT = {{ default_library_root | default('') | tojson | safe }};
     (function () {
         const urlPath = {{ initial_path | default('') | tojson | safe }};
         if (urlPath && urlPath !== '') {
@@ -111,7 +112,7 @@
             <div class="d-flex align-items-center" style="flex: 0 0 auto;">
                 <div class="input-group input-group-sm">
                     <label class="input-group-text bg-body border-0" for="itemsPerPage">Per page</label>
-                    <select class="form-select border-0 shadow-none bg-body" id="itemsPerPage" onchange="changeItemsPerPage(this.value)">
+                    <select class="form-select border-0 shadow-none bg-body text-body" id="itemsPerPage" onchange="changeItemsPerPage(this.value)">
                         <option value="21" selected>20</option>
                         <option value="49">50</option>
                         <option value="98">100</option>
