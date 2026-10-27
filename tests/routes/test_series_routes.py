@@ -1025,6 +1025,112 @@ class TestPullListPage:
         assert "Not monitored" in html
 
 
+class TestPullListPaging:
+    """/pull-list renders one page, filtered and sorted on the server, and
+    /api/pull-list/rows and /ids serve the later pages and select-all."""
+
+    @staticmethod
+    def _seed(n=30):
+        from tests.factories.db_factories import create_series
+        for i in range(n):
+            create_series(series_id=5000 + i, name=f"Zeta {i:02d}", publisher_id=10)
+
+    def test_first_page_only(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        html = client_with_data.get("/pull-list?per_page=24").get_data(as_text=True)
+        # 32 mapped series (Batman, Spider-Man and 30 Zetas), 24 on the page.
+        assert html.count("data-series-id=") == 24
+        assert 'data-total-pages="2"' in html
+        assert "Showing 1–24 of 32 series" in html
+
+    def test_filters_from_the_query_string(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        html = client_with_data.get(
+            "/pull-list?publisher=20&sort=name&dir=desc"
+        ).get_data(as_text=True)
+        assert html.count("data-series-id=") == 1
+        assert 'data-series-id="200"' in html
+        assert '<option value="20" selected>' in html
+        assert "bi bi-chevron-down text-primary ms-1" in html
+
+    def test_bad_params_fall_back_to_defaults(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        resp = client_with_data.get(
+            "/pull-list?page=abc&per_page=7&publisher=x&sort=evil;--&status=nope"
+        )
+        assert resp.status_code == 200
+        html = resp.get_data(as_text=True)
+        assert html.count("data-series-id=") == 2
+        assert 'data-per-page="50"' in html
+
+    def test_rows_endpoint(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        data = client_with_data.get(
+            "/api/pull-list/rows?per_page=24&page=2"
+        ).get_json()
+        assert data["success"] is True
+        assert (data["page"], data["total"], data["total_pages"]) == (2, 32, 2)
+        assert data["html"].count("data-series-id=") == 8
+
+    def test_rows_endpoint_no_match(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        data = client_with_data.get("/api/pull-list/rows?q=nothing").get_json()
+        assert data["total"] == 0
+        assert "No series match" in data["html"]
+
+    def test_ids_endpoint_spans_pages(self, client_with_data):
+        self._seed()
+        data = client_with_data.get("/api/pull-list/ids?q=zeta").get_json()
+        assert data["success"] is True
+        assert data["ids"] == list(range(5000, 5030))
+
+    def test_a_database_error_is_an_error_not_no_match(self, app, client_with_data):
+        """A failed query used to answer an empty page: "No series match"."""
+        from unittest.mock import patch
+        TestPullListPage._register_slug_global(app)
+        failed = {"rows": [], "total": 0, "page": 1, "per_page": 50,
+                  "total_pages": 1, "error": "Could not read the pull list"}
+        with patch("core.database.get_pull_list_page", return_value=failed):
+            resp = client_with_data.get("/api/pull-list/rows")
+            assert resp.status_code == 500 and resp.get_json()["success"] is False
+            html = client_with_data.get("/pull-list").get_data(as_text=True)
+            assert "Could not read the pull list" in html
+            assert "No series match these filters" not in html
+            count = html.split('id="resultCount">', 1)[1].split("</span>", 1)[0]
+            assert "No series match" not in count
+        with patch("core.database.get_pull_list_matching_ids", return_value=None):
+            resp = client_with_data.get("/api/pull-list/ids")
+            assert resp.status_code == 500 and resp.get_json()["success"] is False
+
+    def test_bulk_monitored_url_follows_the_script_root(self, app, client_with_data):
+        """CLU runs behind ProxyFix(x_prefix=1); a hardcoded /api/ 404s
+        under a subpath."""
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get(
+            "/pull-list", environ_overrides={"SCRIPT_NAME": "/clu"}
+        ).get_data(as_text=True)
+        assert '"/clu/api/series/bulk-monitored"' in html
+        assert "'/api/series/bulk-monitored'" not in html
+
+    def test_a_stale_letter_or_publisher_is_dropped(self, app, client_with_data):
+        """A bookmark naming a letter or publisher the bar no longer offers
+        would filter on something the page shows as "All"."""
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get("/pull-list?letter=Q&publisher=999").get_data(as_text=True)
+        assert html.count("data-series-id=") == 2
+        assert 'class="btn btn-sm btn-outline-secondary active" data-letter="all"' in html
+
+    def test_letters_and_publishers_render(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get("/pull-list?letter=B").get_data(as_text=True)
+        assert 'data-letter="A"' in html and 'data-letter="B"' in html
+        assert 'class="btn btn-sm btn-outline-secondary active" data-letter="B"' in html
+        assert html.count("data-series-id=") == 1
+
+
 def _post_import(client, payload, *, raw=None, filename="pull-list.json"):
     """Helper: POST a JSON payload (or raw bytes) to the import endpoint."""
     if raw is None:
