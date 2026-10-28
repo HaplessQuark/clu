@@ -1025,6 +1025,112 @@ class TestPullListPage:
         assert "Not monitored" in html
 
 
+class TestPullListPaging:
+    """/pull-list renders one page, filtered and sorted on the server, and
+    /api/pull-list/rows and /ids serve the later pages and select-all."""
+
+    @staticmethod
+    def _seed(n=30):
+        from tests.factories.db_factories import create_series
+        for i in range(n):
+            create_series(series_id=5000 + i, name=f"Zeta {i:02d}", publisher_id=10)
+
+    def test_first_page_only(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        html = client_with_data.get("/pull-list?per_page=24").get_data(as_text=True)
+        # 32 mapped series (Batman, Spider-Man and 30 Zetas), 24 on the page.
+        assert html.count("data-series-id=") == 24
+        assert 'data-total-pages="2"' in html
+        assert "Showing 1–24 of 32 series" in html
+
+    def test_filters_from_the_query_string(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        html = client_with_data.get(
+            "/pull-list?publisher=20&sort=name&dir=desc"
+        ).get_data(as_text=True)
+        assert html.count("data-series-id=") == 1
+        assert 'data-series-id="200"' in html
+        assert '<option value="20" selected>' in html
+        assert "bi bi-chevron-down text-primary ms-1" in html
+
+    def test_bad_params_fall_back_to_defaults(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        resp = client_with_data.get(
+            "/pull-list?page=abc&per_page=7&publisher=x&sort=evil;--&status=nope"
+        )
+        assert resp.status_code == 200
+        html = resp.get_data(as_text=True)
+        assert html.count("data-series-id=") == 2
+        assert 'data-per-page="50"' in html
+
+    def test_rows_endpoint(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        self._seed()
+        data = client_with_data.get(
+            "/api/pull-list/rows?per_page=24&page=2"
+        ).get_json()
+        assert data["success"] is True
+        assert (data["page"], data["total"], data["total_pages"]) == (2, 32, 2)
+        assert data["html"].count("data-series-id=") == 8
+
+    def test_rows_endpoint_no_match(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        data = client_with_data.get("/api/pull-list/rows?q=nothing").get_json()
+        assert data["total"] == 0
+        assert "No series match" in data["html"]
+
+    def test_ids_endpoint_spans_pages(self, client_with_data):
+        self._seed()
+        data = client_with_data.get("/api/pull-list/ids?q=zeta").get_json()
+        assert data["success"] is True
+        assert data["ids"] == list(range(5000, 5030))
+
+    def test_a_database_error_is_an_error_not_no_match(self, app, client_with_data):
+        """A failed query used to answer an empty page: "No series match"."""
+        from unittest.mock import patch
+        TestPullListPage._register_slug_global(app)
+        failed = {"rows": [], "total": 0, "page": 1, "per_page": 50,
+                  "total_pages": 1, "error": "Could not read the pull list"}
+        with patch("core.database.get_pull_list_page", return_value=failed):
+            resp = client_with_data.get("/api/pull-list/rows")
+            assert resp.status_code == 500 and resp.get_json()["success"] is False
+            html = client_with_data.get("/pull-list").get_data(as_text=True)
+            assert "Could not read the pull list" in html
+            assert "No series match these filters" not in html
+            count = html.split('id="resultCount">', 1)[1].split("</span>", 1)[0]
+            assert "No series match" not in count
+        with patch("core.database.get_pull_list_matching_ids", return_value=None):
+            resp = client_with_data.get("/api/pull-list/ids")
+            assert resp.status_code == 500 and resp.get_json()["success"] is False
+
+    def test_bulk_monitored_url_follows_the_script_root(self, app, client_with_data):
+        """CLU runs behind ProxyFix(x_prefix=1); a hardcoded /api/ 404s
+        under a subpath."""
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get(
+            "/pull-list", environ_overrides={"SCRIPT_NAME": "/clu"}
+        ).get_data(as_text=True)
+        assert '"/clu/api/series/bulk-monitored"' in html
+        assert "'/api/series/bulk-monitored'" not in html
+
+    def test_a_stale_letter_or_publisher_is_dropped(self, app, client_with_data):
+        """A bookmark naming a letter or publisher the bar no longer offers
+        would filter on something the page shows as "All"."""
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get("/pull-list?letter=Q&publisher=999").get_data(as_text=True)
+        assert html.count("data-series-id=") == 2
+        assert 'class="btn btn-sm btn-outline-secondary active" data-letter="all"' in html
+
+    def test_letters_and_publishers_render(self, app, client_with_data):
+        TestPullListPage._register_slug_global(app)
+        html = client_with_data.get("/pull-list?letter=B").get_data(as_text=True)
+        assert 'data-letter="A"' in html and 'data-letter="B"' in html
+        assert 'class="btn btn-sm btn-outline-secondary active" data-letter="B"' in html
+        assert html.count("data-series-id=") == 1
+
+
 def _post_import(client, payload, *, raw=None, filename="pull-list.json"):
     """Helper: POST a JSON payload (or raw bytes) to the import endpoint."""
     if raw is None:
@@ -1529,6 +1635,47 @@ class TestReleasesPublisherFilter:
         assert html.count('<div class="ribbon">Subscribed</div>') == 1
         assert html.count('<span class="badge bg-success ms-1">Subscribed</span>') == 1
         assert html.count("release-card stagger-load tracked") == 1
+
+    def test_cards_and_rows_carry_their_subscription_state(self, client, app):
+        # The Subscription filter reads data-subscribed client-side, on both
+        # views, so it has to agree with the ribbon/badge for every release.
+        with patch("core.database.get_mapped_series_ids", return_value={11}), \
+                patch("core.database.get_tracked_series_lookup", return_value=set()):
+            html = self._render_releases_page(client, app)
+
+        assert html.count('data-subscribed="1"') == 2  # series 11: card + row
+        assert html.count('data-subscribed="0"') == 2  # series 99: card + row
+
+    def test_page_renders_every_filter_group(self, client, app):
+        html = self._render_releases_page(client, app)
+
+        # One group per FILTERS entry; the script finds each group by its key
+        # and reads/writes the matching URL param.
+        for key in ("subscribed", "publisher"):
+            assert f'data-filter-group="{key}"' in html
+            assert f"key: '{key}',\n                param: '{key}'," in html
+        # Subscription is known server-side, so its group is never hidden; the
+        # publisher group waits for the map.
+        assert '<div class="filter-group d-flex align-items-center flex-wrap gap-2" data-filter-group="subscribed">' in html
+        assert 'id="publisher-filter" hidden' in html
+        # .d-flex is !important and beats Bootstrap's bare [hidden] rule, so
+        # without this override `group.hidden = true` would hide nothing.
+        assert ".filter-group[hidden] {\n        display: none !important;" in html
+        # A publisher carried over from another week must survive until the
+        # map has finished loading, rather than being cleared on first render.
+        assert "if (selected[f.key] && !warming" in html
+        assert "if (!data.pending) warming = false;" in html
+        # Filtering everything away says so, with a way back.
+        assert 'id="releases-no-match"' in html
+        assert 'id="clear-filters"' in html
+
+    def test_week_navigation_links_are_tagged_to_keep_filters(self, client, app):
+        # syncUrl() rewrites a.week-nav so Previous/Next keeps the filters on.
+        html = self._render_releases_page(client, app)
+
+        header = html[:html.index('id="release-filters"')]
+        assert header.count("week-nav") == 3
+        assert "document.querySelectorAll('a.week-nav')" in html
 
     def test_page_renders_both_views_with_a_toggle(self, client, app):
         # Cards and the table are rendered together and swapped client-side, so

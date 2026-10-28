@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageChops, 
 from core.database import get_db_connection, current_user_id
 from core.app_logging import app_logger
 from core.thumbnail_cache import thumbnail_cache_path, thumbnails_root
+from tools.build_catppuccin_themes import PALETTE as CATPPUCCIN_PALETTE, year_in_review_colours
 import math
 
 # Image dimensions (9:16 aspect ratio for social sharing)
@@ -49,6 +50,11 @@ THEME_COLORS = {
     'yeti': {'primary': '#008cba', 'secondary': '#adb5bd', 'success': '#43ac6a', 'info': '#5bc0de', 'warning': '#e99002', 'danger': '#f04124', 'bg': '#ffffff', 'bg_secondary': '#f8f9fa', 'text': '#222222', 'text_muted': '#6c757d', 'is_dark': False},
     'zephyr': {'primary': '#3459e6', 'secondary': '#ffffff', 'success': '#2fb380', 'info': '#287bb5', 'warning': '#f4bd61', 'danger': '#da292e', 'bg': '#ffffff', 'bg_secondary': '#f8f9fa', 'text': '#495057', 'text_muted': '#6c757d', 'is_dark': False}
 }
+# Catppuccin's colours come from the generator that writes its stylesheets.
+THEME_COLORS.update({
+    f'catppuccin-{flavour}': year_in_review_colours(flavour)
+    for flavour in CATPPUCCIN_PALETTE
+})
 
 
 def get_theme_colors(theme_name: str) -> dict:

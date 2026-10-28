@@ -131,6 +131,27 @@ class TestDuplicates:
         assert resp.status_code == 200
         assert b"Duplicate Files" in resp.data
 
+    def test_page_carries_the_trash_settings(self, client, app):
+        app.config["TRASH_ENABLED"] = True
+        app.config["TRASH_MAX_SIZE_MB"] = 50
+        body = client.get("/problem-files/duplicates").data
+        assert b'data-trash-enabled="1"' in body
+        assert b'data-trash-max-bytes="52428800"' in body
+
+    def test_page_reports_the_trash_disabled(self, client, app):
+        app.config["TRASH_ENABLED"] = False
+        body = client.get("/problem-files/duplicates").data
+        assert b'data-trash-enabled="0"' in body
+
+    def test_confirmation_is_skipped_only_when_the_trash_can_hold_the_copies(self):
+        src = TestInfoModalIsAvailable._js("library_duplicates.js")
+        assert "function canSkipConfirm(" in src
+        assert "data-trash-enabled" in src and "data-trash-max-bytes" in src
+        # Unknown sizes and an over-limit total both fall back to the modal.
+        assert "if (!(size > 0)) return false;" in src
+        assert "total <= max" in src
+        assert "showModal('dup-confirm-modal')" in src
+
     def test_problem_files_page_has_the_health_card(self, client):
         with patch("core.problem_files.count_problems", return_value={}), \
              patch("core.problem_files.list_problems", return_value=[]):
@@ -282,6 +303,25 @@ class TestInfoModalIsAvailable:
         assert "CLU.showCBZInfo(" in src
         # Edits rewrite the archive, so the list is re-read when the modal closes.
         assert "onMetadataSaved" in src and "hidden.bs.modal" in src
+
+    def test_empty_folder_delete_skips_the_confirmation(self):
+        """Its leftovers are recreatable and the server re-checks emptiness,
+        so the row deletes at once; files still go through the modal."""
+        src = self._js("problem_files.js")
+        body = src.split("function confirmDelete(row)", 1)[1].split("function doDelete", 1)[0]
+        bypass, modal = body.split("pending = row;", 1)
+        assert "row.source === 'empty-folder'" in bypass
+        assert "doDelete(row)" in bypass
+        assert "showModal('pf-delete-modal')" in modal
+
+    def test_deleted_row_turns_red_then_fades(self):
+        src = self._js("problem_files.js")
+        body = src.split("function doDelete(row)", 1)[1].split("function bind()", 1)[0]
+        request = body.index("postJson('/api/problem-files/delete'")
+        assert body.index("classList.add('table-danger')") < request
+        # A refused delete puts the row back the way it was.
+        assert "classList.remove('table-danger')" in body
+        assert "fadeDeleted(tr).then(refresh)" in body
 
     def test_duplicates_opens_the_compare_viewer(self):
         src = self._js("library_duplicates.js")
