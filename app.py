@@ -2659,179 +2659,181 @@ def run_komga_sync():
     )
     from models.komga import KomgaClient, extract_book_info, resolve_komga_book_path
 
-    cfg = get_komga_config()
-    if not cfg or not cfg.get("server_url"):
-        app_logger.warning("Komga sync: not configured")
-        return {"success": False, "error": "Komga not configured"}
+    cfg_list = get_komga_config()
 
-    if not cfg.get("username") or not cfg.get("password"):
-        app_logger.warning("Komga sync: credentials not set")
-        return {"success": False, "error": "Komga credentials not set"}
+    for cfg in cfg_list:
+        if not cfg or not cfg.get("server_url"):
+            app_logger.warning("Komga sync: not configured")
+            return {"success": False, "error": "Komga not configured"}
 
-    try:
-        client = KomgaClient(cfg["server_url"], cfg["username"], cfg["password"])
-    except Exception as e:
-        app_logger.error(f"Komga sync: failed to create client: {e}")
-        return {"success": False, "error": str(e)}
+        if not cfg.get("username") or not cfg.get("password"):
+            app_logger.warning("Komga sync: credentials not set")
+            return {"success": False, "error": "Komga credentials not set"}
 
-    # Build active mappings from per-library configuration
-    # Sort by komga_prefix length descending so longer prefixes match first
-    active_mappings = []
-    for m in cfg.get("library_mappings", []):
-        komga_pfx = (m.get("komga_path_prefix") or "").strip()
-        clu_pfx = (m.get("library_path") or "").strip()
-        if komga_pfx and clu_pfx:
-            active_mappings.append({"komga_prefix": komga_pfx, "clu_prefix": clu_pfx})
-    active_mappings.sort(key=lambda x: len(x["komga_prefix"]), reverse=True)
+        try:
+            client = KomgaClient(cfg["server_url"], cfg["username"], cfg["password"])
+        except Exception as e:
+            app_logger.error(f"Komga sync: failed to create client: {e}")
+            return {"success": False, "error": str(e)}
 
-    prefix_summary = ", ".join(m["komga_prefix"] for m in active_mappings) or "none"
-    if not active_mappings:
-        app_logger.warning(
-            "Komga sync: no library path prefixes configured — matching by filename "
-            "against the file index only. If books do not match, set prefixes at "
-            "Config → Komga Reading Sync → Library Path Mapping."
-        )
+        # Build active mappings from per-library configuration
+        # Sort by komga_prefix length descending so longer prefixes match first
+        active_mappings = []
+        for m in cfg.get("library_mappings", []):
+            komga_pfx = (m.get("komga_path_prefix") or "").strip()
+            clu_pfx = (m.get("library_path") or "").strip()
+            if komga_pfx and clu_pfx:
+                active_mappings.append({"komga_prefix": komga_pfx, "clu_prefix": clu_pfx})
+        active_mappings.sort(key=lambda x: len(x["komga_prefix"]), reverse=True)
 
-    # Komga is a single shared account per instance; its read/progress data
-    # belongs to the Store Owner. Attribute writes explicitly so they land on
-    # the owner regardless of who (or what scheduler thread) triggered the sync.
-    from core.database import get_owner_user
-    _owner = get_owner_user()
-    owner_id = _owner["id"] if _owner else 1
-
-    read_count = 0
-    progress_count = 0
-    skip_count = 0
-    progress_skip_count = 0
-    no_match_count = 0
-    ambiguous_count = 0
-    logged_unmatched = 0
-
-    def resolve(info):
-        """Resolve a book to a CLU path, counting and logging any miss."""
-        nonlocal no_match_count, ambiguous_count, logged_unmatched
-
-        clu_path, reason = resolve_komga_book_path(info, active_mappings)
-        if clu_path:
-            return clu_path
-
-        if reason == "ambiguous":
-            ambiguous_count += 1
-            detail = "filename exists in more than one library, skipped"
-        else:
-            no_match_count += 1
-            detail = "no CLU match"
-
-        # repr() the values deliberately: trailing spaces, casing and empty
-        # strings are what make these fail, and plain formatting hides them.
-        msg = (
-            f"Komga sync: {detail} — komga url={info['url']!r} "
-            f"filename={info['file_name']!r} | configured prefixes: {prefix_summary}"
-        )
-        if logged_unmatched < KOMGA_UNMATCHED_LOG_LIMIT:
-            app_logger.info(msg)
-            logged_unmatched += 1
-        else:
-            app_logger.debug(msg)
-        return None
-
-    app_logger.info("🔄 Starting Komga reading sync...")
-    start_time = time.time()
-
-    # Phase 1: Sync completed reads
-    try:
-        for book in client.get_all_read_books():
-            info = extract_book_info(book)
-            book_id = info["id"]
-
-            if is_komga_book_synced(book_id, "read"):
-                skip_count += 1
-                continue
-
-            clu_path = resolve(info)
-            if not clu_path:
-                continue
-
-            # Mark as read in CLU using existing function
-            mark_issue_read(
-                issue_path=clu_path,
-                read_at=info["read_date"],
-                page_count=info["page_count"],
-                user_id=owner_id,
+        prefix_summary = ", ".join(m["komga_prefix"] for m in active_mappings) or "none"
+        if not active_mappings:
+            app_logger.warning(
+                "Komga sync: no library path prefixes configured — matching by filename "
+                "against the file index only. If books do not match, set prefixes at "
+                "Config → Komga Reading Sync → Library Path Mapping."
             )
-            mark_komga_book_synced(book_id, info["url"], clu_path, "read")
-            read_count += 1
-    except Exception as e:
-        app_logger.error(f"Komga sync phase 1 (reads) error: {e}")
 
-    # Phase 2: Sync in-progress reading positions
-    try:
-        from core.database import get_reading_position, save_reading_position
+        # Komga is a single shared account per instance; its read/progress data
+        # belongs to the Store Owner. Attribute writes explicitly so they land on
+        # the owner regardless of who (or what scheduler thread) triggered the sync.
+        from core.database import get_owner_user
+        # _owner = get_owner_user()
+        # owner_id = _owner["id"] if _owner else 1
 
-        for book in client.get_all_in_progress_books():
-            info = extract_book_info(book)
-            book_id = info["id"]
+        read_count = 0
+        progress_count = 0
+        skip_count = 0
+        progress_skip_count = 0
+        no_match_count = 0
+        ambiguous_count = 0
+        logged_unmatched = 0
 
-            clu_path = resolve(info)
-            if not clu_path:
-                continue
+        def resolve(info):
+            """Resolve a book to a CLU path, counting and logging any miss."""
+            nonlocal no_match_count, ambiguous_count, logged_unmatched
 
-            # No is_komga_book_synced guard here, unlike phase 1: "read" is
-            # terminal but progress moves, and komga_sync_log records only that
-            # a book synced, never at what page. Compare the position itself.
-            existing = get_reading_position(clu_path, user_id=owner_id)
-            if existing and existing.get("page_number") == info["current_page"]:
-                progress_skip_count += 1
-                continue
+            clu_path, reason = resolve_komga_book_path(info, active_mappings)
+            if clu_path:
+                return clu_path
 
-            save_reading_position(
-                comic_path=clu_path,
-                page_number=info["current_page"],
-                total_pages=info["page_count"],
-                user_id=owner_id,
+            if reason == "ambiguous":
+                ambiguous_count += 1
+                detail = "filename exists in more than one library, skipped"
+            else:
+                no_match_count += 1
+                detail = "no CLU match"
+
+            # repr() the values deliberately: trailing spaces, casing and empty
+            # strings are what make these fail, and plain formatting hides them.
+            msg = (
+                f"Komga sync: {detail} — komga url={info['url']!r} "
+                f"filename={info['file_name']!r} | configured prefixes: {prefix_summary}"
             )
-            mark_komga_book_synced(book_id, info["url"], clu_path, "progress")
-            progress_count += 1
-    except Exception as e:
-        app_logger.error(f"Komga sync phase 2 (progress) error: {e}")
+            if logged_unmatched < KOMGA_UNMATCHED_LOG_LIMIT:
+                app_logger.info(msg)
+                logged_unmatched += 1
+            else:
+                app_logger.debug(msg)
+            return None
 
-    update_komga_last_sync(read_count, progress_count)
+        app_logger.info("🔄 Starting Komga reading sync...")
+        start_time = time.time()
 
-    # Clear the owner's stats caches so the newly-synced data shows up.
-    clear_stats_cache_prefix(f"u{owner_id}:")
+        # Phase 1: Sync completed reads
+        try:
+            for book in client.get_all_read_books():
+                info = extract_book_info(book)
+                book_id = info["id"]
 
-    unlogged = (no_match_count + ambiguous_count) - logged_unmatched
-    if unlogged > 0:
+                if is_komga_book_synced(book_id, cfg.get("user_id"), "read"):
+                    skip_count += 1
+                    continue
+
+                clu_path = resolve(info)
+                if not clu_path:
+                    continue
+
+                # Mark as read in CLU using existing function
+                mark_issue_read(
+                    issue_path=clu_path,
+                    read_at=info["read_date"],
+                    page_count=info["page_count"],
+                    user_id=cfg.get("user_id"),
+                )
+                mark_komga_book_synced(book_id, info["url"], clu_path, cfg.get("user_id"), "read")
+                read_count += 1
+        except Exception as e:
+            app_logger.error(f"Komga sync phase 1 (reads) error: {e}")
+
+        # Phase 2: Sync in-progress reading positions
+        try:
+            from core.database import get_reading_position, save_reading_position
+
+            for book in client.get_all_in_progress_books():
+                info = extract_book_info(book)
+                book_id = info["id"]
+
+                clu_path = resolve(info)
+                if not clu_path:
+                    continue
+
+                # No is_komga_book_synced guard here, unlike phase 1: "read" is
+                # terminal but progress moves, and komga_sync_log records only that
+                # a book synced, never at what page. Compare the position itself.
+                existing = get_reading_position(clu_path, user_id=cfg.get("user_id"))
+                if existing and existing.get("page_number") == info["current_page"]:
+                    progress_skip_count += 1
+                    continue
+
+                save_reading_position(
+                    comic_path=clu_path,
+                    page_number=info["current_page"],
+                    total_pages=info["page_count"],
+                    user_id=cfg.get("user_id"),
+                )
+                mark_komga_book_synced(book_id, info["url"], clu_path, cfg.get("user_id"), "progress")
+                progress_count += 1
+        except Exception as e:
+            app_logger.error(f"Komga sync phase 2 (progress) error: {e}")
+
+        update_komga_last_sync(read_count, progress_count)
+
+        # Clear the owner's stats caches so the newly-synced data shows up.
+        clear_stats_cache_prefix(f"u{cfg.get("user_id")}:")
+
+        unlogged = (no_match_count + ambiguous_count) - logged_unmatched
+        if unlogged > 0:
+            app_logger.info(
+                f"Komga sync: {unlogged} further unmatched books not logged "
+                f"(first {KOMGA_UNMATCHED_LOG_LIMIT} shown above)"
+            )
+
+        elapsed = time.time() - start_time
         app_logger.info(
-            f"Komga sync: {unlogged} further unmatched books not logged "
-            f"(first {KOMGA_UNMATCHED_LOG_LIMIT} shown above)"
+            f"✅ Komga sync completed in {elapsed:.2f}s: "
+            f"{read_count} read, {progress_count} in-progress, "
+            f"{skip_count} already synced, {progress_skip_count} unchanged, "
+            f"{no_match_count} unmatched, {ambiguous_count} ambiguous"
         )
 
-    elapsed = time.time() - start_time
-    app_logger.info(
-        f"✅ Komga sync completed in {elapsed:.2f}s: "
-        f"{read_count} read, {progress_count} in-progress, "
-        f"{skip_count} already synced, {progress_skip_count} unchanged, "
-        f"{no_match_count} unmatched, {ambiguous_count} ambiguous"
-    )
+        if (no_match_count or ambiguous_count) and not (read_count or progress_count):
+            app_logger.warning(
+                f"Komga sync: none of {no_match_count + ambiguous_count} books matched a "
+                f"CLU file. Compare the 'komga url' values logged above against your CLU "
+                f"library paths, and check the Library Path Mapping in Config."
+            )
 
-    if (no_match_count or ambiguous_count) and not (read_count or progress_count):
-        app_logger.warning(
-            f"Komga sync: none of {no_match_count + ambiguous_count} books matched a "
-            f"CLU file. Compare the 'komga url' values logged above against your CLU "
-            f"library paths, and check the Library Path Mapping in Config."
-        )
-
-    return {
-        "success": True,
-        "read_count": read_count,
-        "progress_count": progress_count,
-        "skip_count": skip_count,
-        "progress_skip_count": progress_skip_count,
-        "no_match_count": no_match_count,
-        "ambiguous_count": ambiguous_count,
-        "elapsed": round(elapsed, 2),
-    }
+        return {
+            "success": True,
+            "read_count": read_count,
+            "progress_count": progress_count,
+            "skip_count": skip_count,
+            "progress_skip_count": progress_skip_count,
+            "no_match_count": no_match_count,
+            "ambiguous_count": ambiguous_count,
+            "elapsed": round(elapsed, 2),
+        }
 
 
 def scheduled_komga_sync():
@@ -8375,7 +8377,8 @@ def api_get_komga_config():
     """Get current Komga sync configuration (password masked)."""
     from core.database import get_komga_config
 
-    cfg = get_komga_config()
+    cfg_list = get_komga_config()
+    cfg = cfg_list[0]
     if cfg:
         # Mask password for display
         cfg["password"] = "***" if cfg.get("password") else ""
@@ -8412,7 +8415,8 @@ def api_test_komga_connection():
     from core.database import get_komga_config, update_komga_connection_valid
     from models.komga import KomgaClient
 
-    cfg = get_komga_config()
+    cfg_list= get_komga_config()
+    cfg = cfg_list[0]
     if not cfg or not cfg.get("server_url"):
         return jsonify(
             {
@@ -8465,7 +8469,8 @@ def api_komga_sync_status():
     from core.database import get_komga_sync_stats, get_komga_config
 
     stats = get_komga_sync_stats()
-    cfg = get_komga_config()
+    cfg_list = get_komga_config()
+    cfg = cfg_list[0]
 
     # Get next scheduled run
     next_run_str = get_next_run_for_job("komga_sync")

@@ -15367,49 +15367,58 @@ def get_komga_config():
         if not conn:
             return None
         c = conn.cursor()
-        c.execute("SELECT * FROM komga_sync_config WHERE id = 1")
-        row = c.fetchone()
-        conn.close()
-
-        if not row:
-            return None
-
+        c.execute("SELECT * FROM komga_sync_config")
+        
         # Get schedule fields from unified table
         sched = get_schedule("komga")
 
-        result = {
-            "server_url": row["server_url"] or "",
-            "username": "",
-            "password": "",
-            "enabled": bool(row["enabled"]),
-            "connection_valid": bool(row["connection_valid"]) if "connection_valid" in row.keys() else False,
-            "last_sync": sched["last_run"] if sched else row["last_sync"],
-            "last_sync_read_count": row["last_sync_read_count"] or 0,
-            "last_sync_progress_count": row["last_sync_progress_count"] or 0,
-            "frequency": sched["frequency"] if sched else "disabled",
-            "time": sched["time"] if sched else "05:00",
-            "weekday": sched["weekday"] if sched else 0,
-            "library_mappings": get_komga_library_mappings(),
-        }
+        results = []
 
-        # Decrypt credentials if present
-        if row["credentials_encrypted"] and row["credentials_nonce"]:
-            try:
-                from models.providers.crypto import (
-                    decrypt_credentials,
-                    is_crypto_available,
-                )
+        while True:
+            row = c.fetchone()
+        
+            if not row:
+                break
 
-                if is_crypto_available():
-                    creds = decrypt_credentials(
-                        row["credentials_encrypted"], row["credentials_nonce"]
+            result = {
+                "server_url": row["server_url"] or "",
+                "username": "",
+                "password": "",
+                "enabled": bool(row["enabled"]),
+                "connection_valid": bool(row["connection_valid"]) if "connection_valid" in row.keys() else False,
+                "last_sync": sched["last_run"] if sched else row["last_sync"],
+                "last_sync_read_count": row["last_sync_read_count"] or 0,
+                "last_sync_progress_count": row["last_sync_progress_count"] or 0,
+                "frequency": sched["frequency"] if sched else "disabled",
+                "time": sched["time"] if sched else "05:00",
+                "weekday": sched["weekday"] if sched else 0,
+                "library_mappings": get_komga_library_mappings(),
+                "user_id": row["user_id"],
+            }
+
+            # Decrypt credentials if present
+            if row["credentials_encrypted"] and row["credentials_nonce"]:
+                try:
+                    from models.providers.crypto import (
+                        decrypt_credentials,
+                        is_crypto_available,
                     )
-                    result["username"] = creds.get("username", "")
-                    result["password"] = creds.get("password", "")
-            except Exception as e:
-                app_logger.error(f"Failed to decrypt Komga credentials: {e}")
 
-        return result
+                    if is_crypto_available():
+                        creds = decrypt_credentials(
+                            row["credentials_encrypted"], row["credentials_nonce"]
+                        )
+                        result["username"] = creds.get("username", "")
+                        result["password"] = creds.get("password", "")
+                except Exception as e:
+                    app_logger.error(f"Failed to decrypt Komga credentials: {e}")
+
+
+            results.append(result)
+              
+        conn.close()
+        return results
+    
     except Exception as e:
         app_logger.error(f"Failed to get Komga config: {e}")
         return None
@@ -15643,7 +15652,7 @@ def save_komga_library_mappings(mappings):
         return False
 
 
-def is_komga_book_synced(komga_book_id, sync_type="read"):
+def is_komga_book_synced(komga_book_id, user_id, sync_type="read"):
     """
     Check if a Komga book has already been synced.
 
@@ -15662,9 +15671,9 @@ def is_komga_book_synced(komga_book_id, sync_type="read"):
         c.execute(
             """
             SELECT 1 FROM komga_sync_log
-            WHERE komga_book_id = ? AND sync_type = ?
+            WHERE komga_book_id = ? AND sync_type = ? AND user_id = ?
         """,
-            (komga_book_id, sync_type),
+            (komga_book_id, sync_type, user_id),
         )
         result = c.fetchone() is not None
         conn.close()
@@ -15674,7 +15683,7 @@ def is_komga_book_synced(komga_book_id, sync_type="read"):
         return False
 
 
-def mark_komga_book_synced(komga_book_id, komga_path, clu_path, sync_type="read"):
+def mark_komga_book_synced(komga_book_id, komga_path, clu_path, user_id, sync_type="read"):
     """
     Record that a Komga book has been synced to CLU.
 
@@ -15694,10 +15703,10 @@ def mark_komga_book_synced(komga_book_id, komga_path, clu_path, sync_type="read"
         conn.execute(
             """
             INSERT OR REPLACE INTO komga_sync_log
-                (komga_book_id, komga_path, clu_path, sync_type, synced_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (komga_book_id, komga_path, clu_path, sync_type, synced_at, user_id)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
         """,
-            (komga_book_id, komga_path, clu_path, sync_type),
+            (komga_book_id, komga_path, clu_path, sync_type, user_id),
         )
         conn.commit()
         conn.close()

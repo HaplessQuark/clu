@@ -60,22 +60,23 @@ class TestKomgaSyncLog:
             komga_book_id="book-123",
             komga_path="/komga/books/123",
             clu_path="/data/DC/Batman/001.cbz",
+            user_id=1,
             sync_type="read",
         )
         assert ok is True
-        assert is_komga_book_synced("book-123", "read") is True
+        assert is_komga_book_synced("book-123", 1, "read") is True
 
     def test_not_synced_by_default(self, db_connection):
         from core.database import is_komga_book_synced
 
-        assert is_komga_book_synced("nonexistent", "read") is False
+        assert is_komga_book_synced("nonexistent", 1, "read") is False
 
     def test_sync_stats(self, db_connection):
         from core.database import mark_komga_book_synced, get_komga_sync_stats
 
-        mark_komga_book_synced("b1", "/k/1", "/c/1", "read")
-        mark_komga_book_synced("b2", "/k/2", "/c/2", "read")
-        mark_komga_book_synced("b3", "/k/3", "/c/3", "progress")
+        mark_komga_book_synced("b1", "/k/1", "/c/1", 1, "read")
+        mark_komga_book_synced("b2", "/k/2", "/c/2", 1, "read")
+        mark_komga_book_synced("b3", "/k/3", "/c/3", 1, "progress")
 
         stats = get_komga_sync_stats()
         assert stats is not None
