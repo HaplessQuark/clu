@@ -1,9 +1,10 @@
 {% extends 'base.html' %}
+{% from 'partials/page_header.html' import page_header %}
+{% from 'partials/filters.html' import toolbar, filter_bar, search_input, result_count %}
 
-{% block title %}CLU: Problem Files{% endblock %}
+{% block title %}CLU: Library Health{% endblock %}
 
 {% block content %}
-{% include 'partials/toast_container.html' %}
 
 {# A corrected file's row flashes green, then fades before the list reloads
 (static/js/problem_files.js: celebrateFixed). Bootstrap paints table cells
@@ -55,43 +56,65 @@ with an inset box-shadow, so the highlight overrides that, not background. #}
   }
 </style>
 
-<div class="container py-4" id="problem-files-app">
-  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
-    <h2 class="mb-0"><i class="bi bi-exclamation-triangle me-2"></i>Problem Files</h2>
-    <div class="d-flex gap-2">
-      <button class="btn btn-outline-primary btn-sm" id="pf-scan-seriesjson"
+<div id="problem-files-app">
+  {# "Report only" is a promise worth making in so many words, so it stays
+  in the subtitle: otherwise an empty page reads as "your library is clean"
+  rather than "nothing has failed yet". #}
+  {% call(slot) page_header('Library Health', 'bi-exclamation-triangle',
+                            subtitle='Files that failed an operation CLU attempted. An empty list means nothing has failed, not that the library is clean.') %}
+    {% if slot == 'actions' %}
+      <button class="btn btn-sm btn-outline-secondary" id="pf-scan-seriesjson"
         title="Check every series.json for a blank name, description or cover">
-        <i class="bi bi-search me-1"></i>Scan series.json
+        <i class="bi bi-search me-1" aria-hidden="true"></i>Scan series.json
       </button>
-      <button class="btn btn-outline-primary btn-sm" id="pf-scan-empty"
+      <button class="btn btn-sm btn-outline-secondary" id="pf-scan-empty"
         title="Find library folders with no comics in them (empty, or only cvinfo / series.json / folder art)">
-        <i class="bi bi-folder-x me-1"></i>Scan empty folders
+        <i class="bi bi-folder-x me-1" aria-hidden="true"></i>Scan empty folders
       </button>
-      <button class="btn btn-outline-success btn-sm d-none" id="pf-refresh-sj-all"
+      {# Shown by problem_files.js once series.json rows are listed. #}
+      <button class="btn btn-sm btn-outline-secondary d-none" id="pf-refresh-sj-all"
         title="Rewrite every listed series.json from Metron or ComicVine">
-        <i class="bi bi-cloud-download me-1"></i>Refresh all series.json
-        <span class="badge bg-success ms-1" id="pf-refresh-sj-count"></span>
+        <i class="bi bi-cloud-download me-1" aria-hidden="true"></i>Refresh all series.json
+        <span class="badge text-bg-secondary ms-1" id="pf-refresh-sj-count"></span>
       </button>
-      <button class="btn btn-outline-secondary btn-sm" id="pf-refresh">
-        <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+      <button class="btn btn-sm btn-outline-secondary" id="pf-refresh">
+        <i class="bi bi-arrow-clockwise me-1" aria-hidden="true"></i>Refresh
       </button>
-    </div>
-  </div>
+    {% elif slot == 'help' %}
+      <p>
+        Unless you turn on the library health scan below, CLU does not look for
+        damage on its own: a file appears here when something tried to read it
+        and could not. With the scan on, the Health scan card shows how much
+        of the library has been checked. <strong>Scan series.json</strong> finds
+        series.json files with a blank name, description or cover;
+        <strong>Scan empty folders</strong> finds library folders left with no
+        comics in them.
+      </p>
+      <p>
+        Looking for files tagged by the wrong metadata provider? That is not a
+        failure, so it is not listed here. The
+        <a href="{{ url_for('source_wall.source_wall_page') }}">Source Wall</a> breaks files
+        down by provider and can filter by one; choose <strong>Re-tag with
+        provider&hellip;</strong> from a folder's menu to update the metadata of
+        every file in it.
+      </p>
+    {% endif %}
+  {% endcall %}
 
-  {# Library health. The scan is opt-in and rolling, so the card states coverage
+  {# Health scan. The scan is opt-in and rolling, so the card states coverage
   rather than "clean": 40% checked means 60% unknown. #}
   <div class="card mb-3" id="pf-health">
     <div class="card-body py-3">
       <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
         <div>
           <h5 class="card-title mb-1">
-            <i class="bi bi-heart-pulse me-2"></i>Library health
+            <i class="bi bi-heart-pulse me-2"></i>Health scan
             <span class="badge ms-2 d-none" id="pf-health-score"></span>
           </h5>
           <div class="small text-muted" id="pf-health-line">Loading&hellip;</div>
         </div>
         <div class="d-flex gap-2 flex-wrap">
-          <a class="btn btn-outline-primary btn-sm" href="/problem-files/duplicates">
+          <a class="btn btn-outline-primary btn-sm" href="{{ url_for('library_health.duplicates_page') }}">
             <i class="bi bi-files me-1"></i>Review duplicates
             <span class="badge bg-secondary ms-1 d-none" id="pf-health-dups"></span>
           </a>
@@ -133,51 +156,6 @@ with an inset box-shadow, so the highlight overrides that, not background. #}
     </div>
   </div>
 
-  {# "Report only" is a promise worth making in so many words -- otherwise an
-  empty page reads as "your library is clean" rather than "nothing has
-  failed yet". #}
-  <p class="text-muted small mb-3">
-    Files that failed an operation CLU actually attempted. Unless you turn on
-    the library health scan above, CLU does not look for damage on its own
-    &mdash; a file appears here when something tried to read it and could not,
-    so an empty page means <em>nothing has failed</em>, not that the library is
-    clean. With the scan on, the card shows how much of the library has been
-    checked. <strong>Scan series.json</strong> finds series.json files with a
-    blank name, description or cover; <strong>Scan empty folders</strong> finds
-    library folders left with no comics in them.
-  </p>
-  <p class="text-muted small mb-3">
-    Looking for files tagged by the wrong metadata provider? That is not a failure, so it
-    is not listed here. You can view a breakdown of files tagged by provider on the
-    <a href="/source-wall">Source Wall</a> page and filter by provider. Choose <strong>Re-tag with
-      provider&hellip;</strong> from the folder's dropdown menu to update metadata for all files in that folder.
-  </p>
-
-  <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
-    <div class="btn-group btn-group-sm" role="group" id="pf-source-filter">
-      <button type="button" class="btn btn-outline-primary active" data-source="">All</button>
-      <button type="button" class="btn btn-outline-primary" data-source="thumbnail">Thumbnail</button>
-      <button type="button" class="btn btn-outline-primary" data-source="rebuild">Rebuild</button>
-      <button type="button" class="btn btn-outline-primary" data-source="metadata-write">Metadata write</button>
-      <button type="button" class="btn btn-outline-primary" data-source="convert">CBR conversion</button>
-      <button type="button" class="btn btn-outline-primary" data-source="unpack">Unpack</button>
-      <button type="button" class="btn btn-outline-primary" data-source="series-json">series.json</button>
-      <button type="button" class="btn btn-outline-primary" data-source="integrity">Integrity scan</button>
-      <button type="button" class="btn btn-outline-primary" data-source="orphan">Stray files</button>
-      <button type="button" class="btn btn-outline-primary" data-source="empty-folder">Empty folders</button>
-    </div>
-
-    <div class="flex-grow-1" style="min-width: 180px;">
-      <input type="search" class="form-control form-control-sm" id="pf-search" placeholder="Filter by path&hellip;"
-        autocomplete="off">
-    </div>
-
-    <div class="form-check form-switch mb-0">
-      <input class="form-check-input" type="checkbox" id="pf-show-dismissed">
-      <label class="form-check-label small" for="pf-show-dismissed">Show dismissed</label>
-    </div>
-  </div>
-
   <!-- Replacement activity. An applied swap deletes the problem row (the file
        is fixed), so this banner is the only place the result can be reported. -->
   <div id="pf-replacements"></div>
@@ -185,6 +163,37 @@ with an inset box-shadow, so the highlight overrides that, not background. #}
   <!-- The last "Refresh all series.json" run: what was corrected and, more to
        the point, which folders still need attention and why. -->
   <div id="pf-sj-result"></div>
+
+  {# The list toolbar (partials/filters.html): after the health card, which is
+     a feature panel, and directly above the table it filters. #}
+  {% call toolbar('Filter problem files') %}
+    <div class="clu-toolbar-row">
+      {{ search_input('pf-search', 'Search file paths') }}
+      <div class="clu-toolbar-end">
+        {{ result_count('pf-summary', 0, 'entries', one='entry') }}
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="pf-show-dismissed">
+          <label class="form-check-label small" for="pf-show-dismissed">Show dismissed</label>
+        </div>
+      </div>
+    </div>
+    <div class="clu-toolbar-row">
+      {# Ten sources do not fit a phone: the row scrolls on its own
+         (.clu-filter-scroll) instead of pushing the page sideways. #}
+      {{ filter_bar('pf-source-filter', [
+           ('', 'All'),
+           ('thumbnail', 'Thumbnail'),
+           ('rebuild', 'Rebuild'),
+           ('metadata-write', 'Metadata write'),
+           ('convert', 'CBR conversion'),
+           ('unpack', 'Unpack'),
+           ('series-json', 'series.json'),
+           ('integrity', 'Integrity scan'),
+           ('orphan', 'Stray files'),
+           ('empty-folder', 'Empty folders'),
+         ], label='Source') }}
+    </div>
+  {% endcall %}
 
   <div class="table-responsive">
     <table class="table table-hover align-middle">
@@ -205,7 +214,6 @@ with an inset box-shadow, so the highlight overrides that, not background. #}
     </table>
   </div>
 
-  <p class="text-muted small mb-0" id="pf-summary"></p>
 </div>
 
 <!-- Rebuild confirmation. Carries the honest warning: rebuild repairs a
@@ -274,7 +282,7 @@ with an inset box-shadow, so the highlight overrides that, not background. #}
           the new file is read.
         </p>
         <div class="input-group input-group-sm mb-3">
-          <input type="text" class="form-control" id="pf-sources-query" placeholder="Series and issue&hellip;"
+          <input type="text" class="form-control" id="pf-sources-query" aria-label="Search download sources" placeholder="Search download sources&hellip;"
             autocomplete="off">
           <button class="btn btn-primary" type="button" id="pf-sources-go">
             <i class="bi bi-search me-1"></i>Search

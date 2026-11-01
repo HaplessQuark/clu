@@ -1,0 +1,68 @@
+{#
+  The one empty state: what is missing, why, and the one thing to do next.
+
+    {% from 'partials/empty_state.html' import empty_state %}
+
+    {{ empty_state('No publishers', 'Add publishers from Metron or create custom ones.',
+                   'bi-building') }}
+
+    {% call empty_state('No tracked series', 'Scan your library…', 'bi-collection') %}
+      <button class="btn btn-primary" id="scanLibraryBtnEmpty">…</button>
+      <a class="btn btn-outline-secondary" href="…">Browse releases</a>
+    {% endcall %}
+
+  Rules (DESIGN.md, "Empty states"):
+  - title says what is missing ("No reading lists yet"), message says why or
+    what fills it. No exclamation marks, no "Oops".
+  - At most one .btn-primary (default size, never btn-lg); any other action is
+    .btn-outline-secondary.
+  - The title is an <h2>: the page's <h1> is the page header.
+  - A message with markup is passed as a {% set %}…{% endset %} block, which
+    is already Markup; a plain string is escaped.
+  - Script-toggled states pass id= and hidden=True (rendered as
+    style="display: none;", which is what the page scripts toggle). The JS twin
+    is CLU.emptyState({icon, title, message}) in static/js/clu-page.js.
+  - A search or filter that matched nothing is no_matches(noun, query,
+    filtered, clear_href | clear_id), never a hand-written "No results" line.
+  - tone='success' colours the icon for a good empty ("No wanted issues");
+    compact=True is for an empty panel or card, not a whole page.
+#}
+{% macro empty_state(title, message=None, icon=None, id=None, hidden=False, tone=None, compact=False, classes=None) -%}
+{%- set actions_html = caller() if caller is defined else '' -%}
+<div class="clu-empty{% if compact %} clu-empty-compact{% endif %}{% if tone %} clu-empty-{{ tone }}{% endif %}{% if classes %} {{ classes }}{% endif %}"
+     {%- if id %} id="{{ id }}"{% endif %}{% if hidden %} style="display: none;"{% endif %}>
+  {%- if icon %}
+  <i class="bi {{ icon }} clu-empty-icon" aria-hidden="true"></i>
+  {%- endif %}
+  <h2 class="clu-empty-title">{{ title }}</h2>
+  {%- if message %}
+  <p class="clu-empty-text">{{ message }}</p>
+  {%- endif %}
+  {%- if actions_html | trim %}
+  <div class="clu-empty-actions">{{ actions_html }}</div>
+  {%- endif %}
+</div>
+{%- endmacro %}
+
+{% macro no_matches(noun, query=None, filtered=False, clear_href=None, clear_id=None, id=None, hidden=False, compact=False) -%}
+{#- The one "a search or filter matched nothing" state, worded as
+    CLU.noMatches words it (static/js/clu-page.js). The button is a link when
+    the server filters (clear_href) or a button a script wires (clear_id). -#}
+{%- set q = (query or '') | trim -%}
+{%- if q and not filtered -%}
+  {%- set title = 'No ' ~ noun ~ ' match “' ~ q ~ '”' -%}
+  {%- set message = 'Check the spelling, or search for part of a name.' -%}
+  {%- set clear = 'Clear search' -%}{%- set icon = 'bi-search' -%}
+{%- else -%}
+  {%- set title = 'No ' ~ noun ~ ' match these filters' -%}
+  {%- set message = 'Nothing matches the search and the filters together.' if q else 'Change or clear a filter to see more.' -%}
+  {%- set clear = 'Clear filters' -%}{%- set icon = 'bi-funnel' -%}
+{%- endif -%}
+{%- call empty_state(title, message, icon, id=id, hidden=hidden, compact=compact) -%}
+  {%- if clear_href -%}
+  <a class="btn btn-outline-secondary" href="{{ clear_href }}">{{ clear }}</a>
+  {%- elif clear_id -%}
+  <button type="button" class="btn btn-outline-secondary" id="{{ clear_id }}">{{ clear }}</button>
+  {%- endif -%}
+{%- endcall -%}
+{%- endmacro %}

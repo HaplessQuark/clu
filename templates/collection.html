@@ -1,5 +1,9 @@
 {% extends 'base.html' %}
+{% from 'partials/page_header.html' import page_header %}
+{% from 'partials/empty_state.html' import empty_state %}
+{% from 'partials/filters.html' import toolbar, select_field, per_page_select, result_count %}
 {% block title %}Browse Library{% endblock %}
+{% block page_shell %}container-fluid clu-shell-wide{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/collection.css') }}?v={{ range(1, 10000) | random }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/reader.css') }}?v={{ range(1, 10000) | random }}">
@@ -9,6 +13,8 @@
     // Initial path from URL (e.g., /collection/Marvel -> <default library>/Marvel).
     // If no URL path specified, fall back to the saved library selection.
     window.DEFAULT_LIBRARY_ROOT = {{ default_library_root | default('') | tojson | safe }};
+    // Through url_for so history URLs keep a ProxyFix subpath prefix.
+    window.COLLECTION_URL = {{ url_for('collection.collection') | tojson | safe }};
     (function () {
         const urlPath = {{ initial_path | default('') | tojson | safe }};
         if (urlPath && urlPath !== '') {
@@ -25,103 +31,86 @@
    Clerk/Owner features. In implicit-owner mode current_user is the owner, so the
    dropdown shows exactly as before; Readers never see it. #}
 {% set _can_manage = (g.current_user.role if g.get('current_user') else 'owner') in ['clerk', 'owner'] %}
-<div class="container-lg mt-4">
+<div>
+    {# collection.js rebuilds #breadcrumb and sets the title to the current
+       folder (or the special view's name) on every navigation. #}
+    {% call(slot) page_header('Home', 'bi-house', title_id='collectionTitle', crumbs_id='breadcrumb') %}
+        {% if slot == 'crumbs' %}
+            <li class="breadcrumb-item active"><i class="bi bi-info-circle me-1" aria-hidden="true"></i>Loading...</li>
+        {% endif %}
+    {% endcall %}
+
     <!-- Header Image Container -->
     <div id="collection-header-image" class="mb-3 d-none"></div>
 
-    <!-- Integrated Navigation System -->
-    <div class="bg-body-tertiary p-3 rounded-3 shadow-sm mb-4 d-flex flex-column gap-3">
-        
-        <!-- Top Row: Breadcrumbs & Controls -->
-        <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3" id="collectionOptions">
-            <!-- Breadcrumb Navigation -->
-            <nav aria-label="breadcrumb" class="flex-grow-1">
-                <ol class="breadcrumb mb-0" id="breadcrumb">
-                    <li class="breadcrumb-item active"><i class="bi bi-info-circle me-1"></i>Loading...</li>
-                </ol>
-            </nav>
+    {# The grid's controls. collection.js fills #gridSearchRow (only past 25
+       items), shows #librarySelectorContainer when there is more than one
+       library, the view buttons per mode, and the letter row once it has
+       letters. Multi-Select, Refresh, card size and per page are always
+       there, so the panel never renders empty on the dashboard. #}
+    {% call toolbar('Browse controls', id='collectionToolbar') %}
+        <div class="clu-toolbar-row" id="collectionOptions">
+            <div id="gridSearchRow" class="collection-search-slot"></div>
 
-            <div class="d-flex flex-wrap align-items-center gap-2">
-                <!-- Library Selector -->
-                <div id="librarySelectorContainer" style="display: none;">
-                    <select class="form-select form-select-sm" id="librarySelector" onchange="switchLibrary(this.value)"
-                        style="min-width: 150px;">
-                        <!-- Options populated by JavaScript -->
-                    </select>
-                </div>
-                
-                <!-- View Toggle Buttons -->
-                <div id="viewToggleButtons" class="btn-group btn-group-sm">
-                    <button class="btn btn-outline-primary" id="allBooksBtn" onclick="loadAllBooks()"
-                        style="display: none;">
-                        <i class="bi bi-collection"></i> All Books
-                    </button>
-                    <button class="btn btn-outline-warning" id="missingXmlBtn" onclick="loadMissingXml()"
-                        style="display: none;">
-                        <i class="bi bi-file-earmark-x"></i> Missing XML
-                    </button>
-                    <button class="btn btn-outline-warning" id="rescanMissingXmlBtn" onclick="rescanMissingXml()"
-                        style="display: none;" title="Re-check ComicInfo.xml for files currently flagged as missing">
-                        <i class="bi bi-arrow-repeat"></i> Rescan
-                    </button>
-                    <button class="btn btn-primary" id="folderViewBtn" onclick="returnToFolderView()"
-                        style="display: none;">
-                        <i class="bi bi-folder"></i> Collection View
-                    </button>
-                </div>
+            <div id="librarySelectorContainer" style="display: none;">
+                {% call select_field('librarySelector', 'Library') %}
+                    {# Options populated by loadLibrarySelector(). #}
+                {% endcall %}
+            </div>
 
-                <!-- Multi-Select Toggle & Refresh -->
-                <div class="d-flex align-items-center gap-2">
-                    {% if _can_manage %}
-                    <button class="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1"
-                        id="toggleCollectionSelectModeBtn" onclick="toggleCollectionSelectMode()"
-                        title="Toggle multi-select mode">
-                        <i class="bi bi-check2-square"></i>
-                        <span>Multi-Select</span>
-                    </button>
-                    {% endif %}
-                    <button class="btn btn-light border btn-sm" onclick="refreshCurrentView(true, true)" title="Refresh">
-                        <i class="bi bi-arrow-clockwise text-muted"></i>
-                    </button>
-                </div>
+            <div id="viewToggleButtons" class="d-flex flex-wrap gap-2">
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="folderViewBtn" onclick="returnToFolderView()"
+                    style="display: none;">
+                    <i class="bi bi-arrow-left me-1" aria-hidden="true"></i>Collection View
+                </button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="allBooksBtn" onclick="loadAllBooks()"
+                    style="display: none;">
+                    <i class="bi bi-collection me-1" aria-hidden="true"></i>All Books
+                </button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="missingXmlBtn" onclick="loadMissingXml()"
+                    style="display: none;">
+                    <i class="bi bi-file-earmark-x me-1" aria-hidden="true"></i>Missing XML
+                </button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="rescanMissingXmlBtn" onclick="rescanMissingXml()"
+                    style="display: none;" title="Re-check ComicInfo.xml for files currently flagged as missing">
+                    <i class="bi bi-arrow-repeat me-1" aria-hidden="true"></i>Rescan
+                </button>
             </div>
-        </div>
 
-        <!-- Bottom Row: Filters -->
-        <div class="d-flex flex-column flex-md-row gap-2 border-top pt-3" id="filterBar">
-            <div id="gridFilterButtons" style="display: none; flex: 1 1 auto; overflow-x: auto;" class="pb-1 pb-md-0">
-                <div class="btn-group btn-group-sm text-nowrap" role="group" aria-label="Filter by first letter">
-                    <!-- Filter buttons will be dynamically populated by JS -->
-                </div>
-            </div>
-            <div id="gridSearchRow" style="flex: 0 0 auto; width: 100%; max-width: 250px;">
-                <!-- Search input will be dynamically populated by JS -->
-            </div>
-            <div class="d-flex align-items-center" style="flex: 0 0 auto;">
+            <div class="clu-toolbar-end">
+                {# Worded and updated by updateCollectionCount() in collection.js. #}
+                {{ result_count('collectionCount', 0, 'items', one='item') }}
+                {% if _can_manage %}
+                <button type="button" class="btn btn-sm btn-outline-secondary"
+                    id="toggleCollectionSelectModeBtn" onclick="toggleCollectionSelectMode()"
+                    title="Toggle multi-select mode" aria-pressed="false">
+                    <i class="bi bi-check2-square me-1" aria-hidden="true"></i>Multi-Select
+                </button>
+                {% endif %}
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="collectionRefreshBtn"
+                    onclick="refreshCurrentView(true, true)" aria-label="Refresh" title="Refresh">
+                    <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                </button>
                 <div class="btn-group btn-group-sm" role="group" aria-label="Card size">
-                    <button type="button" class="btn btn-outline-secondary" id="cardSizeStandardBtn"
+                    <button aria-label="Standard card size" type="button" class="btn btn-outline-secondary" id="cardSizeStandardBtn"
                         onclick="changeCardSize('standard')" title="Standard card size" aria-pressed="true">
-                        <i class="bi bi-grid-3x3-gap-fill"></i>
+                        <i class="bi bi-grid-3x3-gap-fill" aria-hidden="true"></i>
                     </button>
-                    <button type="button" class="btn btn-outline-secondary" id="cardSizeLargeBtn"
+                    <button aria-label="Large card size" type="button" class="btn btn-outline-secondary" id="cardSizeLargeBtn"
                         onclick="changeCardSize('large')" title="Large card size" aria-pressed="false">
-                        <i class="bi bi-grid-fill"></i>
+                        <i class="bi bi-grid-fill" aria-hidden="true"></i>
                     </button>
                 </div>
-            </div>
-            <div class="d-flex align-items-center" style="flex: 0 0 auto;">
-                <div class="input-group input-group-sm">
-                    <label class="input-group-text bg-body border-0" for="itemsPerPage">Per page</label>
-                    <select class="form-select border-0 shadow-none bg-body text-body" id="itemsPerPage" onchange="changeItemsPerPage(this.value)">
-                        <option value="21" selected>20</option>
-                        <option value="49">50</option>
-                        <option value="98">100</option>
-                        <option value="252">250</option>
-                    </select>
-                </div>
+                {{ per_page_select('itemsPerPage', clu_default_per_page('collection'), default=clu_default_per_page('collection')) }}
             </div>
         </div>
-    </div>
+
+        {# Drawn by CLU.letterBar in collection.js updateFilterBar(), which
+           also toggles the row's hidden attribute. #}
+        <div class="clu-toolbar-row" id="gridFilterButtons" hidden>
+            <div class="btn-group btn-group-sm clu-letter-bar clu-filter-scroll" role="group" aria-label="Filter by first letter"></div>
+        </div>
+    {% endcall %}
 
     <!-- Dashboard Sections -->
     <div id="dashboard-sections" class="mb-5">
@@ -140,10 +129,9 @@
             </div>
             <div id="file-grid" class="file-grid">
             </div>
-            <div id="empty-state" class="text-center py-5" style="display: none;">
-                <i class="bi bi-folder2-open display-1 text-muted"></i>
-                <p class="lead text-muted mt-3">This folder is empty</p>
-            </div>
+            {{ empty_state('This folder is empty', icon='bi-folder2-open', id='empty-state', hidden=True) }}
+            {# A search or letter that hid everything: filled by renderGrid(). #}
+            <div id="no-matches"></div>
             <nav id="pagination-controls" aria-label="File browser pagination" class="collection-pager mt-4"
                 style="display: none;">
                 <div
@@ -249,13 +237,13 @@
             <div class="icon-overlay">
                 <i class="bi"></i>
             </div>
-            <button class="info-button no-propagation" title="CBZ Information">
+            <button aria-label="CBZ Information" class="info-button no-propagation" title="CBZ Information">
                 <i class="bi bi-info-circle"></i>
             </button>
-            <button class="favorite-button no-propagation" title="Add to Favorites" style="display: none;">
+            <button aria-label="Add to Favorites" class="favorite-button no-propagation" title="Add to Favorites" style="display: none;">
                 <i class="bi bi-bookmark-heart"></i>
             </button>
-            <button class="to-read-button no-propagation" title="Add to To Read" style="display: none;">
+            <button aria-label="Add to To Read" class="to-read-button no-propagation" title="Add to To Read" style="display: none;">
                 <i class="bi bi-bookmark-plus"></i>
             </button>
             <span class="issue-badge" style="display: none;"><span class="issue-number"></span><i
@@ -270,11 +258,11 @@
                    theme-aware .item-name rules in collection.css and leaves filenames
                    invisible on dark themes. #}
                 <div class="item-name text-truncate" title=""></div>
-                <div class="item-meta text-muted small"></div>
+                <div class="item-meta small"></div>
             </div>
             {% if _can_manage %}
             <div class="item-actions dropdown ms-2">
-                <button class="btn btn-link btn-sm p-0 text-body no-propagation" type="button" data-bs-toggle="dropdown"
+                <button aria-label="More actions" title="More actions" class="btn btn-link btn-sm p-0 text-body no-propagation" type="button" data-bs-toggle="dropdown"
                     aria-expanded="false">
                     <i class="bi bi-three-dots-vertical"></i>
                 </button>
@@ -336,10 +324,10 @@
             </div>
             <div class="comic-reader-controls">
                 <span class="comic-reader-page-info" id="comicReaderPageInfo">Page 1 of 1</span>
-                <button class="btn btn-sm btn-outline-light" id="comicReaderBookmark" title="Save Position">
+                <button aria-label="Save Position" class="btn btn-sm btn-outline-light" id="comicReaderBookmark" title="Save Position">
                     <i class="bi bi-bookmark text-primary"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-light" id="comicReaderClose" title="Close">
+                <button aria-label="Close" class="btn btn-sm btn-outline-light" id="comicReaderClose" title="Close">
                     <i class="bi bi-x-lg text-light"></i>
                 </button>
             </div>
@@ -385,10 +373,10 @@
         <!-- Footer -->
         <div class="comic-reader-footer">
             <div class="comic-reader-footer-controls">
-                <button class="btn btn-sm btn-outline-light zoom-btn" id="zoomOutBtn" title="Zoom Out (Arrow Down)">
+                <button aria-label="Zoom Out (Arrow Down)" class="btn btn-sm btn-outline-light zoom-btn" id="zoomOutBtn" title="Zoom Out (Arrow Down)">
                     <i class="bi bi-zoom-out text-light"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-light zoom-btn" id="zoomInBtn" title="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre">
+                <button aria-label="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre" class="btn btn-sm btn-outline-light zoom-btn" id="zoomInBtn" title="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre">
                     <i class="bi bi-zoom-in text-light"></i>
                 </button>
                 <select class="form-select form-select-sm page-selector" id="pageSelector">
@@ -504,8 +492,6 @@
 <!-- End of Set Read Date Modal -->
 {% include 'partials/modal_update_xml.html' %}
 {% include 'partials/modal_series_json.html' %}
-<!-- Toast Container -->
-{% include 'partials/toast_container.html' %}
 <!-- Bulk Action Bar -->
 {% if _can_manage %}
 <div id="collectionBulkActionBar" class="collection-bulk-action-bar" style="display: none;">
@@ -680,6 +666,7 @@
                         selector.appendChild(option);
                     });
 
+                    selector.onchange = () => switchLibrary(selector.value);
                     container.style.display = 'block';
 
                     // Store libraries for header title lookup

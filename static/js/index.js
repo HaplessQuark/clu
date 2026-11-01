@@ -95,9 +95,9 @@ function loadDirectories(path = "/data") {
         .then(data => {
             // Save the fetched data for later filtering in the modal
             modalDirectoryData = data;
-            currentModalFilter = 'all';
 
-            // Build the filter bar buttons (like files.html does)
+            // A new folder starts at All, as in the other folder pickers.
+            currentModalFilter = 'all';
             updateModalFilterBar(data.directories);
             // Render the directory list with the current filter applied
             renderModalDirectoryListing(data, currentModalFilter);
@@ -116,58 +116,27 @@ function loadDirectories(path = "/data") {
         .catch(error => console.error("Error fetching directories:", error));
 }
 
-// Build the filter bar for the modal using the directory names.
+// Build the modal's A-Z bar from the directory names. CLU.letterBar keeps the
+// current letter selected, and a second click on it goes back to All.
 function updateModalFilterBar(directories) {
-    const outerContainer = document.getElementById("source-directory-filter");
-    if (!outerContainer) return;
-    const btnGroup = outerContainer.querySelector('.btn-group');
-    if (!btnGroup) return;
+    const bar = document.querySelector("#source-directory-filter .clu-letter-bar");
+    if (!bar) return;
 
-    let availableLetters = new Set();
-    let hasNonAlpha = false;
-    directories.forEach(dir => {
-        const firstChar = dir.charAt(0).toUpperCase();
-        if (firstChar >= 'A' && firstChar <= 'Z') {
-            availableLetters.add(firstChar);
-        } else {
-            hasNonAlpha = true;
+    // CLU.sortLetters buckets each first character ('#' for a non-letter).
+    const letters = CLU.sortLetters(directories.map(dir => dir.charAt(0)));
+    // Keep the selection only while this folder still has that letter.
+    if (currentModalFilter !== 'all' && letters.indexOf(currentModalFilter) === -1) {
+        currentModalFilter = 'all';
+    }
+
+    CLU.letterBar(bar, {
+        letters,
+        active: currentModalFilter === 'all' ? '' : currentModalFilter,
+        onChange: value => {
+            currentModalFilter = value || 'all';
+            renderModalDirectoryListing(modalDirectoryData, currentModalFilter);
         }
     });
-
-    let buttonsHtml = '';
-    buttonsHtml += `<button type="button" class="btn btn-outline-secondary active" onclick="filterModalDirectories('all')">All</button>`;
-    if (hasNonAlpha) {
-        buttonsHtml += `<button type="button" class="btn btn-outline-secondary" onclick="filterModalDirectories('#')">#</button>`;
-    }
-    for (let i = 65; i <= 90; i++) {
-        const letter = String.fromCharCode(i);
-        if (availableLetters.has(letter)) {
-            buttonsHtml += `<button type="button" class="btn btn-outline-secondary" onclick="filterModalDirectories('${letter}')">${letter}</button>`;
-        }
-    }
-    btnGroup.innerHTML = buttonsHtml;
-}
-
-// When a modal filter button is clicked, update the active filter and re-render the list.
-function filterModalDirectories(letter) {
-    // If clicking the same letter that's already active, toggle to 'all'
-    if (currentModalFilter === letter) {
-        letter = 'all';
-    }
-    currentModalFilter = letter;
-    const outerContainer = document.getElementById("source-directory-filter");
-    if (outerContainer) {
-        const buttons = outerContainer.querySelectorAll("button");
-        buttons.forEach(btn => {
-            let btnText = btn.textContent.trim();
-            if ((letter === 'all' && btnText === 'All') || btnText === letter) {
-                btn.classList.add("active");
-            } else {
-                btn.classList.remove("active");
-            }
-        });
-    }
-    renderModalDirectoryListing(modalDirectoryData, currentModalFilter);
 }
 
 // Render the modal's directory (and file) list based on the current filter.
@@ -337,7 +306,7 @@ function runScript(scriptType) {
 function executeScript(scriptType) {
     const directoryInput = document.getElementById('selected-directory').value.trim();
     if (!directoryInput) {
-        showToast("Please select a directory or file first.", "warning");
+        CLU.toast("Please select a directory or file first.", "warning");
         return;
     }
     if (currentEventSource) {
@@ -644,12 +613,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                     window.location.href = '/';
                 } else {
-                    showToast("Error: " + data.error, "error");
+                    CLU.toast("Error: " + data.error, "error");
                 }
             })
             .catch(error => {
                 console.error(error);
-                showToast("An error occurred during processing.", "error");
+                CLU.toast("An error occurred during processing.", "error");
             });
         });
     }
@@ -681,12 +650,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     document.getElementById('edit').classList.add('collapse');
                     document.getElementById('single').classList.remove('collapse');
                 } else {
-                    showToast("Error: " + data.error, "error");
+                    CLU.toast("Error: " + data.error, "error");
                 }
             })
             .catch(error => {
                 console.error(error);
-                showToast("An error occurred during processing.", "error");
+                CLU.toast("An error occurred during processing.", "error");
             });
         });
     }
@@ -796,12 +765,12 @@ function performRename(input) {
             // After updating the filename, re-sort the inline edit cards.
             sortInlineEditCards();
         } else {
-            showToast('Error renaming file: ' + data.error, "error");
+            CLU.toast('Error renaming file: ' + data.error, "error");
         }
     })
     .catch(error => {
         console.error('Error:', error);
-        showToast('An error occurred while renaming the file.', "error");
+        CLU.toast('An error occurred while renaming the file.', "error");
     });
 }
 
@@ -837,12 +806,12 @@ function deleteCardImage(buttonElement) {
                 colElement.remove();
             }, 300);
         } else {
-            showToast("Error deleting image: " + data.error, "error");
+            CLU.toast("Error deleting image: " + data.error, "error");
         }
     })
     .catch(error => {
         console.error("Error:", error);
-        showToast("An error occurred while deleting the image.", "error");
+        CLU.toast("An error occurred while deleting the image.", "error");
     });
 }
 
@@ -913,12 +882,12 @@ function processCropImage(buttonElement, cropType) {
             sortInlineEditCards();
 
         } else {
-            showToast("Error cropping image: " + data.error, "error");
+            CLU.toast("Error cropping image: " + data.error, "error");
         }
     })
     .catch(error => {
         console.error("Error:", error);
-        showToast("An error occurred while cropping the image.", "error");
+        CLU.toast("An error occurred while cropping the image.", "error");
     });
 }
 
@@ -953,7 +922,7 @@ function generateCardHTML(imagePath, imageData) {
                                 <button type="button" class="btn btn-outline-secondary btn-sm" onclick="cropImageRight(this)" title="Crop Image Right">
                                     Right <i class="bi bi-arrow-bar-right"></i>
                                 </button>
-                                <button type="button" class="btn btn-outline-danger btn-sm" onclick="deleteCardImage(this)">
+                                <button aria-label="Delete image" title="Delete image" type="button" class="btn btn-outline-danger btn-sm" onclick="deleteCardImage(this)">
                                     <i class="bi bi-trash"></i>
                                 </button>
                             </div>
@@ -975,56 +944,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 });
-
-// Toast notification system for index.html
-function showToast(message, type = 'info', duration = 5000) {
-    // Create toast container if it doesn't exist
-    let container = document.getElementById('toast-container');
-    if (!container) {
-        container = document.createElement('div');
-        container.id = 'toast-container';
-        container.className = 'toast-container position-fixed top-0 end-0 p-3';
-        container.style.zIndex = '9999';
-        document.body.appendChild(container);
-    }
-
-    const toastId = 'toast-' + Date.now();
-    const iconMap = {
-        'success': 'bi-check-circle-fill text-success',
-        'error': 'bi-exclamation-triangle-fill text-danger',
-        'warning': 'bi-exclamation-triangle-fill text-warning',
-        'info': 'bi-info-circle-fill text-info'
-    };
-
-    const toastHtml = `
-        <div id="${toastId}" class="toast bg-white border-0 shadow" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="toast-header">
-                <i class="bi ${iconMap[type]} me-2"></i>
-                <strong class="me-auto">${type.charAt(0).toUpperCase() + type.slice(1)}</strong>
-                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
-            </div>
-            <div class="toast-body">
-                ${message}
-            </div>
-        </div>
-    `;
-
-    container.insertAdjacentHTML('beforeend', toastHtml);
-    const toastElement = document.getElementById(toastId);
-    const toast = new bootstrap.Toast(toastElement, {
-        delay: duration,
-        autohide: duration > 0
-    });
-
-    toast.show();
-
-    // Remove from DOM after hiding
-    toastElement.addEventListener('hidden.bs.toast', () => {
-        toastElement.remove();
-    });
-
-    return toast;
-}
 
 // Free Form Crop functionality
 let cropData = {
@@ -1111,12 +1030,12 @@ function cropImageFreeForm(buttonElement) {
                 cropModal.show();
             };
         } else {
-            showToast("Error loading image: " + data.error, "error");
+            CLU.toast("Error loading image: " + data.error, "error");
         }
     })
     .catch(error => {
         console.error("Error:", error);
-        showToast("An error occurred while loading the image.", "error");
+        CLU.toast("An error occurred while loading the image.", "error");
     });
 }
 
@@ -1543,13 +1462,13 @@ function confirmFreeFormCrop() {
                 sortInlineEditCards();
             }
 
-            showToast("Free form crop completed successfully!", "success");
+            CLU.toast("Free form crop completed successfully!", "success");
         } else {
-            showToast("Error cropping image: " + data.error, "error");
+            CLU.toast("Error cropping image: " + data.error, "error");
         }
     })
     .catch(error => {
         console.error("Error:", error);
-        showToast("An error occurred while cropping the image.", "error");
+        CLU.toast("An error occurred while cropping the image.", "error");
     });
 }

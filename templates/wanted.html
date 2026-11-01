@@ -1,75 +1,35 @@
 {% extends "base.html" %}
+{% from 'partials/page_header.html' import page_header %}
+{% from 'partials/empty_state.html' import empty_state %}
+{% from 'partials/filters.html' import toolbar, search_input, result_count %}
 
 {% block title %}Wanted Issues{% endblock %}
 
 {% block content %}
-<div class="container py-5">
-    <!-- Header Section -->
-    <div class="d-flex justify-content-between align-items-center mb-4 fade-in-down">
-        <div>
-            <h2 class="display-4 fw-bold mb-1">Wanted Issues</h2>
-            <p class="text-muted lead mb-0">
-                Issues missing from your tracked series
-                {% if cache_age %}
-                <span class="text-muted small ms-2" id="cacheAge">
-                    <i class="bi bi-clock me-1"></i>Updated {{ cache_age }}
-                </span>
-                {% endif %}
-            </p>
-        </div>
-        <div class="d-flex gap-2">
-            <button class="btn btn-outline-secondary" id="refreshBtn" onclick="refreshWanted()" {% if refreshing
+<div>
+    {% call(slot) page_header('Wanted Issues', 'bi-star',
+                              subtitle='Issues missing from your tracked series' ~ (' · Updated ' ~ cache_age if cache_age else ''),
+                              stats=[{'value': total_wanted, 'label': 'wanted'},
+                                     {'value': total_upcoming, 'label': 'upcoming'},
+                                     {'value': total_missing, 'label': 'missing'},
+                                     {'value': reading_list_wanted|length, 'label': 'from reading lists'}]) %}
+        {% if slot == 'actions' %}
+            <button class="btn btn-sm btn-primary" id="checkMissingBtn" onclick="checkForMissing()">
+                <i class="bi bi-search me-1" aria-hidden="true"></i>Check for Missing Issues
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" id="refreshBtn" onclick="refreshWanted()" {% if refreshing
                 %}disabled{% endif %}>
                 {% if refreshing %}
                 <span class="spinner-border spinner-border-sm me-1"></span>Refreshing...
                 {% else %}
-                <i class="bi bi-arrow-clockwise me-1"></i>Refresh
+                <i class="bi bi-arrow-clockwise me-1" aria-hidden="true"></i>Refresh
                 {% endif %}
             </button>
-            <button class="btn btn-outline-success" id="scanDownloadsBtn" onclick="scanDownloads()">
-                <i class="bi bi-folder-check me-1"></i>Scan Download Directory
+            <button class="btn btn-sm btn-outline-secondary" id="scanDownloadsBtn" onclick="scanDownloads()">
+                <i class="bi bi-folder-check me-1" aria-hidden="true"></i>Scan Download Directory
             </button>
-            <button class="btn btn-outline-primary" id="checkMissingBtn" onclick="checkForMissing()">
-                <i class="bi bi-search me-1"></i>Check for Missing Issues
-            </button>
-        </div>
-    </div>
-
-    <!-- Stats Cards -->
-    <div class="row g-3 mb-4">
-        <div class="col-md-3">
-            <div class="card border-0 shadow-sm bg-warning bg-opacity-10">
-                <div class="card-body text-center">
-                    <h3 class="display-5 fw-bold text-warning mb-0">{{ total_wanted }}</h3>
-                    <p class="text-muted mb-0">Total Wanted</p>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card border-0 shadow-sm bg-info bg-opacity-10">
-                <div class="card-body text-center">
-                    <h3 class="display-5 fw-bold text-info mb-0">{{ total_upcoming }}</h3>
-                    <p class="text-muted mb-0">Upcoming</p>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card border-0 shadow-sm bg-danger bg-opacity-10">
-                <div class="card-body text-center">
-                    <h3 class="display-5 fw-bold text-danger mb-0">{{ total_missing }}</h3>
-                    <p class="text-muted mb-0">Missing</p>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card border-0 shadow-sm bg-primary bg-opacity-10">
-                <div class="card-body text-center">
-                    <h3 class="display-5 fw-bold text-primary mb-0">{{ reading_list_wanted|length }}</h3>
-                    <p class="text-muted mb-0">From Reading Lists</p>
-                </div>
-            </div>
-        </div>
-    </div>
+        {% endif %}
+    {% endcall %}
 
     {% if loading %}
     <!-- Loading State -->
@@ -84,28 +44,32 @@
         <p class="text-muted small">This may take a moment on first load.</p>
     </div>
     {% elif total_wanted == 0 and not reading_list_wanted %}
-    <!-- Empty State -->
-    <div class="text-center py-5 fade-in-up">
-        <div class="mb-4">
-            <i class="bi bi-check-circle display-1 text-success opacity-50"></i>
-        </div>
-        <h3 class="h2 text-muted mb-3">No Wanted Issues</h3>
-        <p class="text-muted mb-4 lead">Your collection is complete for all tracked series!</p>
-        <a href="{{ url_for('series.releases') }}" class="btn btn-outline-primary btn-lg">
-            <i class="bi bi-calendar-week me-1"></i>Browse Releases
+    {% call empty_state('No wanted issues', 'Every tracked series is complete.', 'bi-check-circle', tone='success') %}
+        <a href="{{ url_for('series.releases') }}" class="btn btn-outline-secondary">
+            <i class="bi bi-calendar-week me-1" aria-hidden="true"></i>Browse releases
         </a>
-    </div>
+    {% endcall %}
     {% else %}
+    {% set wanted_rows = missing|length + upcoming|length + reading_list_wanted|length %}
+    {% call toolbar('Filter wanted issues', id='wantedToolbar') %}
+        <div class="clu-toolbar-row">
+            {{ search_input('wantedSearch', 'Search series and reading lists') }}
+            <div class="clu-toolbar-end">
+                {{ result_count('wantedCount', wanted_rows, 'wanted issues', one='wanted issue') }}
+            </div>
+        </div>
+    {% endcall %}
+    <div id="wantedNoMatches" hidden></div>
 
     <!-- Missing Issues Section -->
     {% if missing %}
-    <div class="card border-0 shadow-sm mb-4">
+    <div class="card border-0 shadow-sm mb-4 wanted-section">
         <div class="card-header bg-danger bg-opacity-10 d-flex justify-content-between align-items-center">
             <h5 class="mb-0">
                 <i class="bi bi-x-circle me-2 text-danger"></i>Missing Issues
-                <span class="badge bg-danger ms-2">{{ missing|length }}</span>
+                <span class="badge bg-danger ms-2 wanted-section-count">{{ missing|length }}</span>
             </h5>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+            <button aria-label="Show or hide missing issues" title="Show or hide missing issues" class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
                 data-bs-target="#missingCollapse" aria-expanded="true">
                 <i class="bi bi-chevron-down"></i>
             </button>
@@ -124,7 +88,7 @@
                         </thead>
                         <tbody>
                             {% for item in missing %}
-                            <tr>
+                            <tr class="wanted-row" data-search="{{ (item.series_name ~ ' ' ~ (item.issue.name or ''))|lower }}">
                                 <td class="ps-4">
                                     <a href="{{ url_for('series.series_view', slug=generate_series_slug(item.series_name, item.series_id, item.series_volume)) }}"
                                         class="text-decoration-none fw-bold">
@@ -154,7 +118,7 @@
                                        filters results out. #}
                                     {% set issue_year = (item.issue.store_date|string)[:4] if item.issue.store_date
                                     else ((item.issue.cover_date|string)[:4] if item.issue.cover_date else '') %}
-                                    <button class="btn btn-sm btn-outline-primary me-1"
+                                    <button aria-label="Search GetComics" class="btn btn-sm btn-outline-primary me-1"
                                         data-series="{{ item.series_name }}"
                                         data-issue="{{ item.issue.number }}"
                                         data-year="{{ issue_year }}"
@@ -162,7 +126,7 @@
                                         title="Search GetComics">
                                         <i class="bi bi-search"></i>
                                     </button>
-                                    <a href="https://metron.cloud/issue/{{ item.issue.id }}/" target="_blank"
+                                    <a aria-label="View on Metron" href="https://metron.cloud/issue/{{ item.issue.id }}/" target="_blank"
                                         class="btn btn-sm btn-outline-secondary" title="View on Metron">
                                         <i class="bi bi-box-arrow-up-right"></i>
                                     </a>
@@ -179,13 +143,13 @@
 
     <!-- Upcoming Releases Section -->
     {% if upcoming %}
-    <div class="card border-0 shadow-sm mb-4">
+    <div class="card border-0 shadow-sm mb-4 wanted-section">
         <div class="card-header bg-info bg-opacity-10 d-flex justify-content-between align-items-center">
             <h5 class="mb-0">
                 <i class="bi bi-calendar-plus me-2 text-info"></i>Upcoming Releases
-                <span class="badge bg-info ms-2">{{ upcoming|length }}</span>
+                <span class="badge bg-info ms-2 wanted-section-count">{{ upcoming|length }}</span>
             </h5>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+            <button aria-label="Show or hide upcoming issues" title="Show or hide upcoming issues" class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
                 data-bs-target="#upcomingCollapse" aria-expanded="true">
                 <i class="bi bi-chevron-down"></i>
             </button>
@@ -204,7 +168,7 @@
                         </thead>
                         <tbody>
                             {% for item in upcoming %}
-                            <tr>
+                            <tr class="wanted-row" data-search="{{ (item.series_name ~ ' ' ~ (item.issue.name or ''))|lower }}">
                                 <td class="ps-4">
                                     <a href="{{ url_for('series.series_view', slug=generate_series_slug(item.series_name, item.series_id, item.series_volume)) }}"
                                         class="text-decoration-none fw-bold">
@@ -225,7 +189,7 @@
                                     {{ item.issue.store_date }}
                                 </td>
                                 <td class="text-end pe-4">
-                                    <a href="https://metron.cloud/issue/{{ item.issue.id }}/" target="_blank"
+                                    <a aria-label="View on Metron" href="https://metron.cloud/issue/{{ item.issue.id }}/" target="_blank"
                                         class="btn btn-sm btn-outline-secondary" title="View on Metron">
                                         <i class="bi bi-box-arrow-up-right"></i>
                                     </a>
@@ -248,13 +212,13 @@
        tracks no series at all, the loading branch is the only one that ever
        renders. #}
     {% if reading_list_wanted %}
-    <div class="card border-0 shadow-sm mb-4">
+    <div class="card border-0 shadow-sm mb-4 wanted-section">
         <div class="card-header bg-primary bg-opacity-10 d-flex justify-content-between align-items-center">
             <h5 class="mb-0">
                 <i class="bi bi-journal-bookmark me-2 text-primary"></i>From Reading Lists
-                <span class="badge bg-primary ms-2">{{ reading_list_wanted|length }}</span>
+                <span class="badge bg-primary ms-2 wanted-section-count">{{ reading_list_wanted|length }}</span>
             </h5>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+            <button aria-label="Show or hide reading-list issues" title="Show or hide reading-list issues" class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
                 data-bs-target="#readingListCollapse" aria-expanded="true">
                 <i class="bi bi-chevron-down"></i>
             </button>
@@ -273,7 +237,7 @@
                         </thead>
                         <tbody>
                             {% for item in reading_list_wanted %}
-                            <tr>
+                            <tr class="wanted-row" data-search="{{ (item.series ~ ' ' ~ (item.reading_list_name or ''))|lower }}">
                                 <td class="ps-4 fw-bold">{{ item.series }}</td>
                                 <td>
                                     <span class="badge bg-primary">#{{ item.issue_number }}</span>
@@ -291,7 +255,7 @@
                                     {# search_year is computed once in
                                        core.wanted_reading_lists so this page and the
                                        nightly sweep narrow on the same year. #}
-                                    <button class="btn btn-sm btn-outline-primary"
+                                    <button aria-label="Search sources" class="btn btn-sm btn-outline-primary"
                                         data-series="{{ item.series }}"
                                         data-issue="{{ item.issue_number }}"
                                         data-year="{{ item.search_year or '' }}"
@@ -324,9 +288,9 @@
             <div class="modal-body">
                 <div class="mb-3">
                     <div class="input-group">
-                        <input type="text" class="form-control" id="getcomicsQuery" placeholder="Search query..."
+                        <input type="text" class="form-control" id="getcomicsQuery" aria-label="Search GetComics" placeholder="Search GetComics…"
                             onkeypress="if(event.key==='Enter')doGetComicsSearch()">
-                        <button class="btn btn-primary" onclick="doGetComicsSearch()">
+                        <button aria-label="Search GetComics" title="Search GetComics" class="btn btn-primary" onclick="doGetComicsSearch()">
                             <i class="bi bi-search"></i>
                         </button>
                     </div>
@@ -389,7 +353,7 @@
                     issue: currentSearchIssue,
                     year: currentSearchYear,
                 }),
-                toast: showToast,
+                toast: CLU.toast,
                 // The keep-open button leaves the results up so the user can
                 // grab more than one file from a single search.
                 onQueued: ({ keepOpen }) => {
@@ -415,32 +379,6 @@
         return div.innerHTML;
     }
 
-    function showToast(message, type) {
-        // Create toast container if it doesn't exist
-        let container = document.querySelector('.toast-container');
-        if (!container) {
-            container = document.createElement('div');
-            container.className = 'toast-container position-fixed bottom-0 end-0 p-3';
-            document.body.appendChild(container);
-        }
-
-        const toastId = 'toast-' + Date.now();
-        const toastHtml = `
-        <div id="${toastId}" class="toast align-items-center text-bg-${type} border-0" role="alert">
-            <div class="d-flex">
-                <div class="toast-body">${escapeHtml(message)}</div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-            </div>
-        </div>`;
-        container.insertAdjacentHTML('beforeend', toastHtml);
-
-        const toastEl = document.getElementById(toastId);
-        const toast = new bootstrap.Toast(toastEl, { autohide: true, delay: 3000 });
-        toast.show();
-
-        toastEl.addEventListener('hidden.bs.toast', () => toastEl.remove());
-    }
-
     // Trigger GetComics auto-download for missing issues
     function checkForMissing() {
         const btn = document.getElementById('checkMissingBtn');
@@ -452,7 +390,7 @@
             .then(data => {
                 if (data.success) {
                     btn.innerHTML = '<i class="bi bi-check me-1"></i>Started';
-                    showToast(data.message, 'success');
+                    CLU.toast(data.message, 'success');
                     setTimeout(() => {
                         btn.disabled = false;
                         btn.innerHTML = '<i class="bi bi-search me-1"></i>Check for Missing Issues';
@@ -460,13 +398,13 @@
                 } else {
                     btn.disabled = false;
                     btn.innerHTML = '<i class="bi bi-search me-1"></i>Check for Missing Issues';
-                    showToast('Error: ' + data.error, 'danger');
+                    CLU.toast('Error: ' + data.error, 'danger');
                 }
             })
             .catch(e => {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-search me-1"></i>Check for Missing Issues';
-                showToast('Error: ' + e.message, 'danger');
+                CLU.toast('Error: ' + e.message, 'danger');
             });
     }
 
@@ -481,18 +419,18 @@
             .then(data => {
                 if (data.success) {
                     btn.innerHTML = '<i class="bi bi-check me-1"></i>Done';
-                    showToast(data.message, 'success');
+                    CLU.toast(data.message, 'success');
                     setTimeout(() => location.reload(), 1500);
                 } else {
                     btn.disabled = false;
                     btn.innerHTML = '<i class="bi bi-folder-check me-1"></i>Scan Download Directory';
-                    showToast('Error: ' + data.error, 'danger');
+                    CLU.toast('Error: ' + data.error, 'danger');
                 }
             })
             .catch(e => {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-folder-check me-1"></i>Scan Download Directory';
-                showToast('Error: ' + e.message, 'danger');
+                CLU.toast('Error: ' + e.message, 'danger');
             });
     }
 
@@ -510,13 +448,13 @@
                 } else {
                     btn.disabled = false;
                     btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Refresh';
-                    showToast('Error: ' + data.error, 'danger');
+                    CLU.toast('Error: ' + data.error, 'danger');
                 }
             })
             .catch(e => {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Refresh';
-                showToast('Error: ' + e.message, 'danger');
+                CLU.toast('Error: ' + e.message, 'danger');
             });
     }
 
@@ -540,6 +478,52 @@
             })
             .finally(() => clearTimeout(t));
     }
+
+    // The search narrows every section's rows by series (and, for reading-list
+    // rows, the list's name). A section with nothing left hides, and its
+    // header badge counts what is shown.
+    document.addEventListener('DOMContentLoaded', function () {
+        const box = document.getElementById('wantedSearch');
+        if (!box) return;
+        const rows = Array.from(document.querySelectorAll('.wanted-row'));
+        const countEl = document.getElementById('wantedCount');
+        const noMatches = document.getElementById('wantedNoMatches');
+
+        function apply(value) {
+            const q = (value || '').trim();
+            const needle = q.toLowerCase();
+            let shown = 0;
+            rows.forEach(function (row) {
+                const ok = !needle || (row.dataset.search || '').indexOf(needle) !== -1;
+                row.classList.toggle('d-none', !ok);
+                if (ok) shown += 1;
+            });
+            document.querySelectorAll('.wanted-section').forEach(function (section) {
+                const visible = section.querySelectorAll('.wanted-row:not(.d-none)').length;
+                section.classList.toggle('d-none', visible === 0);
+                const badge = section.querySelector('.wanted-section-count');
+                if (badge) badge.textContent = CLU.formatCount(visible);
+            });
+            CLU.setCount(countEl, {
+                total: rows.length, noun: 'wanted issues', one: 'wanted issue', shown: shown
+            });
+            if (shown === 0 && q) {
+                noMatches.replaceChildren(CLU.noMatches({
+                    noun: 'wanted issues', query: q,
+                    onClear: function () {
+                        box.value = '';
+                        box.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                }));
+                noMatches.hidden = false;
+            } else {
+                noMatches.hidden = true;
+                noMatches.replaceChildren();
+            }
+        }
+
+        CLU.bindSearch(box, apply, { delay: 0 });
+    });
 
     // Auto-poll when in loading state
     {% if loading or refreshing %}

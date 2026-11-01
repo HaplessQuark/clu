@@ -80,7 +80,11 @@ class TestRolePolicy:
         # e.g. /api/settings/* would silently 403 every Reader.
         ("POST", "/api/account/appearance", "reader"),
         ("POST", "/api/account/dashboard", "reader"),
+        ("POST", "/api/account/page-width", "reader"),
         ("GET", "/config", "owner"),
+        # The site-default page width is in routes/auth.py, but its path is
+        # what makes it owner-only.
+        ("POST", "/api/config/page-width", "owner"),
         ("POST", "/api/config/file-processing", "owner"),
         ("POST", "/api/config/folder-paths", "owner"),
         ("GET", "/api/database/stats", "owner"),
@@ -104,9 +108,10 @@ class TestRolePolicy:
         ("POST", "/api/libraries", "owner"),          # library CRUD → owner
         ("DELETE", "/api/publishers/10", "owner"),
         ("GET", "/users", "owner"),
-        # Damaged-file worklist: the page and its API are both owner-only, and
+        # Library Health: the page and its API are both owner-only, and
         # /api/problem-files is NOT covered by the /api/config/ prefix.
-        ("GET", "/problem-files", "owner"),
+        ("GET", "/library-health", "owner"),
+        ("GET", "/problem-files", "owner"),           # old URL, redirects
         ("GET", "/api/problem-files", "owner"),
         ("POST", "/api/problem-files/retry", "owner"),
         ("POST", "/api/problem-files/delete", "owner"),

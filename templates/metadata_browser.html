@@ -1,5 +1,8 @@
 {% extends 'base.html' %}
+{% from 'partials/page_header.html' import page_header %}
+{% from 'partials/filters.html' import toolbar, search_input, select_field, per_page_select, pager_nav, result_count %}
 {% block title %}Library{% endblock %}
+{% block page_shell %}container-fluid clu-shell-wide{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/collection.css') }}?v={{ range(1, 10000) | random }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/metadata_browser.css') }}?v={{ range(1, 10000) | random }}">
@@ -7,75 +10,63 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css" />
 {% endblock %}
 {% block content %}
-<div class="container-fluid mt-4 metadata-browser">
-    <div class="bg-body-tertiary p-3 rounded-3 shadow-sm mb-3 d-flex flex-column gap-3">
-        <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3">
-            <nav aria-label="breadcrumb" class="flex-grow-1">
-                <ol class="breadcrumb mb-0" id="mbBreadcrumb">
-                    <li class="breadcrumb-item active"><i class="bi bi-collection me-1"></i>Library</li>
-                </ol>
-            </nav>
-            <div class="d-flex flex-wrap align-items-center gap-2">
-                <div class="btn-group btn-group-sm" role="group" aria-label="Primary axis">
-                    <input type="radio" class="btn-check" name="mbAxis" id="mbAxisPublisher" value="publisher" autocomplete="off" checked>
-                    <label class="btn btn-outline-primary" for="mbAxisPublisher"><i class="bi bi-building me-1"></i>Publisher</label>
+<div class="metadata-browser">
+    {# metadata_browser.js rebuilds #mbBreadcrumb and sets the title to the
+       current level (Library / publisher / series) on every reload. #}
+    {% call(slot) page_header('Library', 'bi-collection', title_id='mbTitle', crumbs_id='mbBreadcrumb') %}
+        {% if slot == 'crumbs' %}
+            <li class="breadcrumb-item active"><i class="bi bi-collection me-1" aria-hidden="true"></i>Library</li>
+        {% endif %}
+    {% endcall %}
 
-                    <input type="radio" class="btn-check" name="mbAxis" id="mbAxisSeries" value="series" autocomplete="off">
-                    <label class="btn btn-outline-primary" for="mbAxisSeries"><i class="bi bi-journal-text me-1"></i>Series</label>
+    {# Search, then the axis and sort, refresh and page size pushed right; the
+       letter row last (metadata_browser.js fills it and hides it when there
+       are no letters). #}
+    {% call toolbar('Library view') %}
+        <div class="clu-toolbar-row">
+            {{ search_input('mbSearch', 'Search title or series') }}
 
-                    <input type="radio" class="btn-check" name="mbAxis" id="mbAxisYear" value="year" autocomplete="off">
-                    <label class="btn btn-outline-primary" for="mbAxisYear"><i class="bi bi-calendar3 me-1"></i>Year</label>
-                </div>
+            <div class="btn-group btn-group-sm" role="group" aria-label="Primary axis">
+                <input type="radio" class="btn-check" name="mbAxis" id="mbAxisPublisher" value="publisher" autocomplete="off" checked>
+                <label class="btn btn-outline-secondary" for="mbAxisPublisher"><i class="bi bi-building me-1" aria-hidden="true"></i>Publisher</label>
 
-                <div class="input-group input-group-sm">
-                    <label class="input-group-text bg-body border-0" for="mbSort">Sort</label>
-                    <select class="form-select border-0 shadow-none bg-body text-body" id="mbSort">
-                        <option value="alpha" selected>A–Z</option>
-                        <option value="count">Count</option>
-                        <option value="year">Year</option>
-                        <option value="recent">Recent</option>
-                    </select>
-                </div>
+                <input type="radio" class="btn-check" name="mbAxis" id="mbAxisSeries" value="series" autocomplete="off">
+                <label class="btn btn-outline-secondary" for="mbAxisSeries"><i class="bi bi-journal-text me-1" aria-hidden="true"></i>Series</label>
 
-                <div class="input-group input-group-sm">
-                    <label class="input-group-text bg-body border-0" for="mbPerPage">Per page</label>
-                    <select class="form-select border-0 shadow-none bg-body text-body" id="mbPerPage">
-                        <option value="24">24</option>
-                        <option value="50" selected>50</option>
-                        <option value="100">100</option>
-                        <option value="250">250</option>
-                    </select>
-                </div>
+                <input type="radio" class="btn-check" name="mbAxis" id="mbAxisYear" value="year" autocomplete="off">
+                <label class="btn btn-outline-secondary" for="mbAxisYear"><i class="bi bi-calendar3 me-1" aria-hidden="true"></i>Year</label>
+            </div>
 
-                <button class="btn btn-light border btn-sm" id="mbRefreshBtn" title="Refresh">
-                    <i class="bi bi-arrow-clockwise text-muted"></i>
+            {% call select_field('mbSort', 'Sort') %}
+                <option value="alpha" selected>A–Z</option>
+                <option value="count">Count</option>
+                <option value="year">Year</option>
+                <option value="recent">Recent</option>
+            {% endcall %}
+
+            <div class="clu-toolbar-end">
+                {{ result_count('mbCount', 0, 'items') }}
+                <button type="button" class="btn btn-sm btn-outline-secondary" id="mbRefreshBtn" aria-label="Refresh" title="Refresh">
+                    <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
                 </button>
+                {{ per_page_select('mbPerPage', clu_default_per_page()) }}
             </div>
         </div>
-
-        <div class="d-flex flex-column flex-md-row gap-2 border-top pt-3">
-            <div id="mbLetterFilter" class="pb-1 pb-md-0" style="flex: 1 1 auto; overflow-x: auto;">
-                <div class="btn-group btn-group-sm text-nowrap" role="group" aria-label="Filter by first letter"></div>
-            </div>
-            <div style="flex: 0 0 auto; width: 100%; max-width: 260px;">
-                <input type="text" id="mbSearch" class="form-control form-control-sm" placeholder="Search title / series…">
-            </div>
+        <div class="clu-toolbar-row" id="mbLetterFilter">
+            {# Drawn by CLU.letterBar in metadata_browser.js renderLetterFilter(). #}
+            <div class="btn-group btn-group-sm clu-letter-bar clu-filter-scroll" role="group" aria-label="Filter by first letter"></div>
         </div>
-    </div>
+    {% endcall %}
 
     <div id="mbGrid" class="file-grid"></div>
-    <div id="mbEmpty" class="text-center py-5" style="display:none;">
-        <i class="bi bi-inbox display-1 text-muted"></i>
-        <p class="lead text-muted mt-3">No matches</p>
-    </div>
+    {# Drawn by metadata_browser.js renderGrid(): no matches, or an empty library. #}
+    <div id="mbEmpty" style="display: none;"></div>
     <div id="mbLoading" class="text-center py-5">
         <div class="spinner-border text-primary" role="status">
             <span class="visually-hidden">Loading…</span>
         </div>
     </div>
-    <nav id="mbPagination" class="mt-4" aria-label="Metadata pagination" style="display:none;">
-        <ul class="pagination justify-content-center"></ul>
-    </nav>
+    {{ pager_nav('mbPagination', 'Metadata pagination') }}
 </div>
 
 <!-- Grid Item Template (matches collection.html) -->
@@ -86,13 +77,13 @@
             <div class="icon-overlay">
                 <i class="bi"></i>
             </div>
-            <button class="info-button no-propagation" title="CBZ Information">
+            <button aria-label="CBZ Information" class="info-button no-propagation" title="CBZ Information">
                 <i class="bi bi-info-circle"></i>
             </button>
-            <button class="favorite-button no-propagation" title="Add to Favorites" style="display: none;">
+            <button aria-label="Add to Favorites" class="favorite-button no-propagation" title="Add to Favorites" style="display: none;">
                 <i class="bi bi-bookmark-heart"></i>
             </button>
-            <button class="to-read-button no-propagation" title="Add to To Read" style="display: none;">
+            <button aria-label="Add to To Read" class="to-read-button no-propagation" title="Add to To Read" style="display: none;">
                 <i class="bi bi-bookmark-plus"></i>
             </button>
             <span class="issue-badge" style="display: none;"><span class="issue-number"></span><i class="bi bi-book read-icon"></i></span>
@@ -106,7 +97,7 @@
                 <div class="item-meta text-muted small"></div>
             </div>
             <div class="item-actions dropdown ms-2">
-                <button class="btn btn-link btn-sm p-0 text-dark no-propagation" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                <button aria-label="More actions" title="More actions" class="btn btn-link btn-sm p-0 text-dark no-propagation" type="button" data-bs-toggle="dropdown" aria-expanded="false">
                     <i class="bi bi-three-dots-vertical"></i>
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end shadow">
@@ -138,7 +129,6 @@
 {% include 'partials/modal_cbz_info.html' %}
 {% include 'partials/modal_update_xml.html' %}
 {% include 'partials/modal_add_to_reading_list.html' %}
-{% include 'partials/toast_container.html' %}
 {% include 'partials/progress_container.html' %}
 
 <!-- Comic Reader Modal (shared with collection) -->
@@ -155,10 +145,10 @@
             </div>
             <div class="comic-reader-controls">
                 <span class="comic-reader-page-info" id="comicReaderPageInfo">Page 1 of 1</span>
-                <button class="btn btn-sm btn-outline-light" id="comicReaderBookmark" title="Save Position">
+                <button aria-label="Save Position" class="btn btn-sm btn-outline-light" id="comicReaderBookmark" title="Save Position">
                     <i class="bi bi-bookmark text-primary"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-light" id="comicReaderClose" title="Close">
+                <button aria-label="Close" class="btn btn-sm btn-outline-light" id="comicReaderClose" title="Close">
                     <i class="bi bi-x-lg text-light"></i>
                 </button>
             </div>
@@ -197,10 +187,10 @@
         </div>
         <div class="comic-reader-footer">
             <div class="comic-reader-footer-controls">
-                <button class="btn btn-sm btn-outline-light zoom-btn" id="zoomOutBtn" title="Zoom Out (Arrow Down)">
+                <button aria-label="Zoom Out (Arrow Down)" class="btn btn-sm btn-outline-light zoom-btn" id="zoomOutBtn" title="Zoom Out (Arrow Down)">
                     <i class="bi bi-zoom-out text-light"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-light zoom-btn" id="zoomInBtn" title="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre">
+                <button aria-label="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre" class="btn btn-sm btn-outline-light zoom-btn" id="zoomInBtn" title="Zoom In (Arrow Up). Pan with Shift+Arrows, WASD or scroll wheel; 0 to re-centre">
                     <i class="bi bi-zoom-in text-light"></i>
                 </button>
                 <select class="form-select form-select-sm page-selector" id="pageSelector">
@@ -225,6 +215,5 @@
 <script src="{{ url_for('static', filename='js/clu-delete.js') }}?v={{ range(1, 10000) | random }}"></script>
 <script src="{{ url_for('static', filename='js/reader.js') }}?v={{ range(1, 10000) | random }}"></script>
 <script src="{{ url_for('static', filename='js/reading_list_picker.js') }}?v={{ range(1, 10000) | random }}"></script>
-<script src="{{ url_for('static', filename='js/clu-pager.js') }}?v={{ range(1, 10000) | random }}"></script>
 <script src="{{ url_for('static', filename='js/metadata_browser.js') }}?v={{ range(1, 10000) | random }}"></script>
 {% endblock %}

@@ -42,10 +42,6 @@
         opacity: 1;
     }
 
-    .grid-filter-buttons {
-        grid-template-columns: repeat(auto-fill, minmax(50px, 1fr));
-    }
-
     #destination-list,
     #source-list {
         /* 100vh is the full height of the screen.
@@ -374,4 +370,25 @@
     font-size: 1.2rem;
     z-index: 9999;
     pointer-events: none;
+}
+/* "This folder is empty" / "No downloads waiting": a message, not a row. */
+.files-empty-listing {
+    cursor: default;
+    background-color: transparent;
+}
+
+/* Library / Downloads / Recent Files / Trash: never wider than the panel. */
+.files-source-views {
+    max-width: 100%;
+}
+
+.files-source-views > *,
+.files-source-views > .dropdown > .btn {
+    min-width: 0;
+}
+
+/* One line per label: a wrapped "Recent / Files" broke the joined group on a
+   phone. "Recent Files" reads "Recent" below 576px so the group fits. */
+.files-source-views .btn {
+    white-space: nowrap;
 }

@@ -42,11 +42,6 @@
       background-color: rgba(var(--bs-primary-rgb), 0.15);
     }
 
-    #source-directory-filter .btn {
-      flex: 1 0 80px;
-      /* Each button grows equally with a minimum width of 80px */
-    }
-
     .folder-hover {
       background-color: rgba(var(--bs-info-rgb), 0.2);
       /* Adjust color to your preference */
@@ -98,16 +93,30 @@
     .ops-item-completed { opacity: 0.6; }
     .ops-item-error { border-left: 3px solid #dc3545; }
   </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/clu-page.css') }}">
   {% block extra_css %}{% endblock %}
+  {# The list toolbar helpers (partials/filters.html's script twins and the
+     page bar) load in the head, not the footer: several pages run inline
+     scripts inside their content block that call them while the page parses.
+     Neither touches the DOM when it loads. #}
+  <script src="{{ url_for('static', filename='js/clu-filters.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/clu-pager.js') }}"></script>
 </head>
 
 <body class="d-flex flex-column min-vh-100">
+  {# The page shell's width. A page states what it wants by overriding
+     page_shell (cover grids ask for full width); the page_width setting
+     (core/page_width.py: auto / wide / constrained, per user) decides whether
+     that is honoured. The block is defined here, unprinted, so self.page_shell()
+     returns the page's override; header, footer and banner follow _shell. #}
+  {% if false %}{% block page_shell %}container-lg{% endblock %}{% endif %}
+  {% set _shell = page_width_shell(page_width, self.page_shell()) %}
   {% include 'header.html' %}
 
   <main class="flex-grow-1">
     {% if show_setup_banner %}
     {# Upgraded installs: a one-time invitation to the Guided Setup. #}
-    <div class="container-lg mt-3" id="setup-banner">
+    <div class="{{ page_width_chrome(_shell) }} mt-3" id="setup-banner">
       <div class="alert alert-info d-flex flex-wrap align-items-center gap-2 mb-0" role="status">
         <i class="bi bi-signpost-split"></i>
         <span class="flex-grow-1">New: <strong>Guided Setup</strong> can check your configuration and point out anything missing.</span>
@@ -126,14 +135,23 @@
       });
     </script>
     {% endif %}
-    {% block content %}{% endblock %}
+    {# The page shell. Every page gets the same width and top rhythm from here;
+       a page never adds its own outer container. Cover grids opt into full
+       width by overriding page_shell (tests/unit/test_page_header.py), and
+       the page_width setting can override that (see _shell above). #}
+    <div class="clu-shell {{ _shell }}">
+      {% block content %}{% endblock %}
+    </div>
   </main>
 
   {% include 'footer.html' %}
+  {% include 'partials/toast_container.html' %}
 
 
   <!-- Bootstrap JS (Required for Modal functionality) -->
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="{{ url_for('static', filename='js/clu-toast.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/clu-page.js') }}"></script>
 
   <!-- Environment-based console logging -->
   <script>
@@ -377,7 +395,7 @@
         .catch(err => console.error("Failed to check for updates:", err));
     }
 
-    // Library health: a dot on the gear and a score beside "Problem Files".
+    // Library health: a dot on the gear and a score beside "Library Health".
     // Owner-only (the elements are only rendered for the owner, and the
     // endpoint is owner-gated); hidden until a scan has ever completed.
     function updateHealthBadge(signal) {

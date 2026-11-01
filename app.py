@@ -756,7 +756,7 @@ def process_incoming_wanted_issues():
     # before the wanted pass runs. These are deliberately NOT wanted issues --
     # the damaged file exists, so the issue is not missing and nothing below
     # would ever claim the download. This is the hook that makes the swap
-    # happen even when the user has closed the Problem Files page.
+    # happen even when the user has closed the Library Health page.
     #
     # The app context is required, not decorative: api.py calls this function
     # from a bare daemon thread (check_wanted_after_watch_empty), and the swap
@@ -7176,6 +7176,7 @@ def config_page():
         downloadPacks=is_download_packs_enabled(),
         enableDebugLogging=st["ENABLE_DEBUG_LOGGING"],
         bootstrapTheme=get_user_preference("bootstrap_theme", default="default"),
+        pageWidth=st["PAGE_WIDTH"],
         timezone=get_user_preference("timezone", default="UTC"),
         # Named exactly, for the Komga schedule card: the preference is a fixed
         # offset with no DST.

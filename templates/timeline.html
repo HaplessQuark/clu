@@ -1,72 +1,12 @@
 {% extends "base.html" %}
+{% from 'partials/page_header.html' import page_header %}
+{% from 'partials/empty_state.html' import empty_state %}
+{% from 'partials/filters.html' import toolbar, search_input, select_field, result_count %}
 
 {% block title %}Reading Timeline - Comic Library{% endblock %}
 
 {% block extra_css %}
 <style>
-    /* Timeline-specific styling that complements site theme */
-    .timeline-page {
-        padding: 2rem 0;
-    }
-
-    .timeline-header {
-        margin-bottom: 2rem;
-    }
-
-    /* Stats Row */
-    .stat-card {
-        background: var(--bs-secondary-bg, #f8f9fa);
-        border-radius: 12px;
-        padding: 1.5rem;
-        text-align: center;
-        border: 1px solid var(--bs-border-color);
-        height: 100%;
-    }
-
-    .stat-card .stat-icon {
-        width: 48px;
-        height: 48px;
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        margin: 0 auto 0.75rem;
-        font-size: 1.5rem;
-    }
-
-    .stat-card .stat-icon.primary {
-        background: rgba(var(--bs-primary-rgb), 0.15);
-        color: var(--bs-primary);
-    }
-
-    .stat-card .stat-icon.success {
-        background: rgba(var(--bs-success-rgb), 0.15);
-        color: var(--bs-success);
-    }
-
-    .stat-card .stat-icon.warning {
-        background: rgba(var(--bs-warning-rgb), 0.15);
-        color: var(--bs-warning);
-    }
-
-    .stat-card .stat-icon.info {
-        background: rgba(var(--bs-info-rgb), 0.15);
-        color: var(--bs-info);
-    }
-
-    .stat-card .stat-value {
-        font-size: 2rem;
-        font-weight: 700;
-        line-height: 1.2;
-    }
-
-    .stat-card .stat-label {
-        font-size: 0.85rem;
-        color: var(--bs-secondary-color);
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-
     /* Timeline Structure */
     .timeline-container {
         position: relative;
@@ -234,16 +174,6 @@
     }
 
     /* Empty State */
-    .empty-state {
-        text-align: center;
-        padding: 4rem 2rem;
-    }
-
-    .empty-state i {
-        font-size: 4rem;
-        color: var(--bs-secondary-color);
-        margin-bottom: 1rem;
-    }
 
     /* Section Card (matching insights.html pattern) */
     .section-card {
@@ -272,13 +202,6 @@
 
     .section-card-body {
         padding: 1.25rem;
-    }
-
-    /* Filter Buttons */
-    .filter-btn {
-        border-radius: 20px;
-        font-size: 0.8rem;
-        font-weight: 600;
     }
 
     /* Responsive */
@@ -364,87 +287,55 @@
 {% endblock %}
 
 {% block content %}
-<div class="container-lg timeline-page">
-    <!-- Page Header -->
-    <div class="timeline-header d-flex justify-content-between align-items-start flex-wrap gap-3">
-        <div>
-            <h1><i class="bi bi-clock-history me-2 text-primary"></i>Reading Timeline</h1>
-            <p class="lead mb-0">Chronological history of your comic journey</p>
-        </div>
-        <div class="d-flex gap-2">
-            <button class="btn btn-primary" id="monthlyWrappedBtn" data-bs-toggle="modal" data-bs-target="#monthlyWrappedModal">
-                <i class="bi bi-gift me-1"></i>Monthly Wrapped
+<div class="timeline-page">
+    {% call(slot) page_header('Reading Timeline', 'bi-clock-history',
+                              subtitle='Chronological history of your comic journey',
+                              stats=[{'value': stats.total_read, 'label': 'issues read', 'id': 'tlIssuesRead'},
+                                     {'value': stats.total_series, 'label': 'series read'},
+                                     {'value': stats.streak, 'label': 'day streak'},
+                                     {'value': stats.top_publisher if stats.top_publisher not in ('N/A', '') else None,
+                                      'label': 'top publisher'}]) %}
+        {% if slot == 'actions' %}
+            <button class="btn btn-sm btn-primary" id="monthlyWrappedBtn" data-bs-toggle="modal" data-bs-target="#monthlyWrappedModal">
+                <i class="bi bi-gift me-1" aria-hidden="true"></i>Monthly Wrapped
             </button>
-            <a href="{{ url_for('insights_page') }}" class="btn btn-outline-secondary">
-                <i class="bi bi-graph-up-arrow me-1"></i>Insights
+            <a href="{{ url_for('insights_page') }}" class="btn btn-sm btn-outline-secondary">
+                <i class="bi bi-graph-up-arrow me-1" aria-hidden="true"></i>Insights
             </a>
-        </div>
-    </div>
+        {% endif %}
+    {% endcall %}
 
-    <!-- Stats Row -->
-    <div class="row g-3 mb-4">
-        <div class="col-6 col-lg-3">
-            <div class="stat-card">
-                <div class="stat-icon primary">
-                    <i class="bi bi-book"></i>
-                </div>
-                <div class="stat-value">{{ "{:,}".format(stats.total_read) }}</div>
-                <div class="stat-label">Issues Read</div>
+    <!-- Year, month and search: the shared list toolbar (partials/filters.html).
+         Year and month reload the page as soon as they change. -->
+    {% call toolbar('Filter reading history') %}
+        <div class="clu-toolbar-row">
+            {{ search_input('timelineSearch', 'Search reading history') }}
+            {% call select_field('filterYear', 'Year') %}
+                <option value="">All</option>
+                {% for y in available_years %}
+                <option value="{{ y }}" {% if filter_year == y|int %}selected{% endif %}>{{ y }}</option>
+                {% endfor %}
+            {% endcall %}
+            {% call select_field('filterMonth', 'Month') %}
+                <option value="">All</option>
+                {% for m in ['January','February','March','April','May','June','July','August','September','October','November','December'] %}
+                <option value="{{ loop.index }}" {% if filter_month == loop.index %}selected{% endif %}>{{ m }}</option>
+                {% endfor %}
+            {% endcall %}
+            <div class="clu-toolbar-end">
+                {# Cards loaded so far: the list scrolls in 50 at a time. #}
+                {{ result_count('timelineCount', timeline | map(attribute='entries') | map('length') | sum, 'issues', one='issue') }}
+                {# Clear drops the year and month (a reload) and the search box. #}
+                <a href="{{ url_for('timeline') }}" id="timelineClear" data-server-filter="{{ '1' if filter_year or filter_month else '' }}"
+                   class="btn btn-sm btn-outline-secondary{% if not (filter_year or filter_month) %} d-none{% endif %}"><i class="bi bi-x-lg me-1" aria-hidden="true"></i>Clear</a>
             </div>
         </div>
-        <div class="col-6 col-lg-3">
-            <div class="stat-card">
-                <div class="stat-icon info">
-                    <i class="bi bi-collection"></i>
-                </div>
-                <div class="stat-value">{{ "{:,}".format(stats.total_series) }}</div>
-                <div class="stat-label">Series Read</div>
-            </div>
-        </div>
-        <div class="col-6 col-lg-3">
-            <div class="stat-card">
-                <div class="stat-icon success">
-                    <i class="bi bi-fire"></i>
-                </div>
-                <div class="stat-value">{{ stats.streak }} <small class="fs-6 fw-normal">Days</small></div>
-                <div class="stat-label">Current Streak</div>
-            </div>
-        </div>
-        <div class="col-6 col-lg-3">
-            <div class="stat-card">
-                <div class="stat-icon warning">
-                    <i class="bi bi-building"></i>
-                </div>
-                <div class="stat-value" style="font-size: 1.5rem;">{{ stats.top_publisher }}</div>
-                <div class="stat-label">Top Publisher</div>
-            </div>
-        </div>
-    </div>
+    {% endcall %}
 
     <!-- Timeline Section -->
     <div class="section-card">
-        <div class="section-card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div class="section-card-header">
             <h3><i class="bi bi-calendar3"></i>Reading History</h3>
-            <div class="d-flex gap-2 align-items-center flex-wrap">
-                <select id="filterYear" class="form-select form-select-sm" style="width:auto;">
-                    <option value="">All Years</option>
-                    {% for y in available_years %}
-                    <option value="{{ y }}" {% if filter_year == y|int %}selected{% endif %}>{{ y }}</option>
-                    {% endfor %}
-                </select>
-                <select id="filterMonth" class="form-select form-select-sm" style="width:auto;">
-                    <option value="">All Months</option>
-                    {% for m in ['January','February','March','April','May','June','July','August','September','October','November','December'] %}
-                    <option value="{{ loop.index }}" {% if filter_month == loop.index %}selected{% endif %}>{{ m }}</option>
-                    {% endfor %}
-                </select>
-                <button class="btn btn-sm btn-primary" id="applyFilter"><i class="bi bi-funnel me-1"></i>Filter</button>
-                {% if filter_year or filter_month %}
-                <a href="/timeline" class="btn btn-sm btn-outline-secondary"><i class="bi bi-x-lg me-1"></i>Clear</a>
-                {% endif %}
-                <input type="text" class="form-control form-control-sm" placeholder="Search..."
-                    style="max-width: 200px;" id="timelineSearch">
-            </div>
         </div>
         <div class="section-card-body">
             {% if timeline %}
@@ -489,6 +380,8 @@
                 {% endfor %}
             </div>
 
+            <div id="timelineNoMatches" style="display: none;"></div>
+
             <!-- Loading Spinner -->
             <div id="timelineLoader" class="mt-4 text-center" style="display: none;">
                 <div class="spinner-border text-primary" role="status">
@@ -505,14 +398,11 @@
             <!-- Scroll Sentinel (invisible element to trigger loading) -->
             <div id="scrollSentinel" style="height: 1px;"></div>
             {% else %}
-            <div class="empty-state">
-                <i class="bi bi-journal-x d-block"></i>
-                <h4 class="text-muted">No reading history found yet.</h4>
-                <p class="text-muted">Start reading comics to see your timeline here!</p>
-                <a href="/" class="btn btn-primary mt-3">
-                    <i class="bi bi-collection me-1"></i>Go to Library
+            {% call empty_state('No reading history yet', 'Comics you read in CLU show up here, month by month.', 'bi-journal-x') %}
+                <a href="{{ url_for('index') }}" class="btn btn-primary">
+                    <i class="bi bi-collection me-1" aria-hidden="true"></i>Go to Library
                 </a>
-            </div>
+            {% endcall %}
             {% endif %}
         </div>
     </div>
@@ -644,16 +534,18 @@ document.addEventListener('DOMContentLoaded', function() {
     const filterYear = {{ filter_year|tojson }};
     const filterMonth = {{ filter_month|tojson }};
 
-    // Filter button handler
-    document.getElementById('applyFilter')?.addEventListener('click', function() {
+    // Year and month apply on change: the server filters, so reload with them.
+    function applyDateFilter() {
         const year = document.getElementById('filterYear').value;
         const month = document.getElementById('filterMonth').value;
         const params = new URLSearchParams();
         if (year) params.set('year', year);
         if (month) params.set('month', month);
         const qs = params.toString();
-        window.location.href = '/timeline' + (qs ? '?' + qs : '');
-    });
+        window.location.href = {{ url_for('timeline')|tojson }} + (qs ? '?' + qs : '');
+    }
+    document.getElementById('filterYear')?.addEventListener('change', applyDateFilter);
+    document.getElementById('filterMonth')?.addEventListener('change', applyDateFilter);
 
     if (!timelineContainer || !sentinel) return;
 
@@ -739,6 +631,7 @@ document.addEventListener('DOMContentLoaded', function() {
         });
 
         hasMore = data.has_more;
+        applyTimelineSearch();
         if (!hasMore) {
             endMessage.style.display = 'block';
             sentinel.style.display = 'none';
@@ -790,27 +683,63 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Search functionality
     const searchInput = document.getElementById('timelineSearch');
-    if (searchInput) {
-        searchInput.addEventListener('input', function() {
-            const query = this.value.toLowerCase().trim();
-            document.querySelectorAll('.issue-card').forEach(card => {
-                const title = card.querySelector('.series-title')?.textContent.toLowerCase() || '';
-                const publisher = card.querySelector('.publisher-badge')?.textContent.toLowerCase() || '';
-                const subtitle = card.querySelector('.issue-subtitle')?.textContent.toLowerCase() || '';
-
-                if (query === '' || title.includes(query) || publisher.includes(query) || subtitle.includes(query)) {
-                    card.style.display = '';
-                } else {
-                    card.style.display = 'none';
-                }
-            });
-
-            // Hide empty date groups
-            document.querySelectorAll('.timeline-date-group').forEach(group => {
-                const visibleCards = group.querySelectorAll('.issue-card:not([style*="display: none"])');
-                group.style.display = visibleCards.length === 0 ? 'none' : '';
-            });
+    const clearBtn = document.getElementById('timelineClear');
+    const serverFilter = !!(clearBtn && clearBtn.dataset.serverFilter);
+    if (clearBtn) {
+        clearBtn.addEventListener('click', function (e) {
+            if (serverFilter) return;  // the reload clears the search too
+            e.preventDefault();
+            searchInput.value = '';
+            searchInput.dispatchEvent(new Event('input'));
+            searchInput.focus();
         });
+    }
+    // Filter every loaded card by the search box, then redraw the count and
+    // the no-matches state. Also runs after each batch scrolls in, so new
+    // cards obey the box too.
+    function applyTimelineSearch() {
+        const query = (searchInput ? searchInput.value : '').trim();
+        const needle = query.toLowerCase();
+        if (clearBtn && !serverFilter) clearBtn.classList.toggle('d-none', needle === '');
+        let total = 0, shown = 0;
+        document.querySelectorAll('.issue-card').forEach(card => {
+            total++;
+            const title = card.querySelector('.series-title')?.textContent.toLowerCase() || '';
+            const publisher = card.querySelector('.publisher-badge')?.textContent.toLowerCase() || '';
+            const subtitle = card.querySelector('.issue-subtitle')?.textContent.toLowerCase() || '';
+            const match = needle === '' || title.includes(needle) || publisher.includes(needle) || subtitle.includes(needle);
+            card.style.display = match ? '' : 'none';
+            if (match) shown++;
+        });
+
+        // Hide empty date groups
+        document.querySelectorAll('.timeline-date-group').forEach(group => {
+            const visibleCards = group.querySelectorAll('.issue-card:not([style*="display: none"])');
+            group.style.display = visibleCards.length === 0 ? 'none' : '';
+        });
+
+        CLU.setCount(document.getElementById('timelineCount'),
+            { total, noun: 'issues', one: 'issue', shown });
+
+        const holder = document.getElementById('timelineNoMatches');
+        if (holder) {
+            holder.replaceChildren();
+            const nothing = total > 0 && shown === 0;
+            holder.style.display = nothing ? '' : 'none';
+            if (nothing) {
+                holder.appendChild(CLU.noMatches({
+                    noun: 'issues', query,
+                    onClear: function () {
+                        searchInput.value = '';
+                        searchInput.dispatchEvent(new Event('input'));
+                        searchInput.focus();
+                    },
+                }));
+            }
+        }
+    }
+    if (searchInput) {
+        CLU.bindSearch(searchInput, applyTimelineSearch, { delay: 0 });
     }
 
     // ===== TIMELINE ACTIONS (Mark Unread / Hide from Timeline) =====
@@ -825,8 +754,9 @@ document.addEventListener('DOMContentLoaded', function() {
             if (group && group.querySelectorAll('.issue-card').length === 0) {
                 group.remove();
             }
+            applyTimelineSearch();
             // Update stat counter
-            const statEl = document.querySelector('.stat-card .stat-value');
+            const statEl = document.getElementById('tlIssuesRead');
             if (statEl) {
                 const current = parseInt(statEl.textContent.replace(/,/g, '')) || 0;
                 if (current > 0) statEl.textContent = (current - 1).toLocaleString();
@@ -1034,7 +964,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
         e.preventDefault();
         if (typeof JSZip === 'undefined') {
-            alert('JSZip not loaded. Please try again.');
+            CLU.toast('JSZip not loaded. Please try again.', 'error');
             return;
         }
 

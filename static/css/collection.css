@@ -1,28 +1,24 @@
-/* Filter bar styling */
-#gridFilterButtons {
-    overflow-x: auto;
-    overflow-y: hidden;
-    white-space: nowrap;
-    -webkit-overflow-scrolling: touch;
+/* The letter bar and search box are .clu-letter-bar / .clu-search (clu-page.css).
+   collection.js builds the search box inside this slot (only past 25 items), so
+   the slot takes the place .clu-search takes as a direct child of a toolbar row,
+   and drops out of the row while it is empty. */
+.clu-toolbar-row > .collection-search-slot {
+    flex: 1 1 14rem;
+    max-width: 22rem;
+    min-width: 0;
 }
 
-#gridFilterButtons .btn-group {
-    display: inline-flex;
-    flex-wrap: nowrap;
+/* The view buttons are shown and hidden one by one with inline display; with
+   none showing (a library root), the empty group must not leave a gap. */
+.collection-search-slot:empty,
+#viewToggleButtons:not(:has(> .btn:not([style*="display: none"]))) {
+    display: none !important;
 }
 
-#gridFilterButtons .btn {
-    flex-shrink: 0;
-}
-
-/* Search box styling */
-#gridSearchRow input {
-    width: 100%;
-}
-
-@media (max-width: 768px) {
-    #gridSearchRow {
-        max-width: 100% !important;
+@media (max-width: 575.98px) {
+    .clu-toolbar-row > .collection-search-slot {
+        flex-basis: 100%;
+        max-width: none;
     }
 }
 
@@ -55,11 +51,6 @@
     flex-direction: column;
 }
 
-/* Make comic files visually distinct */
-.grid-item.file.has-comic {
-    cursor: pointer;
-}
-
 .grid-item.file.has-comic:hover .thumbnail {
     opacity: 0.8;
 }
@@ -76,35 +67,32 @@
     /* Bootstrap default is 1000, go higher */
 }
 
-/* Ensure dropdown toggle button icon is always visible across all themes */
+/* Card menu toggle: the theme's muted ink, darkening to full emphasis on hover,
+   so it stays legible on light and dark themes alike. */
 .item-actions .btn-link {
-    color: #6c757d;
-    /* Neutral gray that works on most backgrounds */
+    color: var(--bs-secondary-color);
 }
 
 .item-actions .btn-link:hover {
-    color: #495057;
-    /* Slightly darker on hover */
+    color: var(--bs-emphasis-color);
 }
 
 .item-actions .btn-link i {
     color: inherit;
 }
 
-/* Make dropdown item hover more visible */
+/* Make dropdown item hover more visible: the theme's own active-item fill and
+   ink, which every Bootswatch and local theme sets as a contrasting pair. */
 .dropdown-item:hover,
 .dropdown-item:focus {
-    background-color: #0d6efd;
-    /* Primary color */
-    color: white;
+    background-color: var(--bs-dropdown-link-active-bg, var(--bs-primary));
+    color: var(--bs-dropdown-link-active-color, #fff);
 }
 
 .thumbnail-container {
     position: relative;
     width: 100%;
-    /* height: 248px; */
     aspect-ratio: 2/3;
-    /* background-color: #f8f9fa; */
     border-radius: 8px;
     overflow: clip;
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
@@ -148,7 +136,7 @@
 
 .grid-item.folder .icon-overlay {
     opacity: 1;
-    background-color: #e9ecef;
+    background-color: var(--bs-secondary-bg);
 }
 
 .grid-item.folder .thumbnail {
@@ -157,7 +145,7 @@
 
 .grid-item.folder .icon-overlay i {
     font-size: 3rem;
-    color: #ffc107;
+    color: var(--bs-warning);
     /* Folder color */
 }
 
@@ -171,7 +159,7 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    color: #333;
+    color: var(--bs-body-color);
 }
 
 .item-name-tooltip .tooltip-inner {
@@ -181,21 +169,23 @@
 
 .item-meta {
     font-size: 0.75rem;
-    color: #6c757d;
+    color: var(--bs-secondary-color);
 }
 
 /* Metadata loading state for progressive loading */
 .item-meta.metadata-loading {
-    color: #999;
     font-style: italic;
-    animation: pulse 1.5s ease-in-out infinite;
+    animation: metaPulse 1.5s ease-in-out infinite;
 }
 
 .item-meta.metadata-error {
     opacity: 0.6;
 }
 
-@keyframes pulse {
+/* Not "pulse": base.html owns that name for the navbar count badges, and a
+   second @keyframes pulse here silently replaced it on every page that loads
+   this file. */
+@keyframes metaPulse {
 
     0%,
     100% {
@@ -207,48 +197,39 @@
     }
 }
 
-/* Dark mode support if base.html supports it (assuming standard bootstrap dark mode or custom class) */
-[data-bs-theme="dark"] .item-name {
-    color: #e9ecef;
-}
-
-[data-bs-theme="dark"] .thumbnail-container {
-    background-color: #2b3035;
+/* Dark themes: the empty cover frame gets a well and a stronger edge, since a
+   10% black shadow has nothing to darken. Scoped to :root so it can never match
+   inside the navbar, which is data-bs-theme="dark" on every theme. */
+:root[data-bs-theme="dark"] .thumbnail-container {
+    background-color: var(--bs-tertiary-bg);
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
 }
 
-[data-bs-theme="dark"] .grid-item.folder .icon-overlay {
-    background-color: #343a40;
-}
-
-/* Drag and drop styles */
+/* Drag and drop styles. An outline rather than a border, so the hovered
+   card doesn't grow by 4px and shove its row. */
 .grid-item.drag-over {
     transform: scale(1.05);
-    box-shadow: 0 8px 16px rgba(13, 110, 253, 0.3);
-    border: 2px solid #0d6efd;
-    background-color: rgba(13, 110, 253, 0.05);
+    box-shadow: 0 8px 16px rgba(var(--bs-primary-rgb), 0.3);
+    outline: 2px solid var(--clu-select);
+    outline-offset: 2px;
+    border-radius: 8px;
+    background-color: rgba(var(--bs-primary-rgb), 0.05);
 }
 
 .grid-item.folder.drag-over::after {
-    content: '📁 Drop files here';
+    content: 'Drop files here';
     position: absolute;
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    background: rgba(13, 110, 253, 0.9);
-    color: white;
+    background: var(--clu-select-fill);
+    color: #fff;
     padding: 8px 16px;
     border-radius: 4px;
     font-weight: 500;
     font-size: 0.9rem;
     pointer-events: none;
     z-index: 10;
-}
-
-[data-bs-theme="dark"] .grid-item.drag-over {
-    border-color: #4dabf7;
-    background-color: rgba(77, 171, 247, 0.1);
-    box-shadow: 0 8px 16px rgba(77, 171, 247, 0.3);
 }
 
 /* Loading more indicator for progressive loading */
@@ -390,8 +371,8 @@ body.collection-select-mode {
     margin: 0;
 }
 
+/* .page-link touch targets are global (clu-page.css); the Back to top button is ours. */
 @media (pointer: coarse) {
-    #pagination-controls .page-link,
     #pagination-controls .pager-top {
         min-width: 2.75rem;
         min-height: 2.75rem;
@@ -424,10 +405,6 @@ body.collection-select-mode {
 }
 
 /* Info Button Styling */
-.thumbnail-container {
-    position: relative;
-}
-
 .info-button {
     position: absolute;
     bottom: 8px;
@@ -459,18 +436,19 @@ body.collection-select-mode {
     background: rgba(0, 0, 0, 0.9);
 }
 
-.info-button:focus {
-    outline: 2px solid #0d6efd;
+.info-button:focus-visible {
+    outline: 2px solid var(--bs-primary);
     outline-offset: 2px;
 }
 
 /* Text File Viewer Modal Styling */
 .text-file-content {
-    background-color: #f8f9fa;
-    border: 1px solid #dee2e6;
+    background-color: var(--bs-tertiary-bg);
+    color: var(--bs-body-color);
+    border: 1px solid var(--bs-border-color);
     border-radius: 4px;
     padding: 1rem;
-    font-family: 'Courier New', monospace;
+    font-family: var(--bs-font-monospace);
     font-size: 14px;
     line-height: 1.6;
     white-space: pre-wrap;
@@ -519,6 +497,20 @@ body.collection-select-mode {
     background: rgba(0, 0, 0, 0.9);
 }
 
+.favorite-button:focus-visible {
+    outline: 2px solid var(--bs-primary);
+    outline-offset: 2px;
+}
+
+/* Cover actions are hover-revealed; a keyboard user tabbing onto one gets the
+   same reveal, or the focused control would be invisible. */
+.info-button:focus-visible,
+.favorite-button:focus-visible,
+.to-read-button:focus-visible,
+.mark-unread-btn:focus-visible {
+    opacity: 1;
+}
+
 .favorite-button.favorited {
     opacity: 1;
     background: rgba(255, 193, 7, 0.9);
@@ -565,8 +557,8 @@ body.collection-select-mode {
     background: rgba(0, 0, 0, 0.9);
 }
 
-.to-read-button:focus {
-    outline: 2px solid #0d6efd;
+.to-read-button:focus-visible {
+    outline: 2px solid var(--bs-primary);
     outline-offset: 2px;
 }
 
@@ -615,8 +607,8 @@ body.collection-select-mode {
     background: rgba(220, 53, 69, 1);
 }
 
-.mark-unread-btn:focus {
-    outline: 2px solid #dc3545;
+.mark-unread-btn:focus-visible {
+    outline: 2px solid var(--bs-danger);
     outline-offset: 2px;
 }
 
@@ -642,13 +634,12 @@ body.collection-select-mode {
     padding: 2px 6px;
     border-radius: 4px;
     background: rgb(253 200 63 / 85%);
-    color: white;
+    /* Dark ink: white on this gold is about 1.6:1 and unreadable at 0.7rem. */
+    color: #212529;
     font-size: 0.7rem;
     font-weight: bold;
     z-index: 10;
-    border: black;
-    border-style: solid;
-    border-width: thin;
+    border: thin solid #000;
 }
 
 .issue-badge .read-icon {
@@ -695,7 +686,7 @@ body.collection-select-mode {
     aspect-ratio: auto;
     border-radius: 8px;
     overflow: hidden;
-    background-color: #f8f9fa;
+    background-color: var(--bs-tertiary-bg);
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
     margin-bottom: 8px;
     display: flex;
@@ -725,12 +716,12 @@ body.collection-select-mode {
     display: flex;
     align-items: center;
     justify-content: center;
-    background-color: #e9ecef;
+    background-color: var(--bs-secondary-bg);
 }
 
 .dashboard-card .icon-overlay i {
     font-size: 3rem;
-    color: #ffc107;
+    color: var(--bs-warning);
 }
 
 .dashboard-card.has-thumbnail .icon-overlay {
@@ -783,10 +774,11 @@ body.collection-select-mode {
 .dashboard-swiper .swiper-button-prev {
     width: 32px;
     height: 32px;
-    background-color: rgba(255, 255, 255, 0.9);
+    background-color: var(--bs-body-bg);
+    background-color: color-mix(in srgb, var(--bs-body-bg) 90%, transparent);
     border-radius: 50%;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
-    color: #333;
+    color: var(--bs-body-color);
 }
 
 .dashboard-swiper .swiper-button-next:after,
@@ -800,19 +792,8 @@ body.collection-select-mode {
     cursor: default;
 }
 
-[data-bs-theme="dark"] .dashboard-card-img-container {
-    background-color: #2b3035;
+:root[data-bs-theme="dark"] .dashboard-card-img-container {
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
-}
-
-[data-bs-theme="dark"] .dashboard-card .icon-overlay {
-    background-color: #343a40;
-}
-
-[data-bs-theme="dark"] .dashboard-swiper .swiper-button-next,
-[data-bs-theme="dark"] .dashboard-swiper .swiper-button-prev {
-    background-color: rgba(40, 40, 40, 0.9);
-    color: #fff;
 }
 
 /* =============================================================================
@@ -820,8 +801,8 @@ body.collection-select-mode {
    ============================================================================= */
 
 #editCBZModal .modal-body.drag-over {
-    background-color: rgba(33, 150, 243, 0.1);
-    border: 2px dashed #2196f3;
+    background-color: rgba(var(--bs-primary-rgb), 0.1);
+    border: 2px dashed var(--bs-primary);
     transition: all 0.2s ease;
 }
 
@@ -831,8 +812,8 @@ body.collection-select-mode {
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    background: rgba(33, 150, 243, 0.9);
-    color: white;
+    background: var(--clu-select-fill);
+    color: #fff;
     padding: 1rem 2rem;
     border-radius: 0.5rem;
     font-weight: bold;
@@ -845,7 +826,7 @@ body.collection-select-mode {
 .cbz-image-info {
     margin-top: 0.75rem;
     padding: 0.5rem 1rem;
-    background-color: rgba(0, 0, 0, 0.05);
+    background-color: var(--bs-tertiary-bg);
     border-radius: 0.375rem;
     font-size: 0.85rem;
     text-align: center;
@@ -853,8 +834,29 @@ body.collection-select-mode {
 
 /* Multi-Select & Bulk Action Bar */
 
+/* Selection colours.
+   --clu-select is an outline: the theme's primary pushed 30% toward its
+   emphasis colour (black on light themes, white on dark), so it stands off the
+   page on either.
+   --clu-select-fill carries white ink (the check, the drop label), so it is
+   always pushed toward black - pushing it toward white on a dark theme would
+   leave Cyborg's or Solar's white check at about 2:1.
+   Plain primary first: a custom property holding an unsupported color-mix()
+   is not discarded at parse time, it is invalid wherever it is used. */
+:root {
+    --clu-select: var(--bs-primary);
+    --clu-select-fill: var(--bs-primary);
+}
+
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+    :root {
+        --clu-select: color-mix(in srgb, var(--bs-primary) 70%, var(--bs-emphasis-color));
+        --clu-select-fill: color-mix(in srgb, var(--bs-primary) 70%, #000);
+    }
+}
+
 .grid-item.file.bulk-selected .thumbnail-container {
-    outline: 3px solid #0d6efd;
+    outline: 3px solid var(--clu-select);
     outline-offset: -3px;
     border-radius: 8px;
 }
@@ -866,18 +868,10 @@ body.collection-select-mode {
     left: 0;
     width: 100%;
     height: 100%;
-    background-color: rgba(13, 110, 253, 0.15);
+    background-color: rgba(var(--bs-primary-rgb), 0.15);
     pointer-events: none;
     z-index: 5;
     border-radius: 8px;
-}
-
-[data-bs-theme="dark"] .grid-item.file.bulk-selected .thumbnail-container {
-    outline-color: #4dabf7;
-}
-
-[data-bs-theme="dark"] .grid-item.file.bulk-selected .thumbnail-container::after {
-    background-color: rgba(77, 171, 247, 0.15);
 }
 
 /* Selection checkbox circle overlay (top-left of thumbnail) */
@@ -887,7 +881,7 @@ body.collection-select-mode {
     left: 8px;
     width: 24px;
     height: 24px;
-    background: rgba(13, 110, 253, 0.9);
+    background: var(--clu-select-fill);
     border-radius: 50%;
     display: flex;
     align-items: center;
@@ -929,18 +923,11 @@ body.collection-select-mode .grid-item.file {
     cursor: pointer;
 }
 
-/* Active state for the Multi-Select toggle button */
+/* Active state for the Multi-Select toggle button. Bootstrap's .active already
+   fills it with the theme's own matched fill-and-ink pair; the ring is what
+   says "a mode is on". */
 #toggleCollectionSelectModeBtn.active {
-    background-color: #6c757d;
-    border-color: #6c757d;
-    color: #fff;
-    box-shadow: 0 0 0 0.2rem rgba(108, 117, 125, 0.35);
-}
-
-#toggleCollectionSelectModeBtn.active:hover {
-    background-color: #5c636a;
-    border-color: #565e64;
-    color: #fff;
+    box-shadow: 0 0 0 0.2rem rgba(var(--bs-secondary-rgb), 0.35);
 }
 
 /* Hide favorite/to-read button when selection checkbox is visible */
@@ -977,11 +964,36 @@ body.collection-select-mode .grid-item.file {
 /* Selection hint (below breadcrumb) */
 .selection-hint {
     font-size: 0.78rem;
-    color: var(--bs-secondary-color, #6c757d);
+    color: var(--bs-secondary-color);
     margin-bottom: 0.5rem;
     opacity: 0.7;
 }
 
 .selection-hint i {
     font-size: 0.72rem;
+}
+
+/* Reduced motion. Kept last on purpose: it overrides rules of equal
+   specificity (.dashboard-card:hover, .collection-bulk-action-bar...) and
+   only wins by coming after them. */
+@media (prefers-reduced-motion: reduce) {
+
+    #loading-more-indicator,
+    #loading-more-indicator.fade-out,
+    .collection-bulk-action-bar,
+    .item-meta.metadata-loading {
+        animation: none;
+    }
+
+    .grid-item:hover,
+    .dashboard-card:hover,
+    .grid-item.drag-over {
+        transform: none;
+    }
+}
+
+/* A search or letter is narrowing the grid: the shelves above it step aside
+   (collection.js renderPage). Important: the shelves carry inline display. */
+#dashboard-sections.clu-narrowing .dashboard-section:not(#library-section) {
+    display: none !important;
 }

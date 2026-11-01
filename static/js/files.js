@@ -251,6 +251,44 @@ async function fetchDirectoryMetadataForPanel(dirPath, dirName, panel) {
 }
 
 // Helper function to create drop target item
+// An empty listing must say so: a blank panel reads as "still loading" or
+// "broken". The row is not a drop target or a selectable item.
+function appendEmptyListing(container, title, message, icon) {
+  const li = document.createElement('li');
+  li.className = 'list-group-item files-empty-listing';
+  li.appendChild(CLU.emptyState({ icon: icon || 'bi-folder2-open', title: title, message: message, compact: true }));
+  container.appendChild(li);
+}
+
+// A letter or a search hid every entry: the shared no-matches state, compact,
+// in a list row. "Clear filters" also resets the letter; "Clear search" only
+// the panel's search box.
+function appendNoMatchesListing(container, panel, letterOn) {
+  const query = panelSearch[panel];
+  const li = document.createElement('li');
+  li.className = 'list-group-item files-empty-listing';
+  li.appendChild(CLU.noMatches({
+    noun: 'folders', query: query, filtered: letterOn, compact: true,
+    onClear: () => clearDirectoryNarrowing(panel, letterOn),
+  }));
+  container.appendChild(li);
+}
+
+function clearDirectoryNarrowing(panel, clearLetter) {
+  const data = panel === 'source' ? sourceDirectoriesData : destinationDirectoriesData;
+  if (clearLetter) {
+    currentFilter[panel] = 'all';
+    if (data) updateFilterBar(panel, data.directories, data.files);
+  }
+  const box = document.getElementById(panel + '-directory-search');
+  if (box) {
+    box.value = '';
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  panelSearch[panel] = '';
+  if (data) renderDirectoryListing(data, panel);
+}
+
 function createDropTargetItem(container, currentPath, panel) {
   let dropTargetItem = document.createElement("li");
   dropTargetItem.className = "list-group-item text-center drop-target-item";
@@ -299,13 +337,13 @@ function normalizeFile(file) {
 function renameItem(oldPath, newName, panel) {
   if (typeof oldPath !== "string" || typeof newName !== "string") {
     console.error("Invalid oldPath or newName:", { oldPath, newName });
-    alert("Rename failed: Internal path error (non-string input)");
+    CLU.toast("Rename failed: Internal path error (non-string input)", 'error');
     return;
   }
 
   const trimmedName = newName.trim();
   if (!trimmedName) {
-    alert("Filename cannot be empty.");
+    CLU.toast("Filename cannot be empty.", 'warning');
     return;
   }
 
@@ -332,12 +370,12 @@ function renameItem(oldPath, newName, panel) {
           loadDirectories(currentDestinationPath, 'destination');
         }
       } else {
-        alert("Error renaming item: " + result.error);
+        CLU.toast("Error renaming item: " + result.error, 'error');
       }
     })
     .catch(error => {
       console.error("Error in rename request:", error);
-      alert("Rename failed due to a network or server error.");
+      CLU.toast("Rename failed due to a network or server error.", 'error');
     });
 }
 
@@ -473,6 +511,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
     infoBtn.className = "btn btn-sm btn-outline-info";
     infoBtn.innerHTML = '<i class="bi bi-eye"></i>';
     infoBtn.title = "CBZ Information";
+    infoBtn.setAttribute('aria-label', infoBtn.title);
     infoBtn.setAttribute("type", "button");
     infoBtn.onclick = function (e) {
       e.stopPropagation();
@@ -503,6 +542,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       metadataBtn.className = "btn btn-sm btn-outline-success";
       metadataBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
       metadataBtn.title = "Fetch Metadata (search providers by priority)";
+      metadataBtn.setAttribute('aria-label', metadataBtn.title);
       metadataBtn.setAttribute("type", "button");
       metadataBtn.onclick = function (e) {
         e.stopPropagation();
@@ -517,6 +557,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       gcdBtn.className = "btn btn-sm btn-outline-info";
       gcdBtn.innerHTML = '<i class="bi bi-database-down"></i>';
       gcdBtn.title = "Search GCD Database Only";
+      gcdBtn.setAttribute('aria-label', gcdBtn.title);
       gcdBtn.setAttribute("type", "button");
       gcdBtn.onclick = function (e) {
         e.stopPropagation();
@@ -533,6 +574,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
         gcdBtn.className = "btn btn-sm btn-outline-success";
         gcdBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
         gcdBtn.title = "Search GCD for Metadata (legacy)";
+        gcdBtn.setAttribute('aria-label', gcdBtn.title);
         gcdBtn.setAttribute("type", "button");
         gcdBtn.onclick = function (e) {
           e.stopPropagation();
@@ -551,6 +593,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
     infoIcon.className = "btn btn-sm btn-outline-info";
     infoIcon.innerHTML = '<i class="bi bi-info-circle"></i>';
     infoIcon.title = "Show folder information";
+    infoIcon.setAttribute('aria-label', infoIcon.title);
     infoIcon.setAttribute("type", "button");
 
     const sizeDisplay = document.createElement("span");
@@ -609,6 +652,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       metadataBtn.className = "btn btn-sm btn-outline-success";
       metadataBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
       metadataBtn.title = "Fetch Metadata for All Comics in Directory";
+      metadataBtn.setAttribute('aria-label', metadataBtn.title);
       metadataBtn.setAttribute("type", "button");
       metadataBtn.onclick = function (e) {
         e.stopPropagation();
@@ -623,6 +667,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       gcdBtn.className = "btn btn-sm btn-outline-info";
       gcdBtn.innerHTML = '<i class="bi bi-database-down"></i>';
       gcdBtn.title = "Fetch GCD Metadata for All Comics";
+      gcdBtn.setAttribute('aria-label', gcdBtn.title);
       gcdBtn.setAttribute("type", "button");
       gcdBtn.onclick = function (e) {
         e.stopPropagation();
@@ -637,6 +682,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       metadataBtn.className = "btn btn-sm btn-outline-success";
       metadataBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
       metadataBtn.title = "Fetch Metadata for All Comics (legacy)";
+      metadataBtn.setAttribute('aria-label', metadataBtn.title);
       metadataBtn.setAttribute("type", "button");
       metadataBtn.onclick = function (e) {
         e.stopPropagation();
@@ -651,6 +697,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       renameBtn.className = "btn btn-sm btn-outline-primary";
       renameBtn.innerHTML = '<i class="bi bi-input-cursor-text"></i>';
       renameBtn.title = "Rename files in this directory";
+      renameBtn.setAttribute('aria-label', renameBtn.title);
       renameBtn.setAttribute("type", "button");
       renameBtn.addEventListener("click", function (e) {
         if (e) e.stopPropagation();
@@ -696,6 +743,8 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       dropdownBtn.setAttribute("type", "button");
       dropdownBtn.setAttribute("data-bs-toggle", "dropdown");
       dropdownBtn.setAttribute("aria-expanded", "false");
+      dropdownBtn.setAttribute("aria-label", "More actions");
+      dropdownBtn.title = "More actions";
       dropdownBtn.innerHTML = '<i class="bi bi-three-dots-vertical"></i>';
       dropdownBtn.onclick = (e) => e.stopPropagation();
 
@@ -890,6 +939,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
     pencil.className = "btn btn-sm btn-outline-dark";
     pencil.innerHTML = '<i class="bi bi-pencil"></i>';
     pencil.title = "Edit filename";
+    pencil.setAttribute('aria-label', pencil.title);
     pencil.setAttribute("type", "button");
 
     pencil.addEventListener("click", e => {
@@ -909,7 +959,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       input.addEventListener("keypress", ev => {
         if (ev.key === "Enter") {
           const newName = input.value.trim();
-          if (!newName) return alert("Filename cannot be empty.");
+          if (!newName) return CLU.toast("Filename cannot be empty.", 'warning');
           liElem.setAttribute("draggable", "true");
           liElem.classList.add("draggable");
           renameItem(oldPath, newName, panel);
@@ -930,6 +980,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
     trash.className = "btn btn-sm btn-outline-danger";
     trash.innerHTML = '<i class="bi bi-trash"></i>';
     trash.title = "Delete file";
+    trash.setAttribute('aria-label', trash.title);
     trash.setAttribute("type", "button");
     trash.onclick = function (e) {
       e.stopPropagation();
@@ -942,6 +993,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       eye.className = "btn btn-sm btn-outline-secondary";
       eye.innerHTML = '<i class="bi bi-eye"></i>';
       eye.title = `View ${fileData.name}`;
+      eye.setAttribute('aria-label', eye.title);
       eye.setAttribute("type", "button");
       eye.onclick = function (e) {
         e.stopPropagation();
@@ -975,6 +1027,7 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
       dropdownBtn.setAttribute("aria-expanded", "false");
       dropdownBtn.innerHTML = '<i class="bi bi-three-dots-vertical"></i>';
       dropdownBtn.title = "More options";
+      dropdownBtn.setAttribute('aria-label', dropdownBtn.title);
       dropdownBtn.onclick = (e) => e.stopPropagation();
 
       const dropdownMenu = document.createElement("ul");
@@ -1309,104 +1362,76 @@ function createListItem(itemName, fullPath, type, panel, isDraggable) {
   return li;
 }
 
-// Function to dynamically build the filter bar.
-function updateFilterBar(panel, directories) {
+// First letters present in a folder listing: 'A'..'Z', or '#' for the rest.
+function directoryLetters(directories) {
+  // CLU.sortLetters buckets each first character ('#' for a non-letter).
+  const dirs = Array.isArray(directories) ? directories : [];
+  return new Set(CLU.sortLetters(dirs.map(dir => dir.charAt(0))));
+}
+
+// Draw a panel's A-Z bar. A second click on the selected letter goes back
+// to All (CLU.letterBar); the list is filtered here, in the browser.
+function updateFilterBar(panel, directories, files) {
   const outerContainer = document.getElementById(`${panel}-directory-filter`);
   if (!outerContainer) return;
-  const btnGroup = outerContainer.querySelector('.btn-group');
-  if (!btnGroup) return;
+  const bar = outerContainer.querySelector('.clu-letter-bar');
+  if (!bar) return;
 
-  // Handle undefined or null directories - provide empty array as fallback
-  if (!directories) {
-    directories = [];
-  }
   if (!Array.isArray(directories)) {
-    console.warn("directories is not an array in updateFilterBar:", directories);
+    if (directories) console.warn("directories is not an array in updateFilterBar:", directories);
     directories = [];
   }
 
-  let availableLetters = new Set();
-  let hasNonAlpha = false;
-
-  directories.forEach(dir => {
-    const firstChar = dir.charAt(0).toUpperCase();
-    if (firstChar >= 'A' && firstChar <= 'Z') {
-      availableLetters.add(firstChar);
-    } else {
-      hasNonAlpha = true;
+  CLU.letterBar(bar, {
+    letters: Array.from(directoryLetters(directories)),
+    active: currentFilter[panel] === 'all' ? '' : currentFilter[panel],
+    onChange: value => {
+      currentFilter[panel] = value || 'all';
+      const data = panel === 'source' ? sourceDirectoriesData : destinationDirectoriesData;
+      if (data) renderDirectoryListing(data, panel);
     }
   });
 
-  let buttonsHtml = '';
-  buttonsHtml += `<button type="button" class="btn btn-outline-secondary ${currentFilter[panel] === 'all' ? 'active' : ''}" onclick="filterDirectories('all', '${panel}')">All</button>`;
-
-  if (hasNonAlpha) {
-    buttonsHtml += `<button type="button" class="btn btn-outline-secondary ${currentFilter[panel] === '#' ? 'active' : ''}" onclick="filterDirectories('#', '${panel}')">#</button>`;
-  }
-
-  for (let i = 65; i <= 90; i++) {
-    const letter = String.fromCharCode(i);
-    if (availableLetters.has(letter)) {
-      buttonsHtml += `<button type="button" class="btn btn-outline-secondary ${currentFilter[panel] === letter ? 'active' : ''}" onclick="filterDirectories('${letter}', '${panel}')">${letter}</button>`;
-    }
-  }
-  btnGroup.innerHTML = buttonsHtml;
-  // --- SEARCH BOX LOGIC (destination only, >25 dirs) ---
-  if (panel === 'destination') {
-    const searchRow = document.getElementById('destination-directory-search-row');
-    if (directories.length > 25) {
-      searchRow.innerHTML = `<input type="text" id="destination-directory-search" class="form-control mb-2" placeholder="Type to filter directories..." oninput="onDestinationDirectorySearch(this.value)">`;
-    } else {
-      searchRow.innerHTML = '';
-    }
+  // --- SEARCH BOX (both panels, once a folder holds more than a screenful) ---
+  // It stays while a search is on, so a search that hides everything can
+  // still be cleared from the box.
+  const searchRow = document.getElementById(panel + '-directory-search-row');
+  if (!searchRow) return;
+  const entries = directories.length + (Array.isArray(files) ? files.length : 0);
+  if (entries > 12 || panelSearch[panel]) {
+    const box = CLU.searchInput({
+      id: panel + '-directory-search',
+      label: 'Search files and folders',
+      value: panelSearch[panel],
+    });
+    box.classList.add('mb-2');
+    searchRow.replaceChildren(box);
+    CLU.bindSearch(box.querySelector('input'), val => onPanelSearch(panel, val), { delay: 0 });
+  } else {
+    searchRow.innerHTML = '';
   }
 }
 
 // Function to restore filter from history if valid for the given path
 function restoreFilterIfValid(panel, path, directories) {
-  if (!filterHistory[panel][path]) {
-    return; // No saved filter for this path
-  }
-
   const savedFilter = filterHistory[panel][path];
+  if (!savedFilter || savedFilter === 'all') return;
 
-  // Build set of available letters from current directories
-  const availableLetters = new Set();
-  let hasNonAlpha = false;
-
-  if (directories && Array.isArray(directories)) {
-    directories.forEach(dir => {
-      const firstChar = dir.charAt(0).toUpperCase();
-      if (firstChar >= 'A' && firstChar <= 'Z') {
-        availableLetters.add(firstChar);
-      } else {
-        hasNonAlpha = true;
-      }
-    });
-  }
-
-  // Only restore if the saved filter is still valid
-  let shouldRestore = false;
-  if (savedFilter === '#' && hasNonAlpha) {
-    shouldRestore = true;
-  } else if (savedFilter !== '#' && savedFilter !== 'all' && availableLetters.has(savedFilter)) {
-    shouldRestore = true;
-  }
-
-  if (shouldRestore) {
+  // Only restore if the saved letter is still in this folder
+  if (directoryLetters(directories).has(savedFilter)) {
     currentFilter[panel] = savedFilter;
-    // Re-run updateFilterBar to reflect the restored filter in button states
-    updateFilterBar(panel, directories);
+    // Redraw the bar to reflect the restored filter
+    const data = panel === 'source' ? sourceDirectoriesData : destinationDirectoriesData;
+    updateFilterBar(panel, directories, data && data.files);
   }
 }
 
-// --- SEARCH STATE FOR DESTINATION PANEL ---
-let destinationSearchTerm = '';
-function onDestinationDirectorySearch(val) {
-  destinationSearchTerm = val.trim().toLowerCase();
-  if (destinationDirectoriesData) {
-    renderDirectoryListing(destinationDirectoriesData, 'destination');
-  }
+// --- SEARCH STATE, ONE PER PANEL (cleared on navigation) ---
+const panelSearch = { source: '', destination: '' };
+function onPanelSearch(panel, val) {
+  panelSearch[panel] = val.trim();
+  const data = panel === 'source' ? sourceDirectoriesData : destinationDirectoriesData;
+  if (data) renderDirectoryListing(data, panel);
 }
 
 // Save scroll position before navigating away
@@ -1489,7 +1514,9 @@ function loadDirectories(path, panel) {
         resetFileTracking(panel, data.current_path);
         updateBreadcrumb('source', data.current_path);
         sourceDirectoriesData = data;
-        updateFilterBar('source', data.directories);
+        // Reset the search on navigation (updateFilterBar redraws its box)
+        panelSearch.source = '';
+        updateFilterBar('source', data.directories, data.files);
 
         // Restore filter if previously set for this path
         restoreFilterIfValid('source', data.current_path, data.directories);
@@ -1503,11 +1530,9 @@ function loadDirectories(path, panel) {
         resetFileTracking(panel, data.current_path);
         updateBreadcrumb('destination', data.current_path);
         destinationDirectoriesData = data;
-        // Reset search filter and input on navigation
-        destinationSearchTerm = '';
-        const searchInput = document.getElementById('destination-directory-search');
-        if (searchInput) searchInput.value = '';
-        updateFilterBar('destination', data.directories);
+        // Reset the search on navigation (updateFilterBar redraws its box)
+        panelSearch.destination = '';
+        updateFilterBar('destination', data.directories, data.files);
 
         // Restore filter if previously set for this path
         restoreFilterIfValid('destination', data.current_path, data.directories);
@@ -1549,12 +1574,9 @@ function renderDirectoryListing(data, panel) {
   }
 
   let filter = currentFilter[panel];
+  const term = panelSearch[panel].toLowerCase();
   let directoriesToShow = data.directories.filter(dir => {
-    // --- SEARCH FILTER FOR DESTINATION PANEL ---
-    if (panel === 'destination' && destinationSearchTerm) {
-      if (!dir.toLowerCase().includes(destinationSearchTerm)) return false;
-    }
-    // --- END SEARCH FILTER ---
+    if (term && !dir.toLowerCase().includes(term)) return false;
     if (filter === 'all') return true;
     if (filter === '#') return !/^[A-Za-z]/.test(dir.charAt(0));
     return dir.charAt(0).toUpperCase() === filter;
@@ -1566,6 +1588,7 @@ function renderDirectoryListing(data, panel) {
     container.appendChild(item);
   });
 
+  let filesShown = 0;
   if (filter === 'all') {
     // Handle undefined or null files - provide empty array as fallback
     if (!data.files) {
@@ -1578,46 +1601,25 @@ function renderDirectoryListing(data, panel) {
 
     data.files.forEach(file => {
       const fileData = normalizeFile(file);
+      if (term && !String(fileData.name).toLowerCase().includes(term)) return;
+      filesShown++;
       const fullPath = data.current_path + "/" + fileData.name;
       let fileItem = createListItem(fileData, fullPath, "file", panel, true);
       container.appendChild(fileItem);
     });
   }
 
+  const folderEmpty = data.directories.length === 0 && (!data.files || data.files.length === 0);
   // For the destination panel, only add the drop target if the directory is truly empty.
-  if (panel === 'destination' &&
-    (!data.directories || data.directories.length === 0) &&
-    (!data.files || data.files.length === 0)) {
+  if (panel === 'destination' && folderEmpty) {
     createDropTargetItem(container, data.current_path, panel);
-  }
-}
-
-// Function to filter directories based on the selected letter.
-function filterDirectories(letter, panel) {
-  if (currentFilter[panel] === letter) {
-    currentFilter[panel] = 'all';
-  } else {
-    currentFilter[panel] = letter;
-  }
-  let filterContainer = document.getElementById(panel + "-directory-filter");
-  if (filterContainer) {
-    let btnGroup = filterContainer.querySelector('.btn-group');
-    if (btnGroup) {
-      let buttons = btnGroup.querySelectorAll("button");
-      buttons.forEach(btn => {
-        let btnText = btn.textContent.trim();
-        if ((currentFilter[panel] === 'all' && btnText === 'All') || btnText === currentFilter[panel]) {
-          btn.classList.add("active");
-        } else {
-          btn.classList.remove("active");
-        }
-      });
-    }
-  }
-  if (panel === 'source' && sourceDirectoriesData) {
-    renderDirectoryListing(sourceDirectoriesData, panel);
-  } else if (panel === 'destination' && destinationDirectoriesData) {
-    renderDirectoryListing(destinationDirectoriesData, panel);
+  } else if (folderEmpty) {
+    appendEmptyListing(container, 'This folder is empty');
+  } else if (directoriesToShow.length === 0 && filter !== 'all') {
+    // Only folders are filtered; files are hidden while a letter is picked.
+    appendNoMatchesListing(container, panel, true);
+  } else if (term && directoriesToShow.length === 0 && filesShown === 0) {
+    appendNoMatchesListing(container, panel, false);
   }
 }
 
@@ -1636,6 +1638,11 @@ function loadDownloads(path, panel) {
   if (filterBar) {
     filterBar.style.display = 'block';
   }
+  // The search box filters a library folder's listing; Downloads lists
+  // something else, so it goes until the panel is back on a folder.
+  panelSearch[panel] = '';
+  const downloadsSearchRow = document.getElementById(panel + '-directory-search-row');
+  if (downloadsSearchRow) downloadsSearchRow.innerHTML = '';
 
   window.scrollTo({ top: 0, behavior: "smooth" });
   let container = panel === 'source' ? document.getElementById("source-list")
@@ -1654,6 +1661,9 @@ function loadDownloads(path, panel) {
     .then(response => response.json())
     .then(data => {
       console.log("Received data:", data);
+      if (data.error) {
+        throw new Error(data.error);
+      }
       container.innerHTML = "";
 
       if (panel === 'source') {
@@ -1690,12 +1700,21 @@ function loadDownloads(path, panel) {
           container.appendChild(fileItem);
         });
       }
+      const nothing = !(data.directories && data.directories.length) && !(data.files && data.files.length);
+      if (nothing && panel === 'destination') {
+        createDropTargetItem(container, data.current_path, panel);
+      } else if (nothing && data.parent) {
+        appendEmptyListing(container, 'This folder is empty');
+      } else if (nothing) {
+        appendEmptyListing(container, 'No downloads waiting',
+          'Finished downloads land here until they are moved into a library.', 'bi-cloud-check');
+      }
     })
     .catch(error => {
       console.error("Error loading downloads:", error);
-      container.innerHTML = `<div class="alert alert-danger" role="alert">
-                                    Error loading downloads.
-                                  </div>`;
+      container.replaceChildren();
+      appendEmptyListing(container, 'Could not load Downloads',
+        error && error.message ? error.message : 'The server did not answer.', 'bi-exclamation-triangle');
     });
 }
 
@@ -1809,6 +1828,7 @@ function loadRecentFiles(panel) {
           infoBtn.className = 'btn btn-sm btn-outline-info';
           infoBtn.innerHTML = '<i class="bi bi-eye"></i>';
           infoBtn.title = 'CBZ Information';
+          infoBtn.setAttribute('aria-label', infoBtn.title);
           infoBtn.setAttribute('type', 'button');
           infoBtn.onclick = function (e) {
             e.stopPropagation();
@@ -1830,6 +1850,7 @@ function loadRecentFiles(panel) {
             metadataBtn.className = 'btn btn-sm btn-outline-success';
             metadataBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
             metadataBtn.title = 'Fetch Metadata (search providers by priority)';
+            metadataBtn.setAttribute('aria-label', metadataBtn.title);
             metadataBtn.setAttribute('type', 'button');
             metadataBtn.onclick = function (e) {
               e.stopPropagation();
@@ -1844,6 +1865,7 @@ function loadRecentFiles(panel) {
             gcdBtn.className = 'btn btn-sm btn-outline-info';
             gcdBtn.innerHTML = '<i class="bi bi-database-down"></i>';
             gcdBtn.title = 'Search GCD Database Only';
+            gcdBtn.setAttribute('aria-label', gcdBtn.title);
             gcdBtn.setAttribute('type', 'button');
             gcdBtn.onclick = function (e) {
               e.stopPropagation();
@@ -1859,6 +1881,7 @@ function loadRecentFiles(panel) {
               gcdBtn.className = 'btn btn-sm btn-outline-success';
               gcdBtn.innerHTML = '<i class="bi bi-cloud-download"></i>';
               gcdBtn.title = 'Search GCD for Metadata (legacy)';
+              gcdBtn.setAttribute('aria-label', gcdBtn.title);
               gcdBtn.setAttribute('type', 'button');
               gcdBtn.onclick = function (e) {
                 e.stopPropagation();
@@ -1873,6 +1896,7 @@ function loadRecentFiles(panel) {
           pencilBtn.className = 'btn btn-sm btn-outline-dark';
           pencilBtn.innerHTML = '<i class="bi bi-pencil"></i>';
           pencilBtn.title = 'Edit filename';
+          pencilBtn.setAttribute('aria-label', pencilBtn.title);
           pencilBtn.setAttribute('type', 'button');
           pencilBtn.addEventListener('click', function (e) {
             e.stopPropagation();
@@ -1888,7 +1912,7 @@ function loadRecentFiles(panel) {
             input.addEventListener('keypress', ev => {
               if (ev.key === 'Enter') {
                 const newName = input.value.trim();
-                if (!newName) return alert('Filename cannot be empty.');
+                if (!newName) return CLU.toast('Filename cannot be empty.', 'warning');
                 renameItem(oldPath, newName, panel);
               }
             });
@@ -1908,6 +1932,7 @@ function loadRecentFiles(panel) {
           trashBtn.className = 'btn btn-sm btn-outline-danger';
           trashBtn.innerHTML = '<i class="bi bi-trash"></i>';
           trashBtn.title = 'Delete file';
+          trashBtn.setAttribute('aria-label', trashBtn.title);
           trashBtn.setAttribute('type', 'button');
           trashBtn.onclick = function (e) {
             e.stopPropagation();
@@ -2133,6 +2158,7 @@ function loadTrash(panel) {
         restoreBtn.title = item.original_path
           ? `Restore to ${item.original_path}`
           : 'No original path recorded — use drag and drop';
+        restoreBtn.setAttribute('aria-label', restoreBtn.title);
         restoreBtn.disabled = !item.original_path;
         restoreBtn.setAttribute('type', 'button');
         restoreBtn.onclick = function (e) {
@@ -2147,6 +2173,7 @@ function loadTrash(panel) {
           infoBtn.className = 'btn btn-sm btn-outline-info';
           infoBtn.innerHTML = '<i class="bi bi-eye"></i>';
           infoBtn.title = 'CBZ Information';
+          infoBtn.setAttribute('aria-label', infoBtn.title);
           infoBtn.setAttribute('type', 'button');
           infoBtn.onclick = function (e) {
             e.stopPropagation();
@@ -2161,6 +2188,7 @@ function loadTrash(panel) {
         permDeleteBtn.className = 'btn btn-sm btn-outline-danger';
         permDeleteBtn.innerHTML = '<i class="bi bi-x-lg"></i>';
         permDeleteBtn.title = 'Permanently delete';
+        permDeleteBtn.setAttribute('aria-label', permDeleteBtn.title);
         permDeleteBtn.setAttribute('type', 'button');
         permDeleteBtn.onclick = function (e) {
           e.stopPropagation();
@@ -2404,7 +2432,7 @@ function moveItem(source, destination) {
         loadDirectories(currentSourcePath, 'source');
         loadDirectories(currentDestinationPath, 'destination');
       } else {
-        alert("Error moving file: " + result.error);
+        CLU.toast("Error moving file: " + result.error, 'error');
       }
     })
     .catch(error => {
@@ -2863,7 +2891,7 @@ function openCreateFolderModal() {
 function createFolder() {
   let folderName = createFolderNameInput.value.trim();
   if (!folderName) {
-    alert('Folder name cannot be empty.');
+    CLU.toast('Folder name cannot be empty.', 'warning');
     createFolderNameInput.focus();
     return;
   }
@@ -2883,12 +2911,12 @@ function createFolder() {
         currentFilter['destination'] = 'all';
         loadDirectories(currentDestinationPath, 'destination');
       } else {
-        alert(data.error || 'Error creating folder.');
+        CLU.toast(data.error || 'Error creating folder.', 'error');
       }
     })
     .catch(err => {
       console.error('Error creating folder:', err);
-      alert('An unexpected error occurred.');
+      CLU.toast('An unexpected error occurred.', 'error');
     });
 }
 
@@ -2989,7 +3017,7 @@ function showDeletePrompt(fullPath, name, panel) {
       }
     },
     onDeleteError: function (path, error) {
-      alert("Error deleting item: " + error);
+      CLU.toast("Error deleting item: " + error, 'error');
     }
   };
   CLU.showDeleteConfirmation(fullPath, name);
@@ -3167,7 +3195,7 @@ function openCustomRenameModal(directoryPath, panel) {
   // Validate that we have a valid directory path
   if (!directoryPath || directoryPath === '') {
     console.error('Invalid directory path provided to openCustomRenameModal:', directoryPath);
-    alert('Error: No directory path provided for rename operation.');
+    CLU.toast('Error: No directory path provided for rename operation.', 'error');
     return;
   }
 
@@ -3197,12 +3225,12 @@ function previewCustomRename() {
   console.log('textToRemove:', textToRemove);
 
   if (!textToRemove.trim()) {
-    alert('Please enter text to remove from filenames.');
+    CLU.toast('Please enter text to remove from filenames.', 'warning');
     return;
   }
 
   if (!currentRenameDirectory || currentRenameDirectory === '') {
-    alert('Error: No directory selected for rename operation.');
+    CLU.toast('Error: No directory selected for rename operation.', 'error');
     console.error('currentRenameDirectory is empty');
     return;
   }
@@ -3262,13 +3290,13 @@ function previewCustomRename() {
     })
     .catch(error => {
       console.error('Error fetching directory contents:', error);
-      alert('Error fetching directory contents: ' + error.message);
+      CLU.toast('Error fetching directory contents: ' + error.message, 'error');
     });
 }
 
 function executeCustomRename() {
   if (fileList.length === 0) {
-    alert('No files to rename.');
+    CLU.toast('No files to rename.', 'warning');
     return;
   }
 
@@ -3336,7 +3364,7 @@ function openReplaceTextModal(directoryPath, panel) {
   // Validate that we have a valid directory path
   if (!directoryPath || directoryPath === '') {
     console.error('Invalid directory path provided to openReplaceTextModal:', directoryPath);
-    alert('Error: No directory path provided for replace operation.');
+    CLU.toast('Error: No directory path provided for replace operation.', 'error');
     return;
   }
 
@@ -3369,12 +3397,12 @@ function previewReplaceText() {
   console.log('replacementText:', replacementText);
 
   if (!textToReplace.trim()) {
-    alert('Please enter text to replace in filenames.');
+    CLU.toast('Please enter text to replace in filenames.', 'warning');
     return;
   }
 
   if (!currentReplaceDirectory || currentReplaceDirectory === '') {
-    alert('Error: No directory selected for replace operation.');
+    CLU.toast('Error: No directory selected for replace operation.', 'error');
     console.error('currentReplaceDirectory is empty');
     return;
   }
@@ -3434,13 +3462,13 @@ function previewReplaceText() {
     })
     .catch(error => {
       console.error('Error fetching directory contents:', error);
-      alert('Error fetching directory contents: ' + error.message);
+      CLU.toast('Error fetching directory contents: ' + error.message, 'error');
     });
 }
 
 function executeReplaceText() {
   if (replaceFileList.length === 0) {
-    alert('No files to rename.');
+    CLU.toast('No files to rename.', 'warning');
     return;
   }
 
@@ -3763,12 +3791,12 @@ function performSearch() {
   const query = document.getElementById('searchQuery').value.trim();
 
   if (!query) {
-    alert('Please enter a search term.');
+    CLU.toast('Please enter a search term.', 'warning');
     return;
   }
 
   if (query.length < 2) {
-    alert('Search term must be at least 2 characters.');
+    CLU.toast('Search term must be at least 2 characters.', 'warning');
     return;
   }
 
@@ -3806,7 +3834,7 @@ function performSearch() {
 
         // Check for timeout message
         if (data.timeout) {
-          alert(`Search timeout: ${data.message}`);
+          CLU.toast(`Search timeout: ${data.message}`, 'error');
         }
 
         displaySearchResults(data.results, query);
@@ -3817,7 +3845,7 @@ function performSearch() {
       if (error.name !== 'AbortError') {
         document.getElementById('searchLoading').style.display = 'none';
         console.error('Search error:', error);
-        alert('Search error: ' + error.message);
+        CLU.toast('Search error: ' + error.message, 'error');
       }
     });
 }
@@ -3830,14 +3858,19 @@ function displaySearchResults(results, query) {
 
   // Always show the results container with the search term
   resultsDiv.style.display = 'block';
+  CLU.setCount(document.getElementById('searchResultsCount'),
+    { total: results.length, noun: 'results', one: 'result' });
 
   if (results.length === 0) {
-    resultsContainer.innerHTML = `
-          <div class="text-center text-muted p-3">
-            <i class="bi bi-search me-2"></i>
-            No results found for "${query}"
-          </div>
-        `;
+    // The search box is on the same modal, so the button just empties it.
+    resultsContainer.appendChild(CLU.noMatches({
+      noun: 'files or folders', query: query, compact: true,
+      onClear: () => {
+        const box = document.getElementById('searchQuery');
+        if (box) { box.value = ''; box.focus(); }
+        resultsDiv.style.display = 'none';
+      },
+    }));
   } else {
     results.forEach(item => {
       const resultItem = document.createElement('div');
@@ -4055,177 +4088,29 @@ function searchGCDMetadata(filePath, fileName) {
       document.body.removeChild(loadingToast);
 
       if (data.success) {
-        // Show success message
-        const successToast = document.createElement('div');
-        successToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        successToast.style.zIndex = '1200';
-        successToast.innerHTML = `
-            <div class="toast-header bg-success text-white">
-              <strong class="me-auto">GCD Search</strong>
-              <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-            </div>
-            <div class="toast-body">
-              Successfully added metadata to "${fileName}"<br>
-              <small class="text-muted">Series: ${data.metadata?.series || 'Unknown'}<br>
-              Issue: ${data.metadata?.issue || 'Unknown'}<br>
-              Found ${data.matches_found || 0} potential matches</small>
-            </div>
-          `;
-        document.body.appendChild(successToast);
-
-        // Auto-remove after 5 seconds
-        setTimeout(() => {
-          if (document.body.contains(successToast)) {
-            document.body.removeChild(successToast);
-          }
-        }, 5000);
+        CLU.showToast('GCD Search',
+          `Added metadata to "${fileName}". Series: ${data.metadata?.series || 'Unknown'}, ` +
+          `issue ${data.metadata?.issue || 'Unknown'}; ${data.matches_found || 0} potential matches.`,
+          'success', 6000);
       } else if (data.requires_selection) {
         // Show series selection modal
         showGCDSeriesSelectionModal(data, filePath, fileName);
       } else if (data.notFound) {
-        // Show not found message as warning (not error)
-        const warningToast = document.createElement('div');
-        warningToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        warningToast.style.zIndex = '1200';
-        warningToast.innerHTML = `
-            <div class="toast-header bg-warning text-white">
-              <strong class="me-auto">GCD Search</strong>
-              <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-            </div>
-            <div class="toast-body">
-              ${data.error || 'Issue not found in GCD database'}
-            </div>
-          `;
-        document.body.appendChild(warningToast);
-
-        // Auto-remove after 5 seconds
-        setTimeout(() => {
-          if (document.body.contains(warningToast)) {
-            document.body.removeChild(warningToast);
-          }
-        }, 5000);
+        // Not found is a warning, not an error.
+        CLU.showToast('GCD Search', data.error || 'Issue not found in GCD database', 'warning');
       } else {
-        // Show error message
-        const errorToast = document.createElement('div');
-        errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        errorToast.style.zIndex = '1200';
-        errorToast.innerHTML = `
-            <div class="toast-header bg-danger text-white">
-              <strong class="me-auto">GCD Search Error</strong>
-              <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-            </div>
-            <div class="toast-body">
-              Failed to add metadata: ${data.error || data.message || 'Server returned no error message'}
-            </div>
-          `;
-        document.body.appendChild(errorToast);
-
-        // Auto-remove after 8 seconds for errors
-        setTimeout(() => {
-          if (document.body.contains(errorToast)) {
-            document.body.removeChild(errorToast);
-          }
-        }, 8000);
+        CLU.showToast('GCD Search',
+          'Failed to add metadata: ' + (data.error || data.message || 'Server returned no error message'), 'error');
       }
     })
     .catch(error => {
       console.error('GCD Search Network Error:', error);
       document.body.removeChild(loadingToast);
 
-      const errorToast = document.createElement('div');
-      errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-      errorToast.style.zIndex = '1200';
-      errorToast.innerHTML = `
-          <div class="toast-header bg-danger text-white">
-            <strong class="me-auto">Network Error</strong>
-            <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-          </div>
-          <div class="toast-body">
-            Network error: ${error.message}
-          </div>
-        `;
-      document.body.appendChild(errorToast);
-
-      setTimeout(() => {
-        if (document.body.contains(errorToast)) {
-          document.body.removeChild(errorToast);
-        }
-      }, 8000);
+      CLU.showToast('Network Error', `Network error: ${error.message}`, 'error', 8000);
     });
 }
 
-
-// Function to sort GCD series results
-function sortGCDSeries(sortBy) {
-  // Update button states
-  document.querySelectorAll('#sortBySeries, #sortByYear').forEach(btn => {
-    btn.classList.remove('btn-secondary');
-    btn.classList.add('btn-outline-secondary');
-  });
-
-  const activeButton = sortBy === 'series' ? document.getElementById('sortBySeries') : document.getElementById('sortByYear');
-  activeButton.classList.remove('btn-outline-secondary');
-  activeButton.classList.add('btn-secondary');
-
-  // Sort the data
-  let sortedData = [...currentSeriesData];
-
-  if (sortBy === 'series') {
-    sortedData.sort((a, b) => a.name.localeCompare(b.name));
-  } else if (sortBy === 'year') {
-    sortedData.sort((a, b) => {
-      const yearA = a.year_began || 9999; // Put unknown years at the end
-      const yearB = b.year_began || 9999;
-      return yearA - yearB;
-    });
-  }
-
-  // Re-render the series list - detect if this is directory mode or single file mode
-  if (Array.isArray(currentIssueNumber)) {
-    // Directory mode - currentIssueNumber contains the comicFiles array
-    renderDirectorySeriesList(sortedData, currentFilePath, currentFileName, currentIssueNumber);
-  } else {
-    // Single file mode - currentIssueNumber is a number
-    renderSeriesList(sortedData);
-  }
-}
-
-// Function to render the series list
-function renderSeriesList(seriesData) {
-  const seriesList = document.getElementById('gcdSeriesList');
-  seriesList.innerHTML = '';
-
-  seriesData.forEach(series => {
-    const seriesItem = document.createElement('div');
-    seriesItem.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-start';
-    seriesItem.style.cursor = 'pointer';
-
-    const yearRange = series.year_began
-      ? (series.year_ended ? `${series.year_began}-${series.year_ended}` : `${series.year_began}-ongoing`)
-      : 'Unknown';
-
-    seriesItem.innerHTML = `
-          <div class="ms-2 me-auto">
-            <div class="fw-bold">${series.name}</div>
-            <small class="text-muted">Publisher: ${series.publisher_name || 'Unknown'}<br>Issue Count: ${series.issue_count || 'Unknown'}</small>
-          </div>
-          <span class="badge bg-primary rounded-pill">${yearRange}</span>
-        `;
-
-    seriesItem.addEventListener('click', () => {
-      // Highlight selected item
-      seriesList.querySelectorAll('.list-group-item').forEach(item => {
-        item.classList.remove('active');
-      });
-      seriesItem.classList.add('active');
-
-      // Call the backend with the selected series
-      selectGCDSeries(currentFilePath, currentFileName, series.id, currentIssueNumber);
-    });
-
-    seriesList.appendChild(seriesItem);
-  });
-}
 
 // Function to search GCD for all comics in a directory
 function searchGCDMetadataForDirectory(directoryPath, directoryName) {
@@ -4651,10 +4536,7 @@ function showGCDDirectorySeriesSelectionModal(data, directoryPath, directoryName
   currentIssueNumber = comicFiles;
 
   // Reset sort buttons
-  document.querySelectorAll('#sortBySeries, #sortByYear').forEach(btn => {
-    btn.classList.remove('btn-secondary');
-    btn.classList.add('btn-outline-secondary');
-  });
+  markGCDSort('');
 
   // Render the series list with initial order (directory mode)
   renderDirectorySeriesList(currentSeriesData, directoryPath, directoryName, comicFiles);
@@ -4990,10 +4872,7 @@ function showGCDSeriesSelectionModal(data, filePath, fileName, skipProviders) {
   currentIssueNumber = data.parsed_filename.issue_number;
 
   // Reset sort buttons
-  document.querySelectorAll('#sortBySeries, #sortByYear').forEach(btn => {
-    btn.classList.remove('btn-secondary');
-    btn.classList.add('btn-outline-secondary');
-  });
+  markGCDSort('');
 
   // Render the series list with initial order
   renderSeriesList(currentSeriesData);
@@ -5057,92 +4936,34 @@ function selectGCDSeries(filePath, fileName, seriesId, issueNumber) {
 
       if (data.success) {
         // Show success message
-        const successToast = document.createElement('div');
-        successToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        successToast.style.zIndex = '1200';
-        successToast.innerHTML = `
-            <div class="toast-header bg-success text-white">
-              <strong class="me-auto">GCD Search Success</strong>
-              <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-            </div>
-            <div class="toast-body">
-              Successfully added metadata to "${fileName}"<br>
-              <small class="text-muted">Series: ${data.metadata?.series || 'Unknown'}<br>
-              Issue: ${data.metadata?.issue || 'Unknown'}<br>
-              Title: ${data.metadata?.title || 'Unknown'}<br>
-              Publisher: ${data.metadata?.publisher || 'Unknown'}</small>
-            </div>
-          `;
-        document.body.appendChild(successToast);
-
-        // Auto-remove after 5 seconds
-        setTimeout(() => {
-          if (document.body.contains(successToast)) {
-            document.body.removeChild(successToast);
-          }
-        }, 5000);
+        CLU.showToast('GCD Search Success', `Added metadata to "${fileName}". Series: ${data.metadata?.series || 'Unknown'}, issue ${data.metadata?.issue || 'Unknown'}, title ${data.metadata?.title || 'Unknown'}, publisher ${data.metadata?.publisher || 'Unknown'}`, 'success', 5000);
       } else {
         // Show error message
-        const errorToast = document.createElement('div');
-        errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        errorToast.style.zIndex = '1200';
-        errorToast.innerHTML = `
-            <div class="toast-header bg-danger text-white">
-              <strong class="me-auto">GCD Search Error</strong>
-              <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-            </div>
-            <div class="toast-body">
-              Failed to add metadata: ${data.error || data.message || 'Server returned no error message'}
-            </div>
-          `;
-        document.body.appendChild(errorToast);
-
-        // Auto-remove after 8 seconds for errors
-        setTimeout(() => {
-          if (document.body.contains(errorToast)) {
-            document.body.removeChild(errorToast);
-          }
-        }, 8000);
+        CLU.showToast('GCD Search Error', `Failed to add metadata: ${data.error || data.message || 'Server returned no error message'}`, 'error', 8000);
       }
     })
     .catch(error => {
       console.error('GCD Search Network Error:', error);
       document.body.removeChild(loadingToast);
 
-      const errorToast = document.createElement('div');
-      errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-      errorToast.style.zIndex = '1200';
-      errorToast.innerHTML = `
-          <div class="toast-header bg-danger text-white">
-            <strong class="me-auto">Network Error</strong>
-            <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-          </div>
-          <div class="toast-body">
-            Network error: ${error.message}
-          </div>
-        `;
-      document.body.appendChild(errorToast);
-
-      setTimeout(() => {
-        if (document.body.contains(errorToast)) {
-          document.body.removeChild(errorToast);
-        }
-      }, 8000);
+      CLU.showToast('Network Error', `Network error: ${error.message}`, 'error', 8000);
     });
 }
 
 
+// Mark the GCD sort buttons (#sortBySeries / #sortByYear, data-value);
+// '' clears both, which is how the modal opens.
+function markGCDSort(sortBy) {
+  document.querySelectorAll('#sortBySeries, #sortByYear').forEach(btn => {
+    const on = btn.getAttribute('data-value') === sortBy;
+    btn.classList.toggle('active', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
 // Function to sort GCD series results
 function sortGCDSeries(sortBy) {
-  // Update button states
-  document.querySelectorAll('#sortBySeries, #sortByYear').forEach(btn => {
-    btn.classList.remove('btn-secondary');
-    btn.classList.add('btn-outline-secondary');
-  });
-
-  const activeButton = sortBy === 'series' ? document.getElementById('sortBySeries') : document.getElementById('sortByYear');
-  activeButton.classList.remove('btn-outline-secondary');
-  activeButton.classList.add('btn-secondary');
+  markGCDSort(sortBy);
 
   // Sort the data
   let sortedData = [...currentSeriesData];
@@ -5330,30 +5151,7 @@ function searchComicVineMetadata(filePath, fileName) {
       document.body.removeChild(loadingToast);
 
       if (data.success) {
-        // Show success message with cover image if available
-        const successToast = document.createElement('div');
-        successToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        successToast.style.zIndex = '1200';
-        let imageHtml = data.image_url ? ('<img src="' + data.image_url + '" class="img-thumbnail mt-2" style="max-width: 100px;" alt="Cover">') : '';
-        successToast.innerHTML = `
-        <div class="toast-header bg-success text-white">
-          <strong class="me-auto">ComicVine Search</strong>
-          <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-        </div>
-        <div class="toast-body">
-          Successfully added metadata to "${fileName}"<br>
-          <small class="text-muted">Series: ${data.metadata && data.metadata.Series || 'Unknown'}<br>
-          Issue: ${data.metadata && data.metadata.Number || 'Unknown'}</small>
-          ${imageHtml}
-        </div>
-      `;
-        document.body.appendChild(successToast);
-
-        setTimeout(() => {
-          if (document.body.contains(successToast)) {
-            document.body.removeChild(successToast);
-          }
-        }, 5000);
+        CLU.showToast('ComicVine Search', `Added metadata to "${fileName}". Series: ${data.metadata && data.metadata.Series || 'Unknown'}, issue ${data.metadata && data.metadata.Number || 'Unknown'}`, 'success', 5000);
 
         // Remove file from UI if it was moved to a new location
         if (data.moved) {
@@ -5381,46 +5179,10 @@ function searchComicVineMetadata(filePath, fileName) {
         }
       } else if (data.notFound) {
         // Show not found message as warning
-        const warningToast = document.createElement('div');
-        warningToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        warningToast.style.zIndex = '1200';
-        warningToast.innerHTML = `
-        <div class="toast-header bg-warning text-white">
-          <strong class="me-auto">ComicVine Search</strong>
-          <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-        </div>
-        <div class="toast-body">
-          ${data.error || 'Issue not found in ComicVine'}
-        </div>
-      `;
-        document.body.appendChild(warningToast);
-
-        setTimeout(() => {
-          if (document.body.contains(warningToast)) {
-            document.body.removeChild(warningToast);
-          }
-        }, 5000);
+        CLU.showToast('ComicVine Search', `${data.error || 'Issue not found in ComicVine'}`, 'warning', 5000);
       } else {
         // Show error message
-        const errorToast = document.createElement('div');
-        errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        errorToast.style.zIndex = '1200';
-        errorToast.innerHTML = `
-        <div class="toast-header bg-danger text-white">
-          <strong class="me-auto">ComicVine Search Error</strong>
-          <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-        </div>
-        <div class="toast-body">
-          Failed to add metadata: ${data.error || 'Unknown error'}
-        </div>
-      `;
-        document.body.appendChild(errorToast);
-
-        setTimeout(() => {
-          if (document.body.contains(errorToast)) {
-            document.body.removeChild(errorToast);
-          }
-        }, 8000);
+        CLU.showToast('ComicVine Search Error', `Failed to add metadata: ${data.error || 'Unknown error'}`, 'error', 8000);
       }
     })
     .catch(error => {
@@ -5429,25 +5191,7 @@ function searchComicVineMetadata(filePath, fileName) {
         document.body.removeChild(loadingToast);
       }
 
-      const errorToast = document.createElement('div');
-      errorToast.className = 'toast show position-fixed top-0 end-0 m-3';
-      errorToast.style.zIndex = '1200';
-      errorToast.innerHTML = `
-      <div class="toast-header bg-danger text-white">
-        <strong class="me-auto">Network Error</strong>
-        <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-      </div>
-      <div class="toast-body">
-        Network error: ${error.message}
-      </div>
-    `;
-      document.body.appendChild(errorToast);
-
-      setTimeout(() => {
-        if (document.body.contains(errorToast)) {
-          document.body.removeChild(errorToast);
-        }
-      }, 8000);
+      CLU.showToast('Network Error', `Network error: ${error.message}`, 'error', 8000);
     });
 }
 
@@ -5620,7 +5364,7 @@ function showGCDApiSeriesSelectionModal(data, filePath, fileName) {
 
   // Add language filter if multiple languages present
   if (Object.keys(langSet).length > 1) {
-    const filterContainer = document.getElementById('cvFilterInput');
+    const filterContainer = document.getElementById('cvFilterWrap') || document.getElementById('cvFilterInput');
     if (filterContainer && filterContainer.parentNode) {
       const selectEl = document.createElement('select');
       selectEl.id = 'gcdApiLangFilterFiles';
@@ -5910,29 +5654,7 @@ function selectComicVineVolume(filePath, fileName, volumeId, publisherName, issu
 
       if (data.success) {
         // Show success with cover image
-        const successToast = document.createElement('div');
-        successToast.className = 'toast show position-fixed top-0 end-0 m-3';
-        successToast.style.zIndex = '1200';
-        let imageHtml = data.image_url ? `<img src="${data.image_url}" class="img-thumbnail mt-2" style="max-width: 100px;" alt="Cover">` : '';
-        successToast.innerHTML = `
-        <div class="toast-header bg-success text-white">
-          <strong class="me-auto">ComicVine Success</strong>
-          <button type="button" class="btn-close btn-close-white" onclick="this.closest('.toast').remove()"></button>
-        </div>
-        <div class="toast-body">
-          Successfully added metadata to "${fileName}"<br>
-          <small class="text-muted">Series: ${data.metadata?.Series || 'Unknown'}<br>
-          Issue: ${data.metadata?.Number || 'Unknown'}</small>
-          ${imageHtml}
-        </div>
-      `;
-        document.body.appendChild(successToast);
-
-        setTimeout(() => {
-          if (document.body.contains(successToast)) {
-            document.body.removeChild(successToast);
-          }
-        }, 5000);
+        CLU.showToast('ComicVine Success', `Added metadata to "${fileName}". Series: ${data.metadata?.Series || 'Unknown'}, issue ${data.metadata?.Number || 'Unknown'}`, 'success', 5000);
 
         // Remove file from UI if it was moved to a new location
         if (data.moved) {

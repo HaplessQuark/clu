@@ -7,43 +7,18 @@ console.log('reading_list.js loaded');
 // Seeded from the buttons the server rendered active (the URL's ?tag=).
 let activeTagFilters = new Set();
 
+// #rlTags is a multi-select filter_bar (partials/filters.html): All clears
+// the others, and the last tag switched off goes back to All.
 function initTagFilters() {
-    document.querySelectorAll('.tag-filter-btn').forEach(btn => {
-        if (btn.classList.contains('active') && btn.dataset.tag !== 'all') {
-            activeTagFilters.add(btn.dataset.tag);
-        }
-        btn.addEventListener('click', () => toggleTagFilter(btn));
+    const group = document.getElementById('rlTags');
+    if (!group || !window.CLU || !CLU.filterBar) return;
+    activeTagFilters = new Set(CLU.filterValue(group));
+    CLU.filterBar(group, {
+        onChange: tags => {
+            activeTagFilters = new Set(tags);
+            applyTagFilters();
+        },
     });
-}
-
-function toggleTagFilter(btn) {
-    const tag = btn.dataset.tag;
-
-    if (tag === 'all') {
-        // Clear all filters, show all
-        activeTagFilters.clear();
-        document.querySelectorAll('.tag-filter-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-    } else {
-        // Remove 'all' active state
-        document.querySelector('.tag-filter-btn[data-tag="all"]')?.classList.remove('active');
-
-        // Toggle this filter
-        if (activeTagFilters.has(tag)) {
-            activeTagFilters.delete(tag);
-            btn.classList.remove('active');
-        } else {
-            activeTagFilters.add(tag);
-            btn.classList.add('active');
-        }
-
-        // If no filters active, activate 'all'
-        if (activeTagFilters.size === 0) {
-            document.querySelector('.tag-filter-btn[data-tag="all"]')?.classList.add('active');
-        }
-    }
-
-    applyTagFilters();
 }
 
 // The server filters (a list must carry ALL active tags), sorts and pages;
@@ -72,7 +47,7 @@ function applyTagFilters() {
                 selectedListIds.clear();
                 syncListCheckboxes();
                 updateBulkBar();
-                showToast('Could not check the selection against the filter, so it was cleared', 'warning');
+                CLU.toast('Could not check the selection against the filter, so it was cleared', 'warning');
             });
     }
     readingListPager.load({ resetPage: true });
@@ -88,12 +63,19 @@ let readingListPager = null;
 const DEFAULT_LIST_SORT = 'date-desc';
 
 function activeListSort() {
-    const btn = document.querySelector('.sort-btn.active');
-    return btn ? btn.dataset.sort : DEFAULT_LIST_SORT;
+    const group = document.getElementById('rlSort');
+    return (group && window.CLU && CLU.filterValue(group)) || DEFAULT_LIST_SORT;
+}
+
+// The search box (?q=): the server matches it against list names.
+function activeListQuery() {
+    const box = document.getElementById('rlSearch');
+    return box ? box.value.trim() : '';
 }
 
 function listFilterState() {
     return {
+        q: activeListQuery(),
         tag: [...activeTagFilters],
         sort: activeListSort() === DEFAULT_LIST_SORT ? '' : activeListSort(),
     };
@@ -102,6 +84,7 @@ function listFilterState() {
 function fetchMatchingListIds() {
     const nav = document.getElementById('rlPagination');
     const p = new URLSearchParams();
+    if (activeListQuery()) p.set('q', activeListQuery());
     activeTagFilters.forEach(t => p.append('tag', t));
     return fetch(nav.dataset.idsEndpoint + '?' + p.toString(), { headers: { Accept: 'application/json' } })
         .then(r => {
@@ -113,6 +96,43 @@ function fetchMatchingListIds() {
             return data.ids || [];
         });
 }
+
+// The toolbar's result count, worded like the server-rendered one.
+function updateListCount(data, grid) {
+    const el = document.getElementById('rlCount');
+    if (!el || !window.CLU) return;
+    const total = data.total || 0;
+    // The server sends the unnarrowed total with every page; keep the grid's
+    // copy current too, since Delete All reads it.
+    if (typeof data.all_total === 'number') grid.dataset.totalLists = String(data.all_total);
+    const allLists = parseInt(grid.dataset.totalLists, 10) || 0;
+    // Narrowed to one page (or to nothing): "Showing 12 of 222 reading lists".
+    const narrowed = activeListQuery() !== '' || activeTagFilters.size > 0;
+    if (total === 0 || (narrowed && (data.total_pages || 1) <= 1)) {
+        CLU.setCount(el, { total: allLists, noun: 'reading lists', one: 'reading list', shown: total });
+        return;
+    }
+    const start = ((data.page || 1) - 1) * (data.per_page || 0);
+    const shown = grid.querySelectorAll('.reading-list-card').length;
+    CLU.setCount(el, {
+        total, noun: 'reading lists', one: 'reading list',
+        first: start + 1, last: start + shown,
+    });
+}
+
+// The no-matches state's button (rendered inside the grid): back to no
+// search and All tags, page 1. "Clear search" only appears when no tag is on,
+// so clearing both is right for either label. The sort is a view order, not a
+// filter, and stays.
+document.addEventListener('click', e => {
+    if (!e.target.closest('#rlClearFilters')) return;
+    const group = document.getElementById('rlTags');
+    if (group && window.CLU) CLU.setFilterValue(group, []);
+    activeTagFilters = new Set();
+    const box = document.getElementById('rlSearch');
+    if (box) box.value = '';
+    applyTagFilters();
+});
 
 // Everything a freshly rendered card needs that its markup cannot carry.
 function initListCards() {
@@ -126,25 +146,33 @@ document.addEventListener('DOMContentLoaded', () => {
     // Before the pager: its state() reads the active tags, and it writes
     // them to the URL as soon as it is created.
     initTagFilters();
+    // The server answers the search, so wait for a pause in typing. It narrows
+    // the selection the same way a tag change does.
+    const searchBox = document.getElementById('rlSearch');
+    if (searchBox && window.CLU) CLU.bindSearch(searchBox, () => applyTagFilters());
     const grid = document.querySelector('.reading-list-grid');
     const nav = document.getElementById('rlPagination');
     if (!grid || !nav || !window.CLU || !CLU.createServerPager) return;
+    const perPageSelect = document.getElementById('rlPerPage');
+    // The server's default (helpers/paging.py), never a copy of it here.
+    const defaultPerPage = parseInt(nav.dataset.defaultPerPage, 10) || CLU.defaultPerPage(perPageSelect);
     readingListPager = CLU.createServerPager({
         endpoint: nav.dataset.endpoint,
         nav,
-        perPageSelect: document.getElementById('rlPerPage'),
-        // The grid is 4 cards wide on a typical screen; 50 left a gap.
-        defaultPerPage: parseInt(nav.dataset.defaultPerPage, 10) || 40,
-        scrollTarget: document.querySelector('.sort-bar') || grid,
+        perPageSelect,
+        defaultPerPage,
+        rememberAs: nav.dataset.perPageCookie,
+        scrollTarget: document.getElementById('rlFilters') || grid,
         initial: {
             page: parseInt(nav.dataset.page, 10) || 1,
-            perPage: parseInt(nav.dataset.perPage, 10) || 40,
+            perPage: parseInt(nav.dataset.perPage, 10) || defaultPerPage,
             totalPages: parseInt(nav.dataset.totalPages, 10) || 1,
         },
         state: listFilterState,
         onData: data => {
             grid.classList.remove('opacity-50');
             grid.innerHTML = data.html;
+            updateListCount(data, grid);
             initListCards();
         },
         // The tag chips may already show what failed to load; dim the cards
@@ -152,7 +180,7 @@ document.addEventListener('DOMContentLoaded', () => {
         onError: err => {
             console.error('Error loading reading lists:', err);
             grid.classList.add('opacity-50');
-            showToast('Could not load reading lists, showing the previous results', 'error');
+            CLU.toast('Could not load reading lists, showing the previous results', 'error');
         },
     });
 });
@@ -213,20 +241,31 @@ document.addEventListener('DOMContentLoaded', observeCardTags);
 // Sort System
 // ==========================================
 
+// #rlSort is a single-choice filter_bar; the server sorts, so a new order
+// shows its page 1.
 function initSortButtons() {
-    document.querySelectorAll('.sort-btn').forEach(btn => {
-        btn.addEventListener('click', () => applySort(btn));
+    const group = document.getElementById('rlSort');
+    if (!group || !window.CLU || !CLU.filterBar) return;
+    CLU.filterBar(group, {
+        onChange: () => { if (readingListPager) readingListPager.load({ resetPage: true }); },
     });
 }
 
-function applySort(btn) {
-    document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    // The server sorts; show page 1 of the new order.
-    if (readingListPager) readingListPager.load({ resetPage: true });
+document.addEventListener('DOMContentLoaded', initSortButtons);
+
+// The import modals' search boxes (search_input in reading_lists.html).
+// The repository filter runs over rows already loaded, so at once; the
+// Metron and ComicVine boxes ask a server, so after a pause in the typing.
+function initModalSearches() {
+    if (!window.CLU || !CLU.bindSearch) return;
+    const byId = id => document.getElementById(id);
+    CLU.bindSearch(byId('githubTreeFilter'), filterTree, { delay: 0 });
+    CLU.bindSearch(byId('metronSearchInput'), searchMetronLists);
+    CLU.bindSearch(byId('metronArcSearchInput'), searchMetronArcs);
+    CLU.bindSearch(byId('cvArcSearchInput'), searchCVArcs);
 }
 
-document.addEventListener('DOMContentLoaded', initSortButtons);
+document.addEventListener('DOMContentLoaded', initModalSearches);
 
 // ==========================================
 // Want to Read (dashboard bookmark)
@@ -291,7 +330,7 @@ function toggleReadingListWantToRead(listId, name, button) {
         .then(r => r.json())
         .then(data => {
             if (data.success) {
-                showToast(
+                CLU.toast(
                     marked
                         ? `${name} removed from Want to Read`
                         : `${name} added to Want to Read`,
@@ -299,60 +338,22 @@ function toggleReadingListWantToRead(listId, name, button) {
                 );
             } else {
                 buttons.forEach(btn => _paintWantToReadButton(btn, marked));
-                showToast('Error: ' + (data.error || 'Unknown error'), 'error');
+                CLU.toast('Error: ' + (data.error || 'Unknown error'), 'error');
             }
         })
         .catch(err => {
             console.error('Error updating Want to Read:', err);
             buttons.forEach(btn => _paintWantToReadButton(btn, marked));
-            showToast('Failed to update Want to Read', 'error');
+            CLU.toast('Failed to update Want to Read', 'error');
         });
 }
 
 // Toast notification system
 let currentProgressToast = null;
 
+// Progress and confirm toasts share the page's one container (base.html).
 function getToastContainer() {
-    let toastContainer = document.getElementById('toast-container');
-    if (!toastContainer) {
-        toastContainer = document.createElement('div');
-        toastContainer.id = 'toast-container';
-        toastContainer.className = 'toast-container position-fixed end-0 p-4';
-        toastContainer.style.zIndex = '1100';
-        toastContainer.style.top = '60px'; // Below navbar
-        document.body.appendChild(toastContainer);
-    }
-    return toastContainer;
-}
-
-function showToast(message, type = 'info', duration = 5000) {
-    console.log(`[Toast] ${type}: ${message}`);
-
-    const toastContainer = getToastContainer();
-    const toastId = 'toast-' + Date.now();
-    const bgClass = type === 'success' ? 'bg-success' : type === 'error' ? 'bg-danger' : 'bg-primary';
-
-    const toastHtml = `
-        <div id="${toastId}" class="toast align-items-center text-white ${bgClass} border-0 show" role="alert">
-            <div class="d-flex">
-                <div class="toast-body">${message}</div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
-            </div>
-        </div>
-    `;
-
-    toastContainer.insertAdjacentHTML('beforeend', toastHtml);
-    const toastEl = document.getElementById(toastId);
-
-    // Auto-hide after duration
-    setTimeout(() => {
-        if (toastEl && toastEl.parentNode) {
-            toastEl.classList.remove('show');
-            setTimeout(() => toastEl.remove(), 300);
-        }
-    }, duration);
-
-    return toastEl;
+    return CLU.toastContainer();
 }
 
 function showProgressToast(message) {
@@ -459,18 +460,18 @@ function pollImportStatus(taskId, filename) {
             .then(response => response.json())
             .then(data => {
                 if (!data.success) {
-                    showToast('Import task not found', 'error');
+                    CLU.toast('Import task not found', 'error');
                     return;
                 }
 
                 if (data.status === 'complete') {
-                    showToast(`Imported "${data.list_name}" (${data.processed} issues)`, 'success', 8000);
+                    CLU.toast(`Imported "${data.list_name}" (${data.processed} issues)`, 'success', 8000);
                     // Reload if still on the reading lists page
                     if (window.location.pathname === '/reading-lists') {
                         setTimeout(() => window.location.reload(), 2000);
                     }
                 } else if (data.status === 'error') {
-                    showToast(`Import failed: ${data.message}`, 'error', 10000);
+                    CLU.toast(`Import failed: ${data.message}`, 'error', 10000);
                 } else {
                     setTimeout(checkStatus, pollInterval);
                 }
@@ -501,7 +502,7 @@ function uploadCBL() {
     const fileInput = document.getElementById('cblFile');
     const file = fileInput.files[0];
     if (!file) {
-        showToast('Please select a file', 'error');
+        CLU.toast('Please select a file', 'error');
         return;
     }
 
@@ -531,18 +532,18 @@ function uploadCBL() {
                     // Close modal — progress shown in navbar ops-indicator
                     const modal = bootstrap.Modal.getInstance(document.getElementById('uploadCBLModal'));
                     if (modal) modal.hide();
-                    showToast(`Importing "${listName}" — track progress in the navbar`, 'info', 5000);
+                    CLU.toast(`Importing "${listName}" — track progress in the navbar`, 'info', 5000);
                     pollImportStatus(data.task_id, listName);
                 } else {
                     window.location.reload();
                 }
             } else {
-                showToast(data.message || 'Something went wrong', 'error');
+                CLU.toast(data.message || 'Something went wrong', 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred during upload', 'error');
+            CLU.toast('An error occurred during upload', 'error');
         })
         .finally(() => {
             // Reset loading state
@@ -577,7 +578,7 @@ function importGithub() {
     const urlInput = document.getElementById('githubUrl');
     const url = urlInput.value;
     if (!url) {
-        showToast('Please enter a URL', 'error');
+        CLU.toast('Please enter a URL', 'error');
         return;
     }
 
@@ -607,18 +608,18 @@ function importGithub() {
                     // Close modal — progress shown in navbar ops-indicator
                     const modal = bootstrap.Modal.getInstance(document.getElementById('importGithubModal'));
                     if (modal) modal.hide();
-                    showToast(`Importing "${filename}" — track progress in the navbar`, 'info', 5000);
+                    CLU.toast(`Importing "${filename}" — track progress in the navbar`, 'info', 5000);
                     pollImportStatus(data.task_id, filename);
                 } else {
                     window.location.reload();
                 }
             } else {
-                showToast(data.message || 'Something went wrong', 'error');
+                CLU.toast(data.message || 'Something went wrong', 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred during import', 'error');
+            CLU.toast('An error occurred during import', 'error');
         })
         .finally(() => {
             // Reset loading state
@@ -686,12 +687,12 @@ function confirmDelete(id) {
                     window.location.reload();
                 }
             } else {
-                showToast('Error: ' + data.message, 'error');
+                CLU.toast('Error: ' + data.message, 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred while deleting', 'error');
+            CLU.toast('An error occurred while deleting', 'error');
         });
 }
 
@@ -781,7 +782,7 @@ function selectAllVisibleLists() {
         })
         .catch(err => {
             console.error('Error selecting lists:', err);
-            showToast('Could not select every matching list', 'error');
+            CLU.toast('Could not select every matching list', 'error');
         });
 }
 
@@ -793,7 +794,7 @@ function clearListSelection() {
 
 function bulkDeleteSelected() {
     if (selectedListIds.size === 0) {
-        showToast('No lists selected', 'warning');
+        CLU.toast('No lists selected', 'warning');
         return;
     }
 
@@ -829,7 +830,7 @@ function confirmDeleteAll() {
     const grid = document.querySelector('.reading-list-grid');
     const total = grid ? (parseInt(grid.dataset.totalLists, 10) || 0) : 0;
     if (total === 0) {
-        showToast('No reading lists to delete', 'warning');
+        CLU.toast('No reading lists to delete', 'warning');
         return;
     }
 
@@ -870,17 +871,17 @@ function sendBulkDelete(payload) {
             const deletedCount = (data.deleted || []).length;
             const failedCount = (data.failed || []).length;
             if (data.success) {
-                showToast(`Deleted ${deletedCount} reading list${deletedCount === 1 ? '' : 's'}`, 'success');
+                CLU.toast(`Deleted ${deletedCount} reading list${deletedCount === 1 ? '' : 's'}`, 'success');
             } else if (deletedCount > 0) {
-                showToast(`Deleted ${deletedCount}, failed ${failedCount}`, 'warning');
+                CLU.toast(`Deleted ${deletedCount}, failed ${failedCount}`, 'warning');
             } else {
-                showToast(data.message || 'Bulk delete failed', 'error');
+                CLU.toast(data.message || 'Bulk delete failed', 'error');
             }
             setTimeout(() => window.location.reload(), 600);
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred during bulk delete', 'error');
+            CLU.toast('An error occurred during bulk delete', 'error');
         });
 }
 
@@ -919,12 +920,12 @@ function cropCover(filePath) {
             if (data.success) {
                 window.location.reload();
             } else {
-                showToast('Crop failed: ' + (data.error || data.message || 'unknown error'), 'error');
+                CLU.toast('Crop failed: ' + (data.error || data.message || 'unknown error'), 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred while cropping', 'error');
+            CLU.toast('An error occurred while cropping', 'error');
         });
 }
 
@@ -937,14 +938,14 @@ function setAsThumbnail(filePath) {
         .then(response => response.json())
         .then(data => {
             if (data.success) {
-                showToast('Thumbnail updated', 'success');
+                CLU.toast('Thumbnail updated', 'success');
             } else {
-                showToast('Failed to update thumbnail: ' + data.message, 'error');
+                CLU.toast('Failed to update thumbnail: ' + data.message, 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred', 'error');
+            CLU.toast('An error occurred', 'error');
         });
 }
 
@@ -988,13 +989,13 @@ function editTitle(listId, element) {
                 .then(data => {
                     if (data.success) {
                         originalElement.textContent = newName;
-                        showToast('Title updated', 'success');
+                        CLU.toast('Title updated', 'success');
                     } else {
-                        showToast('Failed to update title', 'error');
+                        CLU.toast('Failed to update title', 'error');
                     }
                 })
                 .catch(() => {
-                    showToast('Error updating title', 'error');
+                    CLU.toast('Error updating title', 'error');
                 });
         }
         originalElement.textContent = newName || currentName;
@@ -1136,15 +1137,15 @@ function saveTags() {
         .then(data => {
             if (data.success) {
                 tagsModal.hide();
-                showToast('Tags updated', 'success');
+                CLU.toast('Tags updated', 'success');
                 location.reload();
             } else {
-                showToast('Failed to update tags: ' + data.message, 'error');
+                CLU.toast('Failed to update tags: ' + data.message, 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('Error saving tags', 'error');
+            CLU.toast('Error saving tags', 'error');
         });
 }
 
@@ -1279,6 +1280,18 @@ function openMapModal(entryId, series, number, volume, year, issueYear) {
         });
 }
 
+// The file pickers' "nothing found": the button empties the box and the results.
+function fileSearchNoMatches(inputId, resultsDiv) {
+    const input = document.getElementById(inputId);
+    return CLU.noMatches({
+        noun: 'files', query: input ? input.value : '', compact: true,
+        onClear: () => {
+            if (input) { input.value = ''; input.focus(); }
+            resultsDiv.replaceChildren();
+        },
+    });
+}
+
 function searchFiles(retryWithoutFirstWord = false) {
     let query = document.getElementById('fileSearchInput').value;
     if (!query) return;
@@ -1313,7 +1326,7 @@ function searchFiles(retryWithoutFirstWord = false) {
                         return;
                     }
                 }
-                resultsDiv.innerHTML = '<div class="p-3 text-center text-muted">No files found</div>';
+                resultsDiv.replaceChildren(fileSearchNoMatches('fileSearchInput', resultsDiv));
                 return;
             }
 
@@ -1381,12 +1394,12 @@ function confirmMapping() {
             if (data.success) {
                 location.reload();
             } else {
-                showToast(data.message || 'Something went wrong', 'error');
+                CLU.toast(data.message || 'Something went wrong', 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred', 'error');
+            CLU.toast('An error occurred', 'error');
         });
 }
 
@@ -1416,12 +1429,12 @@ function doClearMapping() {
             if (data.success) {
                 location.reload();
             } else {
-                showToast(data.message || 'Something went wrong', 'error');
+                CLU.toast(data.message || 'Something went wrong', 'error');
             }
         })
         .catch(error => {
             console.error('Error:', error);
-            showToast('An error occurred', 'error');
+            CLU.toast('An error occurred', 'error');
         });
 }
 
@@ -1432,7 +1445,7 @@ function createNewList() {
     const nameInput = document.getElementById('newListName');
     const name = nameInput ? nameInput.value.trim() : '';
     if (!name) {
-        showToast('Please enter a name', 'error');
+        CLU.toast('Please enter a name', 'error');
         return;
     }
 
@@ -1446,12 +1459,12 @@ function createNewList() {
         if (data.success) {
             window.location.href = '/reading-lists/' + data.list_id;
         } else {
-            showToast(data.message || 'Something went wrong', 'error');
+            CLU.toast(data.message || 'Something went wrong', 'error');
         }
     })
     .catch(err => {
         console.error('Error creating list:', err);
-        showToast('An error occurred', 'error');
+        CLU.toast('An error occurred', 'error');
     });
 }
 
@@ -1476,14 +1489,14 @@ function doRemoveEntry(entryId) {
             // Remove the card from DOM
             const card = document.querySelector(`.book-card[data-entry-id="${entryId}"]`);
             if (card) card.remove();
-            showToast('Entry removed', 'success');
+            CLU.toast('Entry removed', 'success');
         } else {
-            showToast('Failed to remove entry: ' + data.message, 'error');
+            CLU.toast('Failed to remove entry: ' + data.message, 'error');
         }
     })
     .catch(err => {
         console.error('Error removing entry:', err);
-        showToast('An error occurred', 'error');
+        CLU.toast('An error occurred', 'error');
     });
 }
 
@@ -1520,7 +1533,7 @@ function searchFilesForAdd() {
         .then(results => {
             resultsDiv.innerHTML = '';
             if (results.length === 0) {
-                resultsDiv.innerHTML = '<div class="p-3 text-center text-muted">No files found</div>';
+                resultsDiv.replaceChildren(fileSearchNoMatches('addIssueSearchInput', resultsDiv));
                 return;
             }
             results.forEach(file => {
@@ -1573,12 +1586,12 @@ function confirmAddIssue() {
         if (data.success) {
             location.reload();
         } else {
-            showToast(data.message || 'Something went wrong', 'error');
+            CLU.toast(data.message || 'Something went wrong', 'error');
         }
     })
     .catch(err => {
         console.error('Error adding issue:', err);
-        showToast('An error occurred', 'error');
+        CLU.toast('An error occurred', 'error');
     });
 }
 
@@ -1629,12 +1642,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 .then(r => r.json())
                 .then(data => {
                     if (!data.success) {
-                        showToast('Failed to save order', 'error');
+                        CLU.toast('Failed to save order', 'error');
                     }
                 })
                 .catch(err => {
                     console.error('Error reordering:', err);
-                    showToast('Failed to save order', 'error');
+                    CLU.toast('Failed to save order', 'error');
                 });
             }
         });
@@ -1666,7 +1679,7 @@ let readIssuesSet = new Set();
 function openReadingListComic(filePath) {
     if (reorderMode) return;
     if (typeof window.openComicReader !== 'function') {
-        showToast('Reader failed to load. Try refreshing the page.', 'error');
+        CLU.toast('Reader failed to load. Try refreshing the page.', 'error');
         return;
     }
     // Publish siblings in reading-list order so "next issue" follows the list
@@ -2041,7 +2054,7 @@ function deselectAll() {
 function importSelectedFiles() {
     const files = getSelectedFiles();
     if (files.length === 0) {
-        showToast('No files selected', 'error');
+        CLU.toast('No files selected', 'error');
         return;
     }
 
@@ -2062,18 +2075,18 @@ function importSelectedFiles() {
                 const modal = bootstrap.Modal.getInstance(document.getElementById('importGithubModal'));
                 if (modal) modal.hide();
 
-                showToast(`Importing ${data.tasks.length} list(s) -- track progress in the navbar`, 'info', 5000);
+                CLU.toast(`Importing ${data.tasks.length} list(s) -- track progress in the navbar`, 'info', 5000);
 
                 // Poll each task
                 data.tasks.forEach(task => {
                     pollImportStatus(task.task_id, task.filename);
                 });
             } else {
-                showToast('Error: ' + data.message, 'error');
+                CLU.toast('Error: ' + data.message, 'error');
             }
         })
         .catch(err => {
-            showToast('Import failed: ' + err.message, 'error');
+            CLU.toast('Import failed: ' + err.message, 'error');
         })
         .finally(() => {
             btn.disabled = false;
@@ -2086,8 +2099,25 @@ function importSelectedFiles() {
 // Metron Reading List Browser
 // ==========================================
 
+// A provider that returned nothing: "no matches" for a query, a plain empty
+// state when there was no query. The button empties the search box.
+function showProviderEmpty(empty, inputId, noun, query) {
+    if (!empty || !window.CLU) return;
+    const node = query
+        ? CLU.noMatches({
+            noun, query, compact: true,
+            onClear: () => {
+                const input = document.getElementById(inputId);
+                if (!input) return;
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            },
+        })
+        : CLU.emptyState({ icon: 'bi-inbox', title: 'No ' + noun + ' available', compact: true });
+    empty.replaceChildren(node);
+}
+
 let _metronListsData = null;
-let _metronSearchTimeout = null;
 
 function loadMetronLists() {
     if (_metronListsData) {
@@ -2117,6 +2147,7 @@ function loadMetronLists() {
                 _metronListsData = data.lists;
                 if (data.lists.length === 0) {
                     empty.classList.remove('d-none');
+                    showProviderEmpty(empty, 'metronSearchInput', 'reading lists', '');
                 } else {
                     renderMetronLists(data.lists);
                     content.classList.remove('d-none');
@@ -2137,54 +2168,50 @@ function loadMetronLists() {
         });
 }
 
-function searchMetronLists() {
-    clearTimeout(_metronSearchTimeout);
-    _metronSearchTimeout = setTimeout(() => {
-        const query = document.getElementById('metronSearchInput').value.trim();
+function searchMetronLists(query) {
+    const loading = document.getElementById('metronListLoading');
+    const content = document.getElementById('metronListContent');
+    const error = document.getElementById('metronListError');
+    const empty = document.getElementById('metronListEmpty');
+    const notConfigured = document.getElementById('metronNotConfigured');
 
-        const loading = document.getElementById('metronListLoading');
-        const content = document.getElementById('metronListContent');
-        const error = document.getElementById('metronListError');
-        const empty = document.getElementById('metronListEmpty');
-        const notConfigured = document.getElementById('metronNotConfigured');
+    loading.classList.remove('d-none');
+    content.classList.add('d-none');
+    error.classList.add('d-none');
+    empty.classList.add('d-none');
+    notConfigured.classList.add('d-none');
 
-        loading.classList.remove('d-none');
-        content.classList.add('d-none');
-        error.classList.add('d-none');
-        empty.classList.add('d-none');
-        notConfigured.classList.add('d-none');
+    const url = query
+        ? `/api/reading-lists/metron-browse?search=${encodeURIComponent(query)}`
+        : '/api/reading-lists/metron-browse';
 
-        const url = query
-            ? `/api/reading-lists/metron-browse?search=${encodeURIComponent(query)}`
-            : '/api/reading-lists/metron-browse';
-
-        fetch(url)
-            .then(r => r.json())
-            .then(data => {
-                loading.classList.add('d-none');
-                if (data.success) {
-                    if (!query) _metronListsData = data.lists;
-                    if (data.lists.length === 0) {
-                        empty.classList.remove('d-none');
-                    } else {
-                        renderMetronLists(data.lists);
-                        content.classList.remove('d-none');
-                    }
+    fetch(url)
+        .then(r => r.json())
+        .then(data => {
+            loading.classList.add('d-none');
+            if (data.success) {
+                if (!query) _metronListsData = data.lists;
+                if (data.lists.length === 0) {
+                    empty.classList.remove('d-none');
+                    showProviderEmpty(empty, 'metronSearchInput', 'reading lists', query);
                 } else {
-                    if (data.message && data.message.includes('not configured')) {
-                        notConfigured.classList.remove('d-none');
-                    } else {
-                        error.classList.remove('d-none');
-                        error.textContent = data.message || 'Failed to search';
-                    }
+                    renderMetronLists(data.lists);
+                    content.classList.remove('d-none');
                 }
-            })
-            .catch(err => {
-                loading.classList.add('d-none');
-                error.classList.remove('d-none');
-                error.textContent = 'Search failed: ' + err.message;
-            });
-    }, 300);
+            } else {
+                if (data.message && data.message.includes('not configured')) {
+                    notConfigured.classList.remove('d-none');
+                } else {
+                    error.classList.remove('d-none');
+                    error.textContent = data.message || 'Failed to search';
+                }
+            }
+        })
+        .catch(err => {
+            loading.classList.add('d-none');
+            error.classList.remove('d-none');
+            error.textContent = 'Search failed: ' + err.message;
+        });
 }
 
 function renderMetronLists(lists) {
@@ -2256,7 +2283,7 @@ function deselectAllMetron() {
 function importSelectedMetronLists() {
     const listIds = getSelectedMetronLists();
     if (listIds.length === 0) {
-        showToast('No lists selected', 'error');
+        CLU.toast('No lists selected', 'error');
         return;
     }
 
@@ -2276,17 +2303,17 @@ function importSelectedMetronLists() {
                 const modal = bootstrap.Modal.getInstance(document.getElementById('importMetronModal'));
                 if (modal) modal.hide();
 
-                showToast(`Importing ${data.tasks.length} list(s) -- track progress in the navbar`, 'info', 5000);
+                CLU.toast(`Importing ${data.tasks.length} list(s) -- track progress in the navbar`, 'info', 5000);
 
                 data.tasks.forEach(task => {
                     pollImportStatus(task.task_id, `Metron list ${task.list_id}`);
                 });
             } else {
-                showToast('Error: ' + data.message, 'error');
+                CLU.toast('Error: ' + data.message, 'error');
             }
         })
         .catch(err => {
-            showToast('Import failed: ' + err.message, 'error');
+            CLU.toast('Import failed: ' + err.message, 'error');
         })
         .finally(() => {
             btn.disabled = false;
@@ -2305,7 +2332,6 @@ let _metronArcsSearchQuery = '';
 let _metronArcsLoaded = false;  // true after first successful load
 let _metronArcsTotalCount = 0;
 let _metronArcsDisplayed = 0;
-let _metronArcSearchTimeout = null;
 let _metronArcsFetching = false;
 let _metronArcsObserver = null;
 
@@ -2332,24 +2358,29 @@ function loadMetronArcs() {
     if (_metronArcsLoaded && !_metronArcsSearchQuery) {
         return; // already showing browse results
     }
+    // Back to the browse list, so the box must not keep the old query. A
+    // dispatched input event always runs (CLU.bindSearch), and
+    // searchMetronArcs('') loads the browse list.
+    const searchInput = document.getElementById('metronArcSearchInput');
+    if (searchInput && searchInput.value) {
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+    }
     _metronArcsSearchQuery = '';
     _metronArcsPage = 0;
     _metronArcsDisplayed = 0;
     fetchMetronArcsPage(1);
 }
 
-function searchMetronArcs() {
-    clearTimeout(_metronArcSearchTimeout);
-    _metronArcSearchTimeout = setTimeout(() => {
-        const query = document.getElementById('metronArcSearchInput').value.trim();
-        _metronArcsSearchQuery = query;
-        _metronArcsPage = 0;
-        _metronArcsDisplayed = 0;
-        if (!query) {
-            _metronArcsLoaded = false; // allow browse reload
-        }
-        fetchMetronArcsPage(1);
-    }, 300);
+function searchMetronArcs(query) {
+    _metronArcsSearchQuery = query;
+    _metronArcsPage = 0;
+    _metronArcsDisplayed = 0;
+    if (!query) {
+        _metronArcsLoaded = false; // allow browse reload
+    }
+    fetchMetronArcsPage(1);
 }
 
 function fetchMetronArcsPage(page) {
@@ -2399,6 +2430,7 @@ function fetchMetronArcsPage(page) {
 
                 if (data.results.length === 0 && !append) {
                     empty.classList.remove('d-none');
+                    showProviderEmpty(empty, 'metronArcSearchInput', 'story arcs', _metronArcsSearchQuery);
                     if (sentinel) sentinel.classList.add('d-none');
                 } else {
                     renderMetronArcs(data.results, append);
@@ -2530,7 +2562,7 @@ function deselectAllMetronArcs() {
 function importSelectedMetronArcs() {
     const arcIds = getSelectedMetronArcs();
     if (arcIds.length === 0) {
-        showToast('No arcs selected', 'error');
+        CLU.toast('No arcs selected', 'error');
         return;
     }
 
@@ -2550,17 +2582,17 @@ function importSelectedMetronArcs() {
                 const modal = bootstrap.Modal.getInstance(document.getElementById('importMetronModal'));
                 if (modal) modal.hide();
 
-                showToast(`Importing ${data.tasks.length} arc(s) -- track progress in the navbar`, 'info', 5000);
+                CLU.toast(`Importing ${data.tasks.length} arc(s) -- track progress in the navbar`, 'info', 5000);
 
                 data.tasks.forEach(task => {
                     pollImportStatus(task.task_id, `Metron arc ${task.arc_id}`);
                 });
             } else {
-                showToast('Error: ' + data.message, 'error');
+                CLU.toast('Error: ' + data.message, 'error');
             }
         })
         .catch(err => {
-            showToast('Import failed: ' + err.message, 'error');
+            CLU.toast('Import failed: ' + err.message, 'error');
         })
         .finally(() => {
             btn.disabled = false;
@@ -2575,28 +2607,29 @@ function importSelectedMetronArcs() {
 
 let _cvArcsLoaded = false;
 let _cvArcsSearchQuery = '';
-let _cvArcSearchTimeout = null;
 
 function loadCVArcs() {
     if (_cvArcsLoaded && !_cvArcsSearchQuery) {
         return;
     }
-    _cvArcsSearchQuery = '';
     const searchInput = document.getElementById('cvArcSearchInput');
-    if (searchInput) searchInput.value = '';
+    if (searchInput && searchInput.value) {
+        // Cleared through its input event: a dispatched one always runs
+        // (CLU.bindSearch), so searchCVArcs('') reloads the browse list.
+        searchInput.value = '';
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+    }
+    _cvArcsSearchQuery = '';
     fetchCVArcs();
 }
 
-function searchCVArcs() {
-    clearTimeout(_cvArcSearchTimeout);
-    _cvArcSearchTimeout = setTimeout(() => {
-        const query = document.getElementById('cvArcSearchInput').value.trim();
-        _cvArcsSearchQuery = query;
-        if (!query) {
-            _cvArcsLoaded = false;
-        }
-        fetchCVArcs();
-    }, 300);
+function searchCVArcs(query) {
+    _cvArcsSearchQuery = query;
+    if (!query) {
+        _cvArcsLoaded = false;
+    }
+    fetchCVArcs();
 }
 
 function fetchCVArcs() {
@@ -2626,6 +2659,7 @@ function fetchCVArcs() {
             if (data.success) {
                 if (!data.arcs || data.arcs.length === 0) {
                     empty.classList.remove('d-none');
+                    showProviderEmpty(empty, 'cvArcSearchInput', 'story arcs', _cvArcsSearchQuery);
                 } else {
                     renderCVArcs(data.arcs);
                     content.classList.remove('d-none');
@@ -2717,7 +2751,7 @@ function deselectAllCVArcs() {
 function importSelectedCVArcs() {
     const arcIds = getSelectedCVArcs();
     if (arcIds.length === 0) {
-        showToast('No arcs selected', 'error');
+        CLU.toast('No arcs selected', 'error');
         return;
     }
 
@@ -2737,17 +2771,17 @@ function importSelectedCVArcs() {
                 const modal = bootstrap.Modal.getInstance(document.getElementById('importCVModal'));
                 if (modal) modal.hide();
 
-                showToast(`Importing ${data.tasks.length} arc(s) -- track progress in the navbar`, 'info', 5000);
+                CLU.toast(`Importing ${data.tasks.length} arc(s) -- track progress in the navbar`, 'info', 5000);
 
                 data.tasks.forEach(task => {
                     pollImportStatus(task.task_id, `CV arc ${task.arc_id}`);
                 });
             } else {
-                showToast('Error: ' + data.message, 'error');
+                CLU.toast('Error: ' + data.message, 'error');
             }
         })
         .catch(err => {
-            showToast('Import failed: ' + err.message, 'error');
+            CLU.toast('Import failed: ' + err.message, 'error');
         })
         .finally(() => {
             btn.disabled = false;
@@ -2793,14 +2827,14 @@ function doRematchReadingList(listId) {
         .then(r => r.json())
         .then(data => {
             if (!data.success) {
-                showToast(data.message || 'Re-match failed', 'error');
+                CLU.toast(data.message || 'Re-match failed', 'error');
                 restore();
                 return;
             }
             pollRematchStatus(data.task_id, restore);
         })
         .catch(err => {
-            showToast('Re-match error: ' + err.message, 'error');
+            CLU.toast('Re-match error: ' + err.message, 'error');
             restore();
         });
 }
@@ -2813,15 +2847,15 @@ function pollRematchStatus(taskId, onDone) {
             .then(r => r.json())
             .then(data => {
                 if (!data.success) {
-                    showToast('Re-match task not found', 'error');
+                    CLU.toast('Re-match task not found', 'error');
                     onDone();
                     return;
                 }
                 if (data.status === 'complete') {
-                    showToast(`Re-match complete — ${data.message}`, 'success', 8000);
+                    CLU.toast(`Re-match complete — ${data.message}`, 'success', 8000);
                     setTimeout(() => window.location.reload(), 1500);
                 } else if (data.status === 'error') {
-                    showToast(`Re-match failed: ${data.message}`, 'error', 10000);
+                    CLU.toast(`Re-match failed: ${data.message}`, 'error', 10000);
                     onDone();
                 } else {
                     setTimeout(check, pollInterval);
@@ -2856,7 +2890,7 @@ function toggleTrackWanted(listId, btn) {
             btn.disabled = false;
             if (!data.success) {
                 btn.innerHTML = originalHtml;
-                showToast(data.message || 'Could not update this list', 'error');
+                CLU.toast(data.message || 'Could not update this list', 'error');
                 return;
             }
             btn.dataset.tracking = data.enabled ? '1' : '0';
@@ -2864,12 +2898,12 @@ function toggleTrackWanted(listId, btn) {
             btn.classList.toggle('btn-outline-primary', !data.enabled);
             btn.innerHTML = '<i class="bi bi-binoculars me-1"></i><span class="track-wanted-label">'
                 + (data.enabled ? 'Tracking Wanted' : 'Track Wanted') + '</span>';
-            showToast(data.message, 'success');
+            CLU.toast(data.message, 'success');
         })
         .catch(err => {
             btn.disabled = false;
             btn.innerHTML = originalHtml;
-            showToast('Error: ' + err.message, 'error');
+            CLU.toast('Error: ' + err.message, 'error');
         });
 }
 
@@ -2891,12 +2925,12 @@ function syncReadingList(listId) {
         .then(r => r.json())
         .then(data => {
             if (!data.success) {
-                showToast('Sync failed: ' + data.message, 'error');
+                CLU.toast('Sync failed: ' + data.message, 'error');
                 restore();
                 return;
             }
             if (!data.changed) {
-                showToast('No changes detected', 'info');
+                CLU.toast('No changes detected', 'info');
                 restore();
                 return;
             }
@@ -2904,7 +2938,7 @@ function syncReadingList(listId) {
             pollSyncStatus(data.task_id, restore);
         })
         .catch(err => {
-            showToast('Sync error: ' + err.message, 'error');
+            CLU.toast('Sync error: ' + err.message, 'error');
             restore();
         });
 }
@@ -2917,15 +2951,15 @@ function pollSyncStatus(taskId, onDone) {
             .then(r => r.json())
             .then(data => {
                 if (!data.success) {
-                    showToast('Sync task not found', 'error');
+                    CLU.toast('Sync task not found', 'error');
                     onDone();
                     return;
                 }
                 if (data.status === 'complete') {
-                    showToast(data.message || 'Sync complete', 'success', 8000);
+                    CLU.toast(data.message || 'Sync complete', 'success', 8000);
                     setTimeout(() => window.location.reload(), 1500);
                 } else if (data.status === 'error') {
-                    showToast(`Sync failed: ${data.message}`, 'error', 10000);
+                    CLU.toast(`Sync failed: ${data.message}`, 'error', 10000);
                     onDone();
                 } else {
                     setTimeout(check, pollInterval);
@@ -2974,9 +3008,9 @@ function ensureSourceSearch() {
                 issue: currentSearchIssue,
                 year: currentSearchYear,
             }),
-            // The shared module speaks Bootstrap severities; showToast() here
+            // The shared module speaks Bootstrap severities; CLU.toast() here
             // only knows 'success'/'error' and renders anything else blue.
-            toast: (message, type) => showToast(message, type === 'danger' ? 'error' : type),
+            toast: (message, type) => CLU.toast(message, type === 'danger' ? 'error' : type),
             // The keep-open button leaves the results up so the user can grab
             // more than one file from a single search.
             onQueued: ({ keepOpen }) => {
