@@ -2831,16 +2831,16 @@ def run_komga_sync():
                 f"library paths, and check the Library Path Mapping in Config."
             )
 
-        return {
-            "success": True,
-            "read_count": read_count,
-            "progress_count": progress_count,
-            "skip_count": skip_count,
-            "progress_skip_count": progress_skip_count,
-            "no_match_count": no_match_count,
-            "ambiguous_count": ambiguous_count,
-            "elapsed": round(elapsed, 2),
-        }
+    return {
+                "success": True,
+                "read_count": read_count,
+                "progress_count": progress_count,
+                "skip_count": skip_count,
+                "progress_skip_count": progress_skip_count,
+                "no_match_count": no_match_count,
+                "ambiguous_count": ambiguous_count,
+                "elapsed": round(elapsed, 2),
+            }
 
 
 def scheduled_komga_sync():
