@@ -137,6 +137,8 @@ from core.database import (
     delete_file_index_entry,
     forget_deleted_path,
     sync_file_index_incremental,
+    prune_vanished_index_dirs,
+    move_indexed_path,
     get_rebuild_schedule,
     save_rebuild_schedule as db_save_rebuild_schedule,
     update_last_rebuild,
@@ -406,7 +408,11 @@ def scheduled_file_index_rebuild():
 
         # Scan filesystem to get current state
         app_logger.info("Scanning filesystem...")
-        filesystem_entries = scan_filesystem_for_sync()
+        # Vanished folders first: this also clears their reading-list
+        # matches, which the sync's own removal does not (#693).
+        prune_vanished_index_dirs()
+        walked_roots = []
+        filesystem_entries = scan_filesystem_for_sync(walked_roots=walked_roots)
         scan_time = time.time() - start_time
         app_logger.info(
             f"Filesystem scan completed: {len(filesystem_entries)} entries in {scan_time:.2f}s"
@@ -414,7 +420,9 @@ def scheduled_file_index_rebuild():
 
         # Incremental sync (preserves metadata for existing files)
         app_logger.info("Performing incremental sync...")
-        sync_result = sync_file_index_incremental(filesystem_entries)
+        sync_result = sync_file_index_incremental(
+            filesystem_entries, walked_roots=walked_roots
+        )
         app_logger.info(
             f"Sync result: {sync_result['added']} added, {sync_result['removed']} removed, {sync_result['unchanged']} unchanged"
         )
@@ -641,14 +649,13 @@ def scheduled_series_sync():
             local_issue_count = series.get("issue_count", 0)
             try:
                 # 1. Fetch BASIC series info (1 API call, with rate-limit handling)
-                series_info = metron._api_call(
-                    lambda: api.series(series_id),
-                    f"fetching series info for {series_id}",
-                )
-                # No sleep here: metron._api_call already paces every request
-                # through the shared sliding-window limiter, retuned from the
-                # rate-limit headers Metron returns. A fixed sleep on top just
-                # added dead time per series without adding protection.
+                series_info = api.using(
+                    context=f"fetching series info for {series_id}"
+                ).series(series_id)
+                # No sleep here: the session's limiter paces every request,
+                # retuned from the rate-limit headers Metron returns. A fixed
+                # sleep on top just added dead time per series without adding
+                # protection.
                 if not series_info:
                     fail_count += 1
                     continue
@@ -691,7 +698,7 @@ def scheduled_series_sync():
                 app_logger.info(f"Fetching updates for series {series_id}...")
                 all_issues_result = metron.get_all_issues_for_series(api, series_id)
                 all_issues = list(all_issues_result) if all_issues_result else []
-                # Paced by metron._api_call -- see the note above.
+                # Paced by the session's limiter -- see the note above.
 
                 # 4. Save and Cleanup
                 save_issues_bulk(all_issues, series_id)
@@ -3248,6 +3255,7 @@ from helpers.library import (
     is_valid_library_path,
     get_library_for_path,
     watch_target_verdict,
+    is_root_mounted,
 )
 
 #########################
@@ -3256,20 +3264,16 @@ from helpers.library import (
 
 
 def _is_nested_library_folder(folder_path):
-    """True if *folder_path* is at least two levels below its library root.
+    """True if *folder_path* is below its library root (never the root itself).
 
-    The auto-metadata hooks run on series folders (``<root>/Publisher/Series``),
-    never on a library root or a publisher folder directly under it.
+    This used to demand two levels (``<root>/Publisher/Series``), which made
+    every auto-metadata hook a silent no-op on a flat library whose series
+    folders sit directly under the root. What marks a series folder is its
+    cvinfo, which every hook requires next; a publisher folder has none.
     """
-    normalized = os.path.normpath(folder_path)
-    # Longest root first, so a library nested inside another is measured
-    # from its own root.
-    for root in sorted(get_library_roots(), key=len, reverse=True):
-        root_normalized = os.path.normpath(root)
-        if normalized.startswith(root_normalized + os.sep):
-            rel_path = os.path.relpath(normalized, root_normalized)
-            return "/" in rel_path.replace("\\", "/")
-    return False
+    from helpers.library import is_below_library_root
+
+    return is_below_library_root(folder_path)
 
 
 def log_file_if_in_data(file_path):
@@ -3814,7 +3818,11 @@ def api_rebuild_file_index():
 
         # Scan filesystem to get current state
         app_logger.info("Scanning filesystem...")
-        filesystem_entries = scan_filesystem_for_sync()
+        # Vanished folders first: this also clears their reading-list
+        # matches, which the sync's own removal does not (#693).
+        prune_vanished_index_dirs()
+        walked_roots = []
+        filesystem_entries = scan_filesystem_for_sync(walked_roots=walked_roots)
         scan_time = time.time() - start_time
         app_logger.info(
             f"Filesystem scan completed: {len(filesystem_entries)} entries in {scan_time:.2f}s"
@@ -3822,7 +3830,9 @@ def api_rebuild_file_index():
 
         # Incremental sync (preserves metadata for existing files)
         app_logger.info("Performing incremental sync...")
-        sync_result = sync_file_index_incremental(filesystem_entries)
+        sync_result = sync_file_index_incremental(
+            filesystem_entries, walked_roots=walked_roots
+        )
         app_logger.info(
             f"Sync result: {sync_result['added']} added, {sync_result['removed']} removed, {sync_result['unchanged']} unchanged"
         )
@@ -4371,13 +4381,19 @@ def _build_file_index_locked():
     # Legacy: update_recent_files_from_scan(comic_files) - Removed as we now use file_index directly
 
 
-def scan_filesystem_for_sync():
+def scan_filesystem_for_sync(walked_roots=None):
     """
     Scan the filesystem and return a list of entries without modifying the database.
 
     Used by incremental sync to compare filesystem state with database state.
     Excludes TARGET folder (from app.config) as those files should not be indexed.
     Scans all enabled libraries.
+
+    Args:
+        walked_roots: Optional list; each root actually walked is appended,
+            for ``sync_file_index_incremental(walked_roots=)``. A missing or
+            empty root (an unmounted share looks like either) is skipped and
+            not appended, so its rows are not read as deleted.
 
     Returns:
         List of dicts with {name, path, type, size, parent, has_thumbnail, modified_at}
@@ -4420,6 +4436,13 @@ def scan_filesystem_for_sync():
         if not os.path.exists(library_root):
             app_logger.warning(f"Library path does not exist, skipping: {library_root}")
             continue
+        if not is_root_mounted(library_root):
+            app_logger.warning(
+                f"Library path is empty (unmounted?), skipping: {library_root}"
+            )
+            continue
+        if walked_roots is not None:
+            walked_roots.append(library_root)
 
         try:
             for root, dirs, files in os.walk(library_root):
@@ -4614,60 +4637,17 @@ def update_index_on_move(old_path, new_path, reconcile=True):
                 ):
                     return
 
-                parent = os.path.dirname(new_path)
-                update_file_index_entry(
-                    old_path, name=file_name, new_path=new_path, parent=parent
-                )
+                move_indexed_path(old_path, new_path, is_dir=False)
                 app_logger.debug(
                     f"Updated file index for moved file: {old_path} -> {new_path}"
                 )
 
             else:
-                # Update directory and all children
-                # First update the directory itself
-                dir_name = os.path.basename(new_path)
-                parent = os.path.dirname(new_path)
-                update_file_index_entry(
-                    old_path, name=dir_name, new_path=new_path, parent=parent
-                )
-
-                # Update all children paths
-                # We need to update paths that start with old_path to start with new_path
-                conn = get_db_connection()
-                if conn:
-                    c = conn.cursor()
-                    # Update all entries whose path starts with old_path
-                    c.execute(
-                        """
-                        UPDATE file_index
-                        SET path = ? || SUBSTR(path, ?),
-                            parent = ? || SUBSTR(parent, ?)
-                        WHERE path LIKE ?
-                    """,
-                        (
-                            new_path,
-                            len(old_path) + 1,
-                            new_path,
-                            len(old_path) + 1,
-                            f"{old_path}/%",
-                        ),
-                    )
-
-                    conn.commit()
-                    rows_affected = c.rowcount
-                    conn.close()
-                    app_logger.debug(
-                        f"Updated {rows_affected} child entries for moved directory: {old_path} -> {new_path}"
-                    )
-
-                # The child prefix UPDATE above bypasses update_file_index_entry,
-                # so everything else keyed on the raw path under this folder has
-                # to be followed explicitly -- otherwise a folder rename orphans
-                # every bookmark in the series, every metadata tag, and every
-                # reading-list mapping that pointed into it.
-                from core.database import move_path_references
-
-                move_path_references(old_path, new_path, is_dir=True)
+                # The directory, every row under it and every path reference
+                # (bookmarks, tags, reading-list mappings), in one transaction.
+                # Shared with the file watcher, so a move made outside CLU is
+                # followed the same way.
+                move_indexed_path(old_path, new_path, is_dir=True)
 
             # A file moved between series folders: reconcile both the source
             # (an issue may now be missing) and the destination (an issue may
@@ -4925,7 +4905,7 @@ def api_on_the_stack():
 def auto_fetch_comicvine_metadata(destination_path):
     """
     Automatically fetch ComicVine metadata for moved files if conditions are met.
-    Only triggers for non-root /data directories that have a cvinfo file.
+    Only triggers for folders below a library root that have a cvinfo file.
 
     Returns:
         The final file path (renamed path if file was renamed, original path otherwise)
@@ -4953,8 +4933,7 @@ def auto_fetch_comicvine_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check: Is this a series folder inside a library? (at least 2 path
-        # components below the library root)
+        # Check: Is this folder below a library root (not the root itself)?
         if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping auto-metadata for root-level directory: {folder_path}"
@@ -5003,7 +4982,7 @@ def auto_fetch_comicvine_metadata(destination_path):
 def auto_fetch_metron_metadata(destination_path):
     """
     Automatically fetch Metron metadata for moved files if conditions are met.
-    Only triggers for non-root /data directories that have a cvinfo file.
+    Only triggers for folders below a library root that have a cvinfo file.
 
     Returns:
         The final file path (renamed path if file was renamed, original path otherwise)
@@ -5044,7 +5023,7 @@ def auto_fetch_metron_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check 3: Is this a series folder inside a library?
+        # Check 3: Is this folder below a library root (not the root itself)?
         if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping Metron metadata for root-level directory: {folder_path}"
@@ -5059,7 +5038,7 @@ def auto_fetch_metron_metadata(destination_path):
                 break
 
         if not cvinfo_path:
-            app_logger.debug(
+            app_logger.info(
                 f"No cvinfo file found in {folder_path}, skipping Metron metadata"
             )
             return destination_path
@@ -5073,7 +5052,10 @@ def auto_fetch_metron_metadata(destination_path):
         # Get Metron series ID (from cvinfo or lookup by CV ID)
         series_id = get_series_id(cvinfo_path, api)
         if not series_id:
-            app_logger.debug("Could not determine Metron series ID")
+            app_logger.info(
+                f"Could not determine Metron series ID from {cvinfo_path}, "
+                f"skipping Metron metadata"
+            )
             return destination_path
 
         # Track if we've saved cvinfo fields (only need to do once per folder)
@@ -5197,8 +5179,8 @@ def auto_fetch_metron_metadata(destination_path):
 def auto_fetch_comicvine_sqlite_metadata(destination_path):
     """
     Automatically fetch metadata from the local ComicVine SQLite database for
-    moved files if conditions are met. Only triggers for non-root /data
-    directories that have a cvinfo file. Uses the same ComicVine volume ID stored
+    moved files if conditions are met. Only triggers for folders below a
+    library root that have a cvinfo file. Uses the same ComicVine volume ID stored
     in cvinfo as the online ComicVine provider.
 
     Returns:
@@ -5240,7 +5222,7 @@ def auto_fetch_comicvine_sqlite_metadata(destination_path):
             folder_path = destination_path
             target_file = None
 
-        # Check: Is this a series folder inside a library?
+        # Check: Is this folder below a library root (not the root itself)?
         if not _is_nested_library_folder(folder_path):
             app_logger.debug(
                 f"Skipping local ComicVine metadata for root-level directory: {folder_path}"

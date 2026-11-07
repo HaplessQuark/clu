@@ -61,34 +61,57 @@ only 429 and 5xx are worth retrying. So:
 - Detection reads the status off `exc.__cause__.response.status_code`
   (`metron.auth_failure_status`), the same place `is_connection_error` looks —
   not out of `ApiError`'s message, which mokkari assembles for humans.
-- Enforcement is in **two** places, and both are needed. `_MetronPacer.before()`
-  short-circuits every `_api_call`; `get_api()` refuses to hand out a client at
-  all, checked *before* the session cache, because several callers fetch a
-  client once and then drive mokkari in a loop.
+- Enforcement is in **two** places, and both are needed. Every
+  `MetronClient` method runs under `GuardedClient.call`
+  (`core/provider_client.py`), which short-circuits it; `get_api()` refuses to
+  hand out a client at all, checked *before* the session cache, so a caller
+  that loops over one client never starts.
 - **There is no timed auto-retry.** A rejected credential does not heal on its
   own. The block clears only on a credential save, a successful connection test,
   or the Re-enable button (`POST /api/providers/<type>/reset-auth`).
 - The flag lives in `user_preferences` (`metron_auth_blocked` and friends), not
   just in memory, so a container crash-looping with bad credentials does not
-  resume hammering. The database is the source of truth; the copy in `_AuthBlock`
-  is a memo that `invalidate_session_cache()` drops. Reads fail **open** but
+  resume hammering. The lockout is the shared `core.provider_client.AuthLockout`
+  (keys derived from the provider name, so Metron's never changed). The database
+  is the source of truth; the copy in it is a memo that
+  `invalidate_session_cache()` drops. Reads fail **open** but
   never cache that: `get_user_preference` swallows its own errors, so a read
   taken before the database is ready is indistinguishable from "not blocked",
   and remembering it would switch the lockout off for the life of the process.
   `_read_persisted()` therefore queries the table directly and returns `None`
   on failure, which leaves the memo unloaded so the next call retries.
 - **`test_connection` is the one path allowed past the lockout**
-  (`get_api(..., ignore_auth_lock=True)`, `_api_call(..., raise_auth_errors=True)`).
+  (`get_api(..., ignore_auth_lock=True)`,
+  `api.using(ignore_auth_lock=True, raise_auth_errors=True)`).
   Without that bypass a user who fixed their credentials could never prove it.
 
-> **Every Metron call must go through `_api_call`.** A raw `api.<method>()` takes
-> no rate-limit slot *and* ignores the lockout, so a loop holding a client keeps
-> calling with credentials Metron has already rejected. `fetch_arcs_page` is the
-> deliberate exception — it builds its own request to escape mokkari's
-> auto-pagination — and therefore carries the auth rules by hand. That includes
-> adding `Authorization: Bearer <api.api_token>` itself: mokkari 5 keeps the
-> token out of `api.header`, so an arc page sent with `api.header` alone is a
-> 401, and that latches the lockout for *all* Metron traffic.
+> **Every Metron call goes through a `MetronClient` method.** Callers get a
+> client, never the mokkari Session (`client._library`, which only
+> `models/metron.py` may touch), so a raw call that ignores the lockout and the
+> daily-quota latch can't be written. Eight did exactly that, in
+> `routes/series.py` and `models/series_json.py` (#703).
+> `tests/unit/test_provider_calls_guarded.py` is the ratchet. Routes use
+> `api.using(raise_api_errors=True, context=...)` to keep their "Metron is
+> unavailable" 503, and answer a `None` with `metron.paused_reason()`.
+>
+> **Pacing is not the client's job.** Each `MokkariSession` is built with its
+> own `_CluRateLimiter` (mokkari's `HeaderPacedRateLimiter`, seeded with the
+> 20/min that Settings shows until Metron reports its real limit), and mokkari
+> calls it on **every send** — each page of a paginated list included. CLU used
+> to take one slot per call while mokkari followed every `next` link inside
+> it, so a long series sent dozens of unpaced pages. A 429 Metron returns
+> blocks every thread inside the limiter for `Retry-After`, so the policy
+> retries it without sleeping; a plain `RateLimitError` (the limiter refusing a
+> request it never sent) means the daily window is spent and latches it.
+>
+> `MetronClient.arcs_page` is the deliberate exception — it builds its own
+> request to escape mokkari's auto-pagination — and therefore carries the rules
+> by hand: it takes and releases the session's `rate_limiter` around its
+> `requests.get`, reports a 429 through `on_rate_limited`, and latches the
+> lockout itself. That includes adding `Authorization: Bearer <api_token>`
+> itself: mokkari 5 keeps the token out of the session's `header`, so an arc
+> page sent with `header` alone is a 401, and that latches the lockout for
+> *all* Metron traffic.
 
 Saving Metron credentials verifies them in the same request
 (`BaseProvider.validate_on_save`, Metron only). The credentials are stored either

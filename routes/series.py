@@ -897,7 +897,12 @@ def issue_view(slug):
         return redirect(url_for(".releases"))
 
     try:
-        full_issue = api.issue(issue_id)
+        full_issue = api.using(
+            raise_api_errors=True, context=f"resolving issue {issue_id}"
+        ).issue(issue_id)
+        if full_issue is None:
+            flash(metron.paused_reason() or "Issue not found on Metron", "error")
+            return redirect(url_for(".releases"))
         series_id = full_issue.series.id
         series_name = full_issue.series.name
         series_volume = getattr(full_issue.series, "volume", None)
@@ -998,7 +1003,12 @@ def series_view(slug):
 
         else:
             app_logger.info(f"Fetching series details for series_id: {series_id}")
-            series_info = api.series(series_id)
+            series_info = api.using(
+                raise_api_errors=True, context=f"fetching series {series_id}"
+            ).series(series_id)
+            if series_info is None:
+                flash(metron.paused_reason() or "Series not found on Metron", "error")
+                return redirect(url_for(".releases"))
             app_logger.info(
                 f"Got series_info: {series_info.name if series_info else 'None'}"
             )
@@ -1219,6 +1229,19 @@ def series_view(slug):
 # =============================================================================
 
 
+def _metron_skipped_response():
+    """503 for a Metron call the call policy skipped or gave up on.
+
+    With ``raise_api_errors=True`` a ``None`` result means Metron is paused
+    (rejected credentials, spent daily quota) or still rate limiting after the
+    retries; real API errors raise and keep their own handling.
+    """
+    reason = metron.paused_reason() or (
+        "Metron is rate limiting requests. Please try again shortly."
+    )
+    return jsonify({"success": False, "error": reason}), 503
+
+
 @series_bp.route("/api/series/search", methods=["GET"])
 def api_search_series():
     """Search Metron API for series by name."""
@@ -1248,7 +1271,11 @@ def api_search_series():
             except (TypeError, ValueError):
                 pass  # ignore non-numeric publisher filter
 
-        results = api.series_list(filters)
+        results = api.using(
+            raise_api_errors=True, context=f"searching series '{query}'"
+        ).series_list(filters)
+        if results is None:
+            return _metron_skipped_response()
 
         # Series the user is subscribed to (have a mapped local folder) so the
         # frontend can highlight already-tracked results.
@@ -1616,7 +1643,11 @@ def check_series_collection(series_id):
                     {"error": "Metron API not configured and no cached data"}
                 ), 500
 
-            series_info = api.series(series_id)
+            series_info = api.using(
+                raise_api_errors=True, context=f"fetching series {series_id}"
+            ).series(series_id)
+            if series_info is None:
+                return _metron_skipped_response()
             all_issues_result = metron.get_all_issues_for_series(api, series_id)
             all_issues = list(all_issues_result) if all_issues_result else []
 
@@ -1909,7 +1940,11 @@ def sync_series(series_id):
         # which serves stale bodies until the process restarts.
         metron.purge_series_cache(series_id, api=api)
 
-        series_info = api.series(series_id)
+        series_info = api.using(
+            raise_api_errors=True, context=f"syncing series {series_id}"
+        ).series(series_id)
+        if series_info is None and metron.paused_reason():
+            return _metron_skipped_response()
         if not series_info:
             return jsonify({"error": "Series not found"}), 404
 
@@ -1984,10 +2019,9 @@ def sync_all_series():
         for series in series_to_sync:
             series_id = series["id"]
             try:
-                series_info = metron._api_call(
-                    lambda sid=series_id: api.series(sid),
-                    f"syncing series {series_id}",
-                )
+                series_info = api.using(
+                    context=f"syncing series {series_id}"
+                ).series(series_id)
                 if not series_info:
                     results.append(
                         {"series_id": series_id, "success": False, "error": "Not found"}
@@ -2188,12 +2222,17 @@ def api_add_library():
                         f"Rebuilding file index after adding library: {name}"
                     )
                     app_state.update_operation(op_id, detail="Scanning folders...")
-                    filesystem_entries = scan_filesystem_for_sync()
+                    walked_roots = []
+                    filesystem_entries = scan_filesystem_for_sync(
+                        walked_roots=walked_roots
+                    )
                     app_state.update_operation(
                         op_id,
                         detail=f"Updating the index ({len(filesystem_entries)} entries)...",
                     )
-                    sync_file_index_incremental(filesystem_entries)
+                    sync_file_index_incremental(
+                        filesystem_entries, walked_roots=walked_roots
+                    )
                     app_logger.info(
                         f"File index rebuilt successfully for new library: {name}"
                     )
@@ -2430,7 +2469,11 @@ def api_search_publishers():
                 }
             ), 400
 
-        results = api.publishers_list({"name": query})
+        results = api.using(
+            raise_api_errors=True, context=f"searching publishers '{query}'"
+        ).publishers_list({"name": query})
+        if results is None:
+            return _metron_skipped_response()
 
         existing_publishers = get_all_publishers()
         existing_ids = {p["id"] for p in existing_publishers}
@@ -2479,7 +2522,13 @@ def api_sync_publishers():
                 }
             ), 400
 
-        results = api.publishers_list({})
+        # Empty filters page through every publisher on Metron; each page is
+        # paced by the session's limiter, not by this one call.
+        results = api.using(
+            raise_api_errors=True, context="syncing all publishers"
+        ).publishers_list({})
+        if results is None:
+            return _metron_skipped_response()
 
         count = 0
         for pub in results:

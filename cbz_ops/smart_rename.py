@@ -105,10 +105,9 @@ def _resolve_series_via_providers(cvinfo_path: str, library_id: Optional[int]):
                 metron_id = metron_mod.get_series_id(cvinfo_path, api)
                 if not metron_id:
                     continue
-                series = metron_mod._api_call(
-                    lambda: api.series(metron_id),
-                    f"fetching series {metron_id} for smart rename",
-                )
+                series = api.using(
+                    context=f"fetching series {metron_id} for smart rename"
+                ).series(metron_id)
                 if series:
                     return series, metron_api
             except Exception as e:
@@ -125,7 +124,7 @@ def _resolve_series_via_providers(cvinfo_path: str, library_id: Optional[int]):
                 if series_dict:
                     return series_dict, metron_api
             except Exception as e:
-                app_logger.warning(f"smart_rename: comicvine lookup failed for cv_id={cv_id}: {e}")
+                cv_mod.log_cv_failure(f"smart_rename: comicvine lookup failed for cv_id={cv_id}: {e}", e, "warning")
                 continue
         # Other providers (gcd, anilist, manga*) don't populate Mylar-style
         # series.json today; skip them silently.
@@ -150,9 +149,7 @@ def _build_comicvine_series_dict(api_key: str, cv_id: int) -> Optional[Dict]:
         return None
     try:
         cv = cv_module.get_cv_client(api_key)
-        volume = cv_module._cv_call_with_retry(
-            lambda: cv.get_volume(cv_id), f"smart_rename volume {cv_id}"
-        )
+        volume = cv.using(context=f"smart_rename volume {cv_id}").get_volume(cv_id)
         if not volume:
             return None
         publisher = getattr(volume, "publisher", None)
@@ -185,7 +182,7 @@ def _build_comicvine_series_dict(api_key: str, cv_id: int) -> Optional[Dict]:
         )
         return None
     except Exception as e:
-        app_logger.error(f"smart_rename: ComicVine volume fetch failed for {cv_id}: {e}")
+        cv_mod.log_cv_failure(f"smart_rename: ComicVine volume fetch failed for {cv_id}: {e}", e)
         return None
 
 

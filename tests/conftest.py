@@ -195,6 +195,71 @@ def _contain_background_analyze():
 
 
 # ---------------------------------------------------------------------------
+# Fixture: Plain-requests provider pacing off by default (autouse)
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _no_provider_pacing(request):
+    """``core.http_client`` spaces every send to a provider's real rate (2s for
+    the GCD API), which would turn a paginated test into seconds of sleep.
+    Tests that exercise the pacing itself opt back in with
+    ``@pytest.mark.real_pacing``."""
+    try:
+        import core.http_client as http_client
+    except ImportError:
+        yield
+        return
+    http_client.reset_pacers()
+    if request.node.get_closest_marker("real_pacing"):
+        yield
+    else:
+        from unittest.mock import patch
+
+        with patch.object(http_client._Pacer, "wait_turn", lambda self, timeout: None):
+            yield
+    http_client.reset_pacers()
+
+
+# ---------------------------------------------------------------------------
+# Fixture: Provider latches don't outlive a test (autouse)
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _reset_provider_latches():
+    """Auth lockouts and quota latches are module-level state.
+
+    A test that gets a real 401 (one route test saves a fake ComicVine key and
+    then tests it) latches the lockout's in-process memo, and every later test
+    in the run would find ComicVine paused. ``forget()`` alone is not enough:
+    when the next test's database has no ``user_preferences`` table the read
+    fails, and ``blocked()`` answers from the stale memo. So the memo's values
+    are cleared too, and the next read comes from that test's own database.
+    Only modules already imported are touched; this fixture must not import
+    them.
+    """
+    yield
+    import sys
+
+    provider_client = sys.modules.get("core.provider_client")
+    if provider_client is not None:
+        with provider_client._LOCKOUTS_LOCK:
+            lockouts = list(provider_client._LOCKOUTS.values())
+        for lockout in lockouts:
+            with lockout._lock:
+                lockout._loaded = False
+                lockout._blocked = False
+                lockout._error = None
+                lockout._blocked_at = None
+    for module_name, latch_name in (
+        ("models.comicvine", "_hourly"),
+        ("models.gcd_api", "_quota"),
+        ("models.metron", "_daily"),
+    ):
+        module = sys.modules.get(module_name)
+        latch = getattr(module, latch_name, None) if module is not None else None
+        if latch is not None:
+            latch.reset()
+
+
+# ---------------------------------------------------------------------------
 # Fixture: Logging suppression (autouse)
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)

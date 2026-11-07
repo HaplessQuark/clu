@@ -1,13 +1,19 @@
-"""Process-wide request pacing for the third-party metadata providers.
+"""Process-wide request pacing for providers whose client library doesn't pace.
 
-CLU reaches Metron and ComicVine from several places at once -- background
-sweeps, bulk-metadata jobs, the wanted-cache refresh and live web requests --
-so pacing has to be shared across threads or the providers' burst limits get
+CLU reaches each provider from several places at once -- background sweeps,
+bulk-metadata jobs, the wanted-cache refresh and live web requests -- so
+pacing has to be shared across threads or a provider's burst limit gets
 tripped by the aggregate rather than by any one caller.
 
-The limiter here is the *outer* gate: it trips before the provider libraries'
-own limits so the wait happens somewhere we control and log. It does not
-replace Simyan's or Metron's own protection.
+**Take a slot per HTTP request, never per logical call** (see
+``core/provider_client.py``). One call to a library that follows ``next``
+links is many requests, and a slot per call is how Metron's pages went out
+unpaced (#703). Metron and ComicVine are therefore paced inside their
+libraries (mokkari's limiter, Simyan's bucket), once per send, and no longer
+use this module. The plain-``requests`` providers take one per request
+they send, through ``core.http_client`` (a one-slot window per provider, so
+sends are evenly spaced): GCD API, MangaDex, MangaUpdates, Bedetheque and
+AniList.
 """
 
 import threading

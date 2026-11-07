@@ -226,6 +226,61 @@ class TestRollingBatch:
         assert _health(store, p)["status"] == "missing"
         assert lh.run_batch(50, 90)["missing"] == 0
 
+    def test_a_deleted_folder_is_forgotten_not_counted_as_a_mount(self, store, library):
+        """#693: a top-level folder deleted outside CLU. Every file in it raised
+        FileNotFoundError with no parent, which read as a mount going away: the
+        batch aborted on every run and nothing was ever stamped."""
+        _good_cbz(library / "Keep 001.cbz")  # the library is mounted
+        gone = library / "Fantographics" / "Series"
+        paths = [str(gone / f"Ghost {i:03d}.cbz") for i in range(12)]
+        for p in paths:
+            store.execute(
+                "INSERT INTO file_index (name, path, type, size, parent, modified_at) "
+                "VALUES (?, ?, 'file', 1, ?, 1.0)", (os.path.basename(p), p, str(gone)),
+            )
+        store.commit()
+        stats = lh.run_batch(50, 90)
+        assert stats["aborted"] is False
+        assert stats["missing"] == 12
+        assert list_problems() == []
+        left = store.execute(
+            "SELECT COUNT(*) FROM file_index WHERE path LIKE ?", (str(gone) + "%",)
+        ).fetchone()[0]
+        assert left == 0
+
+    def test_scan_drops_a_moved_folders_ghost_duplicates(self, store, library):
+        """The old copy of a series moved outside CLU paired with the new one
+        as a likely duplicate, in thousands of groups."""
+        new_dir = library / "Combined" / "Love and Rockets"
+        new_dir.mkdir(parents=True)
+        p_new = _good_cbz(new_dir / "Love and Rockets 001 (1982).cbz")
+        tags = {"ci_series": "Love and Rockets", "ci_number": "1",
+                "ci_year": 1982, "ci_publisher": "Fantagraphics"}
+        _index(store, p_new, **tags)
+        # Stored the way the indexer stores them: forward slashes.
+        old_dir = (library / "Fantographics" / "Love and Rockets").as_posix()
+        p_old = old_dir + "/Love and Rockets 001 (1982).cbz"
+        for d in ((library / "Fantographics").as_posix(), old_dir):
+            store.execute(
+                "INSERT INTO file_index (name, path, type, parent) VALUES (?, ?, 'directory', ?)",
+                (os.path.basename(d), d, os.path.dirname(d)),
+            )
+        store.execute(
+            "INSERT INTO file_index (name, path, type, size, parent, modified_at, "
+            "ci_series, ci_number, ci_year, ci_publisher) "
+            "VALUES (?, ?, 'file', 1, ?, 1.0, ?, ?, ?, ?)",
+            (os.path.basename(p_old), p_old, old_dir, *tags.values()),
+        )
+        store.commit()
+        assert lh.count_duplicates()[1] == 1
+
+        lh.run_scan(run_cheap=False)
+
+        assert lh.count_duplicates() == (0, 0)
+        assert store.execute(
+            "SELECT path FROM file_index WHERE path = ?", (p_new,)
+        ).fetchone() is not None
+
     def test_prune_keeps_everything_while_the_index_is_empty(self, store, library):
         p = _good_cbz(library / "Keep 001.cbz")
         _index(store, p)
@@ -665,6 +720,97 @@ class TestResolveGroup:
             result = lh.resolve_group(gid, a, [b])
         trash.assert_not_called()
         assert result["success"] is False and os.path.exists(b)
+
+
+class TestRenameMember:
+    """#691: renaming one copy of a likely group from the compare view."""
+
+    TAG = {"ci_series": "Wonder Woman", "ci_number": "5", "ci_year": 1987, "ci_publisher": "DC"}
+
+    def _likely_pair(self, store, library):
+        folder = library / "v1987"
+        folder.mkdir()
+        a = _good_cbz(folder / "Wonder Woman 005 (1987).cbz", payload=b"A")
+        b = _good_cbz(folder / "Wonder Woman 005 (1996).cbz", payload=b"B")
+        _index(store, a, **self.TAG)
+        _index(store, b, **self.TAG)
+        likely = lh.find_duplicates()["likely"]
+        assert len(likely) == 1
+        return a, b, likely[0]["id"]
+
+    @staticmethod
+    def _rename(store, old, new):
+        """What routes.files.rename_path does: the file, then the index."""
+        os.rename(old, new)
+        store.execute("UPDATE file_index SET path = ?, name = ? WHERE path = ?",
+                      (new, os.path.basename(new), old))
+        store.commit()
+        lh.follow_member_rename(old, new)
+
+    def test_the_right_name_clears_the_group(self, store, library):
+        a, b, gid = self._likely_pair(store, library)
+        checked = lh.validate_member_rename(gid, b, "Wonder Woman Annual 005 (1996).cbz")
+        assert checked == {"new_path": os.path.join(os.path.dirname(b),
+                                                    "Wonder Woman Annual 005 (1996).cbz")}
+        self._rename(store, b, checked["new_path"])
+        assert lh.find_duplicates()["likely"] == []
+        assert lh.group_exists(gid) is False
+
+    def test_an_exact_group_cannot_be_renamed_away(self, store, library):
+        a = _good_cbz(library / "Batman 001 (2016).cbz")
+        b = _good_cbz(library / "Batman 001 (2016) (1).cbz")
+        _index(store, a)
+        _index(store, b)
+        lh.run_batch(50, 90)
+        gid = lh.find_duplicates()["exact"][0]["id"]
+        assert "likely" in lh.validate_member_rename(gid, b, "Batman 002 (2016).cbz")["error"]
+
+    def test_the_hash_follows_the_rename(self, store, library):
+        """Otherwise an exact group containing the renamed file vanishes until
+        the next scan, as though it had been resolved."""
+        a = _good_cbz(library / "Batman 001 (2016).cbz")
+        b = _good_cbz(library / "Batman 001 (2016) (1).cbz")
+        _index(store, a)
+        _index(store, b)
+        lh.run_batch(50, 90)
+        new = str(library / "Batman 001 (2016) scan.cbz")
+        self._rename(store, b, new)
+        assert _health(store, b) is None and _health(store, new) is not None
+        exact = lh.find_duplicates()["exact"]
+        assert len(exact) == 1
+        assert {m["path"] for m in exact[0]["members"]} == {a, new}
+
+    def test_a_file_outside_the_group_is_refused(self, store, library):
+        a, b, gid = self._likely_pair(store, library)
+        outsider = _good_cbz(library / "Other 009.cbz", payload=b"Q")
+        assert "not in this group" in lh.validate_member_rename(gid, outsider, "x 009.cbz")["error"]
+
+    def test_an_unknown_group_is_refused(self, store, library):
+        a, b, gid = self._likely_pair(store, library)
+        assert "no longer exists" in lh.validate_member_rename("deadbeef", b, "x.cbz")["error"]
+
+    @pytest.mark.parametrize("name, needle", [
+        ("", "Enter a file name"),
+        ("   ", "Enter a file name"),
+        ("..", "Enter a file name"),
+        ("Sub/Wonder Woman 005.cbz", "cannot contain"),
+        ("Sub\\Wonder Woman 005.cbz", "cannot contain"),
+        ("Wonder Woman: Annual 005.cbz", "cannot contain"),
+        ("Wonder\tWoman 005.cbz", "U+0009"),
+        (".Wonder Woman 005.cbz", "cannot start"),
+        ("_Wonder Woman 005.cbz", "cannot start"),
+        ("Wonder Woman Annual 005 (1996).cbr", "Keep the .cbz"),
+        ("Wonder Woman Annual 005 (1996)", "Keep the .cbz"),
+        (".cbz", "cannot start"),
+        ("Wonder Woman 005 (1996).cbz", "unchanged"),
+    ])
+    def test_bad_names_are_refused_not_cleaned(self, store, library, name, needle):
+        a, b, gid = self._likely_pair(store, library)
+        assert needle in lh.validate_member_rename(gid, b, name)["error"]
+
+    def test_a_case_only_rename_is_allowed(self, store, library):
+        a, b, gid = self._likely_pair(store, library)
+        assert "new_path" in lh.validate_member_rename(gid, b, "WONDER WOMAN 005 (1996).CBZ")
 
 
 class TestSummary:

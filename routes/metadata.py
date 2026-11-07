@@ -782,6 +782,30 @@ def save_cvinfo():
 # Provider Management API
 # =============================================================================
 
+def _provider_lockout(provider_type):
+    """The provider's ``AuthLockout``, or None if it has nothing to reject.
+
+    Lockouts register when their module is imported, so import every module
+    that owns one before asking the registry.
+    """
+    from core.provider_client import lockout_for
+    import models.metron  # noqa: F401
+    import models.gcd_api  # noqa: F401
+    import models.comicvine  # noqa: F401
+
+    return lockout_for(provider_type)
+
+
+def _reset_provider_client(provider_type):
+    """Drop a provider's shared client after its credentials changed."""
+    if provider_type == 'gcd_api':
+        try:
+            from models.gcd_api import invalidate_gcd_client_cache
+            invalidate_gcd_client_cache()
+        except Exception:
+            pass
+
+
 @metadata_bp.route('/api/providers', methods=['GET'])
 def list_providers():
     """List all available metadata providers with their configuration."""
@@ -803,13 +827,11 @@ def list_providers():
                 p['credentials_masked'] = get_provider_credentials_masked(p['type'])
             else:
                 p['credentials_masked'] = None
-            # Metron is the only provider that latches itself off after a
-            # rejection, but every card reports the field so the UI never has
-            # to distinguish "not blocked" from "does not say".
-            state = {}
-            if p['type'] == 'metron':
-                from models import metron as metron_module
-                state = metron_module.auth_block_state()
+            # Only providers with credentials to reject latch themselves off,
+            # but every card reports the field so the UI never has to
+            # distinguish "not blocked" from "does not say".
+            lockout = _provider_lockout(p['type'])
+            state = lockout.state() if lockout is not None else {}
             p['auth_blocked'] = bool(state.get('blocked'))
             p['auth_error'] = state.get('error')
             p['auth_blocked_at'] = state.get('blocked_at')
@@ -960,14 +982,15 @@ def save_provider_creds(provider_type):
                     invalidate_gcd_table_cache()
                 except Exception:
                     pass
-            if provider_type == 'metron':
-                # New credentials are a fresh chance: lift the lockout so the
-                # validation below can decide on its own evidence.
-                try:
-                    from models import metron as metron_module
-                    metron_module.clear_auth_block()
-                except Exception:
-                    pass
+            # New credentials are a fresh chance: lift the lockout so the
+            # validation below (or the next call) decides on its own evidence.
+            _reset_provider_client(provider_type)
+            try:
+                lockout = _provider_lockout(provider_type)
+                if lockout is not None:
+                    lockout.clear()
+            except Exception:
+                pass
 
             result = {"success": True, "message": f"Credentials saved for {provider_type}"}
 
@@ -1000,6 +1023,7 @@ def delete_provider_creds(provider_type):
 
         success = delete_provider_credentials(provider_type)
         if success:
+            _reset_provider_client(provider_type)
             if provider_type == 'gcd':
                 try:
                     from models.gcd import invalidate_gcd_table_cache
@@ -1018,9 +1042,11 @@ def delete_provider_creds(provider_type):
 def reset_provider_auth_block(provider_type):
     """Lift a provider's latched authentication block.
 
-    Only Metron latches one today. There is deliberately no timed auto-retry:
-    a rejected credential does not heal on its own, and retrying it is what got
-    a user's IP banned by Metron, so clearing it takes a human saying so.
+    Any provider that registers a ``core.provider_client.AuthLockout`` is
+    covered (Metron, ComicVine and the GCD API). There is deliberately no timed
+    auto-retry: a rejected credential does not heal on its own, and retrying it
+    is what got a user's IP banned by Metron, so clearing it takes a human
+    saying so.
     """
     try:
         from models.providers import ProviderType
@@ -1030,14 +1056,14 @@ def reset_provider_auth_block(provider_type):
         except ValueError:
             return jsonify({"error": f"Unknown provider type: {provider_type}"}), 400
 
-        if provider_type != 'metron':
+        lockout = _provider_lockout(provider_type)
+        if lockout is None:
             return jsonify({
                 "error": f"{provider_type} does not use an authentication block"
             }), 400
 
-        from models import metron as metron_module
-        metron_module.clear_auth_block()
-        return jsonify({"success": True, "message": "Metron re-enabled"})
+        lockout.clear()
+        return jsonify({"success": True, "message": f"{lockout.display_name} re-enabled"})
     except Exception as e:
         app_logger.error(f"Error resetting auth block for {provider_type}: {e}")
         return jsonify({"error": str(e)}), 500

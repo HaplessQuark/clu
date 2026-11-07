@@ -15,7 +15,9 @@ import threading
 import time
 from pathlib import Path
 from cbz_ops.rename import rename_comic_from_metadata
-from helpers.rate_limit import get_limiter
+from core.provider_client import (
+    AuthLockout, GuardedClient, LibraryClient, QuotaLatch, Verdict,
+)
 
 try:
     from simyan.comicvine import Comicvine
@@ -25,7 +27,7 @@ except ImportError:
 
 # Simyan <= 3.1 exposes the ComicvineResource enum used by the deprecated
 # Comicvine.search(); 4.0 removed both. Kept only for the legacy fallback in
-# _cv_search -- it must never gate SIMYAN_AVAILABLE, or one dead name disables
+# _raw_search -- it must never gate SIMYAN_AVAILABLE, or one dead name disables
 # the whole ComicVine integration (issue #565).
 try:
     from simyan.comicvine import ComicvineResource
@@ -40,6 +42,13 @@ try:
     _RATE_LIMIT_ERROR_TYPES = (_SimyanRateLimitError,)
 except ImportError:
     _RATE_LIMIT_ERROR_TYPES = ()
+
+# Simyan raises this for an HTTP 401: ComicVine rejected the API key.
+try:
+    from simyan.errors import AuthenticationError as _SimyanAuthenticationError
+    _AUTH_ERROR_TYPES = (_SimyanAuthenticationError,)
+except ImportError:
+    _AUTH_ERROR_TYPES = ()
 
 
 def _get_cv_request_timeout() -> int:
@@ -166,8 +175,11 @@ _CV_CLIENT_CACHE: Dict[str, Any] = {}
 _CV_CLIENT_CACHE_LOCK = threading.Lock()
 
 
-def get_cv_client(api_key: str):
-    """Return the process-shared Simyan client for ``api_key``.
+def get_cv_client(api_key: str) -> "ComicVineClient":
+    """Return the process-shared ``ComicVineClient`` for ``api_key``.
+
+    Its methods carry Simyan's names and run under the call policy; the Simyan
+    client itself stays private to this module.
 
     Clients are cached and reused across calls and threads. A shared
     ``CachedLimiterSession`` is safe to use concurrently: Simyan writes
@@ -182,7 +194,7 @@ def get_cv_client(api_key: str):
         if client is not None:
             return client
 
-    client = _make_cv_client(api_key)
+    client = ComicVineClient(_make_cv_client(api_key))
 
     with _CV_CLIENT_CACHE_LOCK:
         # Another thread may have raced us for the same key; keep whichever won
@@ -202,7 +214,7 @@ def _close_cv_client(client) -> None:
     leaks exactly what the cache exists to prevent.
     """
     try:
-        client._session.close()
+        client._library._session.close()
     except Exception:
         pass
 
@@ -237,6 +249,16 @@ def _cv_retry_config():
     return max(0, retries), max(0.0, backoff)
 
 
+def _cause_chain(exc):
+    """``exc`` and each ``__cause__`` below it, stopping on a cycle."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__
+
+
 def _is_rate_limit_error(exc) -> bool:
     """True when a Simyan/ComicVine error is a rate-limit rejection.
 
@@ -252,107 +274,282 @@ def _is_rate_limit_error(exc) -> bool:
       ``ServiceError("Service took too long to respond")``. The original is
       still on ``__cause__``, so walk the chain rather than matching that
       message directly — a genuine network timeout must stay a hard error.
+      :func:`_limiter_refused` tells this shape apart from the other two.
     """
-    seen = set()
-    current = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
+    for current in _cause_chain(exc):
         if 'rate limit' in str(current).lower():
             return True
         if _RATE_LIMIT_ERROR_TYPES and isinstance(current, _RATE_LIMIT_ERROR_TYPES):
             return True
-        current = current.__cause__
     return False
 
 
-# ComicVine allows roughly 200 requests per resource per hour. Sit under that
-# so this limiter trips *before* Simyan's own per_hour bucket does: then the
-# wait happens here, where it's logged and bounded, instead of surfacing as a
-# hard error from deep inside the HTTP session. The headroom also covers the
-# handful of paths that reach ComicVine outside _cv_call_with_retry.
-_CV_SAFE_HOURLY = 180
-_CV_RATE_WINDOW_SECONDS = 3600.0
+def _limiter_refused(exc) -> bool:
+    """True when Simyan's own limiter gave up waiting, without sending.
 
-
-def _cv_hourly_limit() -> int:
-    try:
-        return max(1, int(os.environ.get("COMICVINE_RATE_LIMIT_PER_HOUR", "180")))
-    except (ValueError, TypeError):
-        return _CV_SAFE_HOURLY
-
-
-_comicvine_rate_limiter = get_limiter(
-    "comicvine", _cv_hourly_limit(), _CV_RATE_WINDOW_SECONDS
-)
-
-# How long a live web request will wait for a throttle slot before giving up on
-# it and letting the reactive retry path handle the call. A user-facing search
-# must not park a request thread behind an hour-long window.
-_CV_INTERACTIVE_ACQUIRE_TIMEOUT = 5.0
-
-
-def _cv_acquire_timeout(blocking: Optional[bool]) -> Optional[float]:
-    """How long this caller may wait for a throttle slot.
-
-    Auto-detects by default rather than making every call site declare itself:
-    inside a Flask request we're on a worker thread a user is waiting on, so
-    wait only briefly; anywhere else (sweeps, bulk jobs, the scheduler) we're on
-    a daemon thread that should wait as long as the budget requires.
+    Its per-second bucket never needs more than a second, so a wait past
+    ``max_delay`` means the 200/hour bucket is spent -- an hourly quota, not a
+    burst. Retrying it inside a sweep is one ``max_delay`` per series for an
+    hour.
     """
-    if blocking is None:
-        try:
-            from flask import has_request_context
-
-            blocking = not has_request_context()
-        except Exception:
-            blocking = True
-    return None if blocking else _CV_INTERACTIVE_ACQUIRE_TIMEOUT
+    return any(
+        'rate limit not cleared' in str(current).lower() for current in _cause_chain(exc)
+    )
 
 
-def _cv_call_with_retry(fn, description: str, blocking: Optional[bool] = None):
-    """Run a Simyan operation under the shared throttle, retrying on rate limits.
+def _auth_rejected(exc) -> bool:
+    return bool(_AUTH_ERROR_TYPES) and any(
+        isinstance(current, _AUTH_ERROR_TYPES) for current in _cause_chain(exc)
+    )
 
-    Two layers, because ComicVine throttles burst traffic aggressively
-    ("Slow down cowboy"):
 
-    * Proactively, every attempt takes a slot from the process-wide limiter, so
-      concurrent sweeps and web requests share one budget instead of racing.
-    * Reactively, a throttle that still gets through is backed off and retried
-      a few times -- a single rejection shouldn't make the bulk-metadata flow
-      fail over to a lower-quality provider (GCD).
+def _is_connection_error(exc) -> bool:
+    import requests
 
-    Non-rate-limit errors raise immediately.
+    return any(
+        isinstance(current, (requests.ConnectionError, requests.Timeout))
+        for current in _cause_chain(exc)
+    )
 
-    Args:
-        blocking: Wait indefinitely for a throttle slot. Defaults to
-            auto-detection (see :func:`_cv_acquire_timeout`); pass explicitly
-            only to override that.
+
+# ---------------------------------------------------------------------------
+# Call policy (#704)
+#
+# Pacing is Simyan's: every Comicvine client is a CachedLimiterSession whose
+# bucket (1/s, 200/h) is consulted on every HTTP send, each page of a list
+# included. CLU used to take a second, per-*call* slot from its own 180/h
+# limiter on top -- the #703 anti-pattern, where one list call of many pages
+# cost one slot. That limiter is gone; this client adds what Simyan lacks: the
+# auth lockout, the hourly quota latch and a bounded wait for web requests.
+# ---------------------------------------------------------------------------
+
+_auth_block = AuthLockout("comicvine", "ComicVine")
+_hourly = QuotaLatch("ComicVine", "hourly")
+
+# Longest a live web request waits for Simyan's bucket before giving up.
+_CV_INTERACTIVE_WAIT = 10.0
+
+
+class ComicVineUnavailable(Exception):
+    """A ComicVine call was skipped: lockout, spent quota, or a busy bucket."""
+
+
+class ComicVineBusy(ComicVineUnavailable):
+    """Simyan's bucket would keep a live web request waiting too long."""
+
+
+def auth_blocked() -> bool:
+    """True while ComicVine has rejected the saved API key."""
+    return _auth_block.blocked()
+
+
+def clear_auth_block() -> None:
+    _auth_block.clear()
+
+
+def latch_auth_failure(status: Optional[int], detail: str = "", context: str = "") -> None:
+    _auth_block.latch(status, detail, context)
+
+
+def log_cv_failure(message: str, exc, level: str = "error") -> None:
+    """Log a failed ComicVine lookup, quietly when it was only skipped.
+
+    While the lockout or the hourly quota is latched every call fails at once,
+    so a sweep would log one ERROR per item in seconds; the latch has already
+    announced the condition once, on its transition. A real failure keeps
+    ``level``.
     """
-    retries, backoff = _cv_retry_config()
-    timeout = _cv_acquire_timeout(blocking)
-    attempt = 0
-    while True:
-        if not _comicvine_rate_limiter.acquire(timeout=timeout):
-            app_logger.info(
-                f"ComicVine throttle saturated for {description}; proceeding "
-                "without a slot so the request isn't held"
-            )
+    if isinstance(exc, ComicVineUnavailable) and not isinstance(exc, ComicVineBusy):
+        app_logger.debug(message)
+    else:
+        getattr(app_logger, level)(message)
+
+
+def paused_reason() -> Optional[str]:
+    """Why ComicVine calls are being skipped right now, for a user-facing message."""
+    return _cv_policy.paused_reason()
+
+
+def _bucket_wait_seconds(slots: int = 1) -> float:
+    """Seconds until ``slots`` more requests fit Simyan's bucket, taking none.
+
+    ``Bucket.waiting()`` answers only after a put has failed, so this reads the
+    bucket directly: for each rate, the item ``limit - slots`` places back from
+    the newest must age out of the window first. Every client shares the one
+    ``comicvine`` bucket, so any cached client's view will do. 0 when no client
+    exists yet, or the bucket cannot be read.
+    """
+    with _CV_CLIENT_CACHE_LOCK:
+        clients = list(_CV_CLIENT_CACHE.values())
+    worst = 0.0
+    for client in clients[:1]:
         try:
-            return fn()
+            session = client._library._session
+            bucket = session.limiter.bucket_factory[session.bucket_name or "comicvine"]
+            now = bucket.now()
+            for rate in bucket.rates:
+                if slots > rate.limit:
+                    continue
+                item = bucket.peek(rate.limit - slots)
+                if item is None:
+                    continue
+                worst = max(worst, (item.timestamp + rate.interval - now) / 1000.0)
         except Exception as e:
-            if not _is_rate_limit_error(e) or attempt >= retries:
-                raise
-            attempt += 1
-            wait = backoff * attempt
-            app_logger.warning(
-                f"ComicVine rate-limited on {description}; "
-                f"retry {attempt}/{retries} in {wait:.0f}s"
+            app_logger.debug(f"ComicVine rate-limit bucket unreadable: {e}")
+    return worst
+
+
+def hourly_wait_seconds(slots: int = 1) -> float:
+    """Seconds until ``slots`` ComicVine requests could go: the latched quota
+    or Simyan's bucket, whichever is later. Lets a long job say it is waiting
+    instead of sitting silently inside a call."""
+    return max(_hourly.remaining_seconds(), _bucket_wait_seconds(slots))
+
+
+def _in_request() -> bool:
+    try:
+        from flask import has_request_context
+
+        return has_request_context()
+    except Exception:
+        return False
+
+
+class _ComicVinePolicy(GuardedClient):
+    """ComicVine's half of the shared call policy: how to read its errors."""
+
+    def __init__(self):
+        super().__init__("ComicVine", _auth_block, _hourly)
+        self._tls = threading.local()
+
+    @property
+    def max_retries(self):
+        retries, _ = _cv_retry_config()
+        return retries + 1
+
+    def _retry_wait(self, wait, attempt):
+        # Simyan's bucket does not learn from a 420 ("Slow down cowboy" is not
+        # in its limit_statuses), so this sleep is the only back-off there is.
+        _, backoff = _cv_retry_config()
+        return backoff * (attempt + 1)
+
+    def _gate(self):
+        blocking = getattr(self._tls, "blocking", None)
+        interactive = (not blocking) if blocking is not None else _in_request()
+        if not interactive:
+            return
+        wait = _bucket_wait_seconds()
+        if wait > _CV_INTERACTIVE_WAIT:
+            raise ComicVineBusy(
+                f"ComicVine's request budget frees up in about {wait:.0f}s"
             )
-            time.sleep(wait)
+
+    def _classify(self, exc):
+        self._tls.last_error = exc
+        if isinstance(exc, ComicVineBusy):
+            return Verdict.error()
+        if _auth_rejected(exc):
+            return Verdict.auth(401, str(exc))
+        if _limiter_refused(exc):
+            return Verdict.quota(max(_bucket_wait_seconds(), 60.0))
+        if _is_rate_limit_error(exc):
+            return Verdict.retry(1.0)  # scaled by _retry_wait
+        if 'resource not found' in str(exc).lower():
+            return None  # a miss, not a fault; callers handle it
+        if _is_connection_error(exc):
+            return Verdict.connection()
+        if type(exc).__module__.startswith("simyan"):
+            return Verdict.error()
+        return None
 
 
-def _cv_search(cv, resource: str, query: str, max_results: Optional[int] = None):
-    """Search one ComicVine resource, across Simyan versions.
+_cv_policy = _ComicVinePolicy()
+_FAILED = object()
+
+
+if os.environ.get("COMICVINE_RATE_LIMIT_PER_HOUR"):
+    app_logger.warning(
+        "COMICVINE_RATE_LIMIT_PER_HOUR is no longer used: ComicVine is paced by "
+        "Simyan's own per-request limiter (200/hour)"
+    )
+
+
+# Simyan's public read methods: 3.0's, plus the per-resource ``search_*s``
+# later versions add. tests/unit/test_provider_calls_guarded.py asserts every
+# read the installed Simyan has is listed here.
+_SIMYAN_READS = frozenset({
+    "get_character", "get_concept", "get_creator", "get_issue", "get_item",
+    "get_location", "get_origin", "get_power", "get_publisher", "get_story_arc",
+    "get_team", "get_volume", "list_characters", "list_concepts",
+    "list_creators", "list_issues", "list_items", "list_locations",
+    "list_origins", "list_powers", "list_publishers", "list_story_arcs",
+    "list_teams", "list_volumes", "search", "search_characters",
+    "search_concepts", "search_creators", "search_issues", "search_items",
+    "search_locations", "search_origins", "search_powers", "search_publishers",
+    "search_story_arcs", "search_teams", "search_volumes",
+})
+
+
+class ComicVineClient(LibraryClient):
+    """A Simyan ``Comicvine`` client whose methods run under the call policy.
+
+    ``get_cv_client(key)`` hands these out. Every method has Simyan's name
+    (``cv.get_volume(id)``, ``cv.list_issues(params=...)``) and keeps the
+    contract ComicVine callers have always relied on: it returns the result
+    or **raises**.
+
+    * A burst rejection ("Slow down cowboy", 429/420) is retried with a linear
+      back-off (``COMICVINE_RATE_LIMIT_RETRIES`` / ``_BACKOFF``); after the
+      last attempt the rejection itself is raised.
+    * Simyan's limiter refusing past ``max_delay`` latches the hourly quota.
+      Every later call is skipped with ``ComicVineUnavailable`` until it
+      resets, instead of waiting ``max_delay`` per call for an hour.
+    * A 401 latches the auth lockout; every later call is skipped the same way
+      until the key is changed, tested, or re-enabled.
+    * Inside a web request (or ``using(blocking=False)``) a call that would wait
+      more than ``_CV_INTERACTIVE_WAIT`` for Simyan's bucket raises
+      ``ComicVineBusy`` instead.
+    * Any other error raises immediately.
+    """
+
+    READ_METHODS = _SIMYAN_READS
+
+    def __init__(self, library, options=None):
+        super().__init__(library, _cv_policy, options)
+
+    def _run(self, fn, context: str):
+        tls = _cv_policy._tls
+        tls.blocking = self._options.blocking
+        tls.last_error = None
+        try:
+            result = _cv_policy.call(fn, f"on {context}", _FAILED, raise_api_errors=True)
+        finally:
+            tls.blocking = None
+        if result is not _FAILED:
+            return result
+        last = getattr(tls, "last_error", None)
+        if last is not None:
+            raise last
+        raise ComicVineUnavailable(
+            f"{paused_reason() or 'ComicVine is unavailable'}; skipped {context}"
+        )
+
+    def search_resource(self, resource: str, query: str, max_results: Optional[int] = None):
+        """Search one resource ("volume", "story_arc"...), across Simyan versions;
+        see :func:`_raw_search`."""
+        library = self._library
+        context = self._options.context or f"{resource} search {query!r}"
+        return self._run(
+            lambda: _raw_search(library, resource, query, max_results), context
+        )
+
+
+def _raw_search(cv, resource: str, query: str, max_results: Optional[int] = None):
+    """Search one ComicVine resource on a raw Simyan client, across versions.
+
+    Callers go through ``ComicVineClient.search_resource``; only
+    ``check_api_key``, the connection test's deliberate bypass, calls this
+    directly.
 
     Simyan 3.1 added per-resource ``search_<plural>()`` methods and deprecated
     ``search(resource=...)``; 4.0 removed ``search()`` and the
@@ -382,12 +579,15 @@ def _cv_search(cv, resource: str, query: str, max_results: Optional[int] = None)
     )
 
 
-def check_api_key(api_key: str):
+def check_api_key(api_key: str, record: bool = False):
     """Verify a ComicVine API key with one cheap request.
 
-    Returns ``(is_valid, error)``.
+    Returns ``(is_valid, error)``. The one path that runs while the auth
+    lockout is latched: a user who fixed their key must be able to prove it.
+    With ``record`` (the saved key's connection test) a pass clears the
+    lockout and a 401 latches it; an unsaved probe records nothing.
 
-    Deliberately *not* routed through :func:`_cv_call_with_retry`. A credential
+    Deliberately *not* routed through the call policy. A credential
     check has to answer while the user watches the settings page, and retrying
     a saturated rate-limit bucket three times at ``max_delay`` (60s each) turns
     a failed test into minutes of silence before an unhelpful verdict.
@@ -402,11 +602,15 @@ def check_api_key(api_key: str):
 
     try:
         cv = get_cv_client(api_key)
-        _cv_search(cv, "volume", "Batman", max_results=1)
-        return True, None
+        _raw_search(cv._library, "volume", "Batman", max_results=1)
     except Exception as e:
         app_logger.error(f"ComicVine credential check failed: {e}")
+        if record and _auth_rejected(e):
+            latch_auth_failure(401, str(e), "testing the API key")
         return False, str(e)
+    if record:
+        clear_auth_block()
+    return True, None
 
 
 def is_simyan_available() -> bool:
@@ -463,15 +667,11 @@ def fetch_cv_arcs(api_key, search=None):
     try:
         cv = get_cv_client(api_key)
         if search:
-            arcs = _cv_call_with_retry(
-                lambda: _cv_search(cv, "story_arc", search),
-                f"story arc search '{search}'",
+            arcs = cv.using(context=f"story arc search '{search}'").search_resource(
+                "story_arc", search
             )
         else:
-            arcs = _cv_call_with_retry(
-                lambda: cv.list_story_arcs(max_results=500),
-                "story arc list",
-            )
+            arcs = cv.using(context="story arc list").list_story_arcs(max_results=500)
 
         if not arcs:
             return []
@@ -494,7 +694,7 @@ def fetch_cv_arcs(api_key, search=None):
         return results
 
     except Exception as e:
-        app_logger.error(f"Error fetching CV story arcs: {e}")
+        log_cv_failure(f"Error fetching CV story arcs: {e}", e)
         return []
 
 
@@ -513,9 +713,7 @@ def fetch_cv_arc_detail(api_key, arc_id):
 
     try:
         cv = get_cv_client(api_key)
-        arc = _cv_call_with_retry(
-            lambda: cv.get_story_arc(arc_id), f"story arc detail {arc_id}"
-        )
+        arc = cv.using(context=f"story arc detail {arc_id}").get_story_arc(arc_id)
         if not arc:
             return None
 
@@ -537,7 +735,7 @@ def fetch_cv_arc_detail(api_key, arc_id):
         }
 
     except Exception as e:
-        app_logger.error(f"Error fetching CV story arc {arc_id}: {e}")
+        log_cv_failure(f"Error fetching CV story arc {arc_id}: {e}", e)
         return None
 
 
@@ -570,10 +768,9 @@ def fetch_cv_arc_issues(api_key, arc_id):
         # hourly budget -- it has to go through the throttle like everything else.
         for i, entry in enumerate(detail['issues']):
             try:
-                issue = _cv_call_with_retry(
-                    lambda eid=entry['id']: cv.get_issue(eid),
-                    f"arc {arc_id} issue {entry['id']}",
-                )
+                issue = cv.using(
+                    context=f"arc {arc_id} issue {entry['id']}"
+                ).get_issue(entry['id'])
                 if not issue:
                     continue
 
@@ -609,7 +806,7 @@ def fetch_cv_arc_issues(api_key, arc_id):
                     app_logger.info(f"CV arc {arc_id}: resolved {i + 1}/{len(detail['issues'])} issues")
 
             except Exception as e:
-                app_logger.warning(f"CV arc {arc_id}: failed to resolve issue {entry['id']}: {e}")
+                log_cv_failure(f"CV arc {arc_id}: failed to resolve issue {entry['id']}: {e}", e, "warning")
                 # Still add a partial entry using the name from the arc
                 resolved.append({
                     'series_name': entry.get('name', ''),
@@ -622,7 +819,7 @@ def fetch_cv_arc_issues(api_key, arc_id):
         return resolved
 
     except Exception as e:
-        app_logger.error(f"Error resolving CV arc issues for {arc_id}: {e}")
+        log_cv_failure(f"Error resolving CV arc issues for {arc_id}: {e}", e)
         return []
 
 
@@ -808,9 +1005,8 @@ def search_volumes(api_key: str, series_name: str, year: Optional[int] = None) -
         # otherwise makes an indexed series look absent.
         volumes = None
         for query in volume_search_variants(series_name):
-            volumes = _cv_call_with_retry(
-                lambda q=query: _cv_search(cv, "volume", q),
-                f"volume search '{query}'",
+            volumes = cv.using(context=f"volume search '{query}'").search_resource(
+                "volume", query
             )
             if volumes:
                 if query != series_name:
@@ -856,7 +1052,7 @@ def search_volumes(api_key: str, series_name: str, year: Optional[int] = None) -
         return results
 
     except Exception as e:
-        app_logger.error(f"Error searching ComicVine volumes: {str(e)}")
+        log_cv_failure(f"Error searching ComicVine volumes: {str(e)}", e)
         raise
 
 
@@ -909,10 +1105,9 @@ def get_issue_by_number(api_key: str, volume_id: int, issue_number: str, year: O
         # Build filter string
         filter_str = f"volume:{volume_id},issue_number:{issue_number}"
 
-        issues = _cv_call_with_retry(
-            lambda: cv.list_issues(params={"filter": filter_str}),
-            f"issue lookup volume:{volume_id} #{issue_number}",
-        )
+        issues = cv.using(
+            context=f"issue lookup volume:{volume_id} #{issue_number}"
+        ).list_issues(params={"filter": filter_str})
 
         if not issues:
             app_logger.info(f"No issues found for volume {volume_id}, issue #{issue_number}")
@@ -930,9 +1125,8 @@ def get_issue_by_number(api_key: str, volume_id: int, issue_number: str, year: O
         basic_issue = issues[0]
 
         # Fetch full issue details to get all metadata (credits, characters, etc.)
-        issue = _cv_call_with_retry(
-            lambda: cv.get_issue(basic_issue.id),
-            f"issue detail {basic_issue.id}",
+        issue = cv.using(context=f"issue detail {basic_issue.id}").get_issue(
+            basic_issue.id
         )
 
         # Convert to dict format
@@ -943,7 +1137,7 @@ def get_issue_by_number(api_key: str, volume_id: int, issue_number: str, year: O
         return issue_dict
 
     except Exception as e:
-        app_logger.error(f"Error getting ComicVine issue: {str(e)}")
+        log_cv_failure(f"Error getting ComicVine issue: {str(e)}", e)
         raise
 
 
@@ -958,10 +1152,7 @@ def get_issue_by_id(api_key: str, issue_id: int) -> Optional[Dict[str, Any]]:
         raise Exception("Simyan library not installed. Install with: pip install simyan")
 
     cv = get_cv_client(api_key)
-    issue = _cv_call_with_retry(
-        lambda: cv.get_issue(int(issue_id)),
-        f"issue detail {issue_id}",
-    )
+    issue = cv.using(context=f"issue detail {issue_id}").get_issue(int(issue_id))
     if not issue:
         return None
     return _issue_to_dict(issue)
@@ -1405,7 +1596,7 @@ def search_and_get_metadata(api_key: str, series_name: str, issue_number: str, y
         return comicinfo
 
     except Exception as e:
-        app_logger.error(f"Error in search_and_get_metadata: {str(e)}")
+        log_cv_failure(f"Error in search_and_get_metadata: {str(e)}", e)
         raise
 
 
@@ -1559,7 +1750,7 @@ def get_metadata_by_volume_id(api_key: str, volume_id: int, issue_number: str, y
 
         return comicinfo
     except Exception as e:
-        app_logger.error(f"Error in get_metadata_by_volume_id: {str(e)}")
+        log_cv_failure(f"Error in get_metadata_by_volume_id: {str(e)}", e)
         return None
 
 
@@ -1812,10 +2003,7 @@ def get_volume_details(api_key: str, volume_id: int) -> Dict[str, Any]:
     try:
         app_logger.info(f"Fetching volume details for volume ID: {volume_id}")
         cv = get_cv_client(api_key)
-        volume = _cv_call_with_retry(
-            lambda: cv.get_volume(volume_id),
-            f"volume details {volume_id}",
-        )
+        volume = cv.using(context=f"volume details {volume_id}").get_volume(volume_id)
 
         if volume:
             result['id'] = getattr(volume, 'id', volume_id)
@@ -1839,7 +2027,7 @@ def get_volume_details(api_key: str, volume_id: int) -> Dict[str, Any]:
         return result
 
     except Exception as e:
-        app_logger.error(f"Error fetching volume details for {volume_id}: {e}")
+        log_cv_failure(f"Error fetching volume details for {volume_id}: {e}", e)
         return result
 
 
@@ -1875,12 +2063,9 @@ def get_all_issues_for_volume(api_key: str, volume_id: int) -> List[Dict[str, An
 
     try:
         while len(issues) < max_issues:
-            page = _cv_call_with_retry(
-                lambda o=offset: cv.list_issues(
-                    params={"filter": f"volume:{volume_id}", "offset": o}
-                ),
-                f"issue list volume:{volume_id} offset:{offset}",
-            )
+            page = cv.using(
+                context=f"issue list volume:{volume_id} offset:{offset}"
+            ).list_issues(params={"filter": f"volume:{volume_id}", "offset": offset})
             if not page:
                 break
 
@@ -1922,7 +2107,7 @@ def get_all_issues_for_volume(api_key: str, volume_id: int) -> List[Dict[str, An
         return issues
 
     except Exception as e:
-        app_logger.error(f"Error fetching issues for ComicVine volume {volume_id}: {e}")
+        log_cv_failure(f"Error fetching issues for ComicVine volume {volume_id}: {e}", e)
         return issues
 
 
@@ -2156,7 +2341,7 @@ def auto_fetch_metadata_for_folder(folder_path: str, api_key: str, target_file: 
             time.sleep(1)
 
         except Exception as e:
-            app_logger.error(f"Error processing {file_path}: {e}")
+            log_cv_failure(f"Error processing {file_path}: {e}", e)
             result['errors'] += 1
             result['details'].append({'file': file_path, 'status': 'error', 'reason': str(e)})
 

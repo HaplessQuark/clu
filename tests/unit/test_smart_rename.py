@@ -18,6 +18,14 @@ def _mock_rename_deps():
         yield
 
 
+def _metron_client(session):
+    """A real MetronClient over a fake session (imported late: smart_rename
+    keeps models.metron lazy)."""
+    from models.metron import MetronClient
+
+    return MetronClient(session)
+
+
 def _write_series_json(folder, name="Sandman", volume=2, year=1989):
     payload = {
         "metadata": {
@@ -312,12 +320,9 @@ class TestPlanSmartRenameAutoCreateSeriesJson:
         fake_api.series.return_value = series_obj
 
         fake_metron = MagicMock()
-        # _api_call is the pacing/auth funnel every Metron call goes through,
-        # not a data source -- keep it transparent so the fake api is what the
-        # test actually exercises.
-        fake_metron._api_call.side_effect = lambda fn, *a, **kw: fn()
         fake_metron.is_metron_configured.return_value = True
-        fake_metron.get_flask_api.return_value = fake_api
+        # A real MetronClient over the fake session, so the call policy runs.
+        fake_metron.get_flask_api.return_value = _metron_client(fake_api)
         fake_metron.get_series_id.return_value = 42
 
         with _enable_custom_rename(), \
@@ -363,12 +368,9 @@ class TestPlanSmartRenameAutoCreateSeriesJson:
         fake_api = MagicMock()
         fake_api.series.return_value = series_obj
         fake_metron = MagicMock()
-        # _api_call is the pacing/auth funnel every Metron call goes through,
-        # not a data source -- keep it transparent so the fake api is what the
-        # test actually exercises.
-        fake_metron._api_call.side_effect = lambda fn, *a, **kw: fn()
         fake_metron.is_metron_configured.return_value = True
-        fake_metron.get_flask_api.return_value = fake_api
+        # A real MetronClient over the fake session, so the call policy runs.
+        fake_metron.get_flask_api.return_value = _metron_client(fake_api)
         fake_metron.get_series_id.return_value = 42
         return fake_metron
 
@@ -640,6 +642,13 @@ class TestApplySmartRename:
         assert summary["skipped"] >= 1
 
 
+def _client(library):
+    """A real ComicVineClient over a mock Simyan, so the guard runs."""
+    from models.comicvine import ComicVineClient
+
+    return ComicVineClient(library)
+
+
 class TestBuildComicvineSeriesDict:
     """Regression cover for a fallback that never worked: this built its own
     Simyan client with `cache=None`, which Simyan 3.x rejects with TypeError,
@@ -661,7 +670,7 @@ class TestBuildComicvineSeriesDict:
         cv = MagicMock()
         cv.get_volume.return_value = self._volume()
         with patch("models.comicvine.is_simyan_available", return_value=True), \
-             patch("models.comicvine.get_cv_client", return_value=cv):
+             patch("models.comicvine.get_cv_client", return_value=_client(cv)):
             result = sr._build_comicvine_series_dict("KEY", 4050)
 
         assert result["name"] == "Batman"
@@ -680,25 +689,27 @@ class TestBuildComicvineSeriesDict:
         cv = MagicMock()
         cv.get_volume.return_value = self._volume()
         with patch("models.comicvine.is_simyan_available", return_value=True), \
-             patch("models.comicvine.get_cv_client", return_value=cv) as get_client, \
+             patch("models.comicvine.get_cv_client", return_value=_client(cv)) as get_client, \
              patch.object(cv_module, "Comicvine", create=True) as raw_ctor:
             sr._build_comicvine_series_dict("KEY", 4050)
 
         get_client.assert_called_once_with("KEY")
         raw_ctor.assert_not_called()
 
-    def test_goes_through_the_shared_throttle(self):
+    def test_goes_through_the_call_policy(self):
         import cbz_ops.smart_rename as sr
+        import models.comicvine as cv_module
 
         cv = MagicMock()
         cv.get_volume.return_value = self._volume()
         with patch("models.comicvine.is_simyan_available", return_value=True), \
-             patch("models.comicvine.get_cv_client", return_value=cv), \
-             patch("models.comicvine._cv_call_with_retry",
-                   side_effect=lambda fn, desc: fn()) as retry:
+             patch("models.comicvine.get_cv_client", return_value=_client(cv)), \
+             patch.object(cv_module._cv_policy, "call",
+                          wraps=cv_module._cv_policy.call) as policy_call:
             sr._build_comicvine_series_dict("KEY", 4050)
 
-        retry.assert_called_once()
+        policy_call.assert_called_once()
+        cv.get_volume.assert_called_once_with(4050)
 
     def test_missing_volume_returns_none(self):
         import cbz_ops.smart_rename as sr
@@ -706,7 +717,7 @@ class TestBuildComicvineSeriesDict:
         cv = MagicMock()
         cv.get_volume.return_value = None
         with patch("models.comicvine.is_simyan_available", return_value=True), \
-             patch("models.comicvine.get_cv_client", return_value=cv):
+             patch("models.comicvine.get_cv_client", return_value=_client(cv)):
             assert sr._build_comicvine_series_dict("KEY", 4050) is None
 
     def test_simyan_unavailable_returns_none(self):
@@ -724,5 +735,5 @@ class TestBuildComicvineSeriesDict:
         cv = MagicMock()
         cv.get_volume.side_effect = RuntimeError("ComicVine down")
         with patch("models.comicvine.is_simyan_available", return_value=True), \
-             patch("models.comicvine.get_cv_client", return_value=cv):
+             patch("models.comicvine.get_cv_client", return_value=_client(cv)):
             assert sr._build_comicvine_series_dict("KEY", 4050) is None

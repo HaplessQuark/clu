@@ -184,9 +184,11 @@ custom_headers_str = get_user_preference("custom_headers", "")
 
 # Import-time bootstrap only -- WATCH is editable at runtime from Settings, so
 # every download must resolve it through _download_dir() instead of this constant.
+# Not created here: this module is imported before init_db(), when a fresh
+# install (or a failed settings read) yields the default, and creating it put a
+# stray /downloads/temp beside a configured WATCH (#699). _download_dir()
+# creates whatever it resolves, on first use.
 DOWNLOAD_DIR = watch
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
 
 
 def _download_dir():
@@ -1473,7 +1475,9 @@ def download_mega(url: str, download_id: str, dest_name: Optional[str] = None, h
         # Download into WATCH, MegaDownloader handles decryption
         _watch_dir = _download_dir()
         monitor_logger.debug(f"Starting MEGA download to {_watch_dir}")
-        result_path = mega_dl.download(_watch_dir, progress_callback=progress_callback)
+        result_path = mega_dl.download(
+            _watch_dir, progress_callback=progress_callback, dest_path=out_path
+        )
         monitor_logger.debug(f"Download returned path: {result_path}")
 
         # If dest_name was specified, rename the file

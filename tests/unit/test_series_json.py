@@ -176,20 +176,22 @@ class TestBuildMetadata:
         assert meta["status"] == "Continuing"
 
     def test_backfills_cv_id_from_api_when_missing(self):
+        from models.metron import MetronClient
         from models.series_json import build_metadata
         series = self._dict_series(cv_id=None)
         api = MagicMock()
         api.series.return_value = MagicMock(cv_id=77777)
-        meta = build_metadata(series, api=api)
+        meta = build_metadata(series, api=MetronClient(api))
         assert meta["comicid"] == "77777"
         api.series.assert_called_once_with(12345)
 
     def test_api_failure_during_backfill_is_silent(self):
+        from models.metron import MetronClient
         from models.series_json import build_metadata
         series = self._dict_series(cv_id=None)
         api = MagicMock()
         api.series.side_effect = RuntimeError("network down")
-        meta = build_metadata(series, api=api)
+        meta = build_metadata(series, api=MetronClient(api))
         assert meta["comicid"] == ""
 
 
@@ -542,8 +544,9 @@ class TestComicVineImageIsJsonSafe:
         )
         cv_module = MagicMock()
         cv_module.is_simyan_available.return_value = True
-        cv_module._cv_call_with_retry.side_effect = lambda fn, _label: fn()
-        cv_module.get_cv_client.return_value.get_volume.return_value = volume
+        client = cv_module.get_cv_client.return_value
+        client.using.return_value = client  # a using() view is the same client
+        client.get_volume.return_value = volume
         with patch.dict("sys.modules", {"models.comicvine": cv_module}), \
              patch("models.comicvine", cv_module, create=True):
             from cbz_ops.smart_rename import _build_comicvine_series_dict

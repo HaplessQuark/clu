@@ -11,18 +11,18 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from core.version import __version__
+from core.version import CLU_USER_AGENT
 
 import requests as requests_lib
 import requests.exceptions as requests_exceptions
-from helpers.rate_limit import SlidingWindowRateLimiter, get_limiter
+from core.provider_client import (
+    AuthLockout, GuardedClient, LibraryClient, QuotaLatch, Verdict,
+)
+from mokkari.rate_limit import HeaderPacedRateLimiter, RateLimitStatus, RateLimitWindow
 from mokkari.session import Session as MokkariSession
 from mokkari.sqlite_cache import SqliteCache
 from mokkari.exceptions import ApiError, AuthenticationError, RateLimitError
 from mokkari.schemas.collection import ScrobbleRequest
-
-# User agent for Metron API requests
-CLU_USER_AGENT = f"CLU/{__version__}"
 
 _RATE_LIMIT_MAX_RETRIES = 3
 _RATE_LIMIT_DEFAULT_WAIT = 60  # seconds, used when retry_after is 0 or unset
@@ -32,15 +32,14 @@ _DAILY_RATE_LIMIT_THRESHOLD = (
 
 # Metron's burst limit is 20 requests/minute. CLU runs multiple background
 # threads (bulk metadata jobs, wanted-cache refresh, reading-list sync) plus
-# live web requests that can all reach Metron concurrently. mokkari.Session
-# tracks rate-limit state from response headers and pre-emptively raises
-# RateLimitError, that check is advisory only -- it isn't
-# synchronized with request dispatch, so concurrent callers can race past it.
-# We therefore (1) share one Session per API token so mokkari's header
-# tracking actually accumulates real state across all callers in this
-# process, and (2) throttle at the process level to a sliding-window request
-# rate safely under the burst limit.
-_SESSION_CACHE: Dict[str, MokkariSession] = {}
+# live web requests that can all reach Metron concurrently. Pacing happens
+# inside mokkari, on every HTTP send -- each page of a paginated list
+# included -- through the ``rate_limiter`` each Session is built with (#703).
+# One Session per API token, so one limiter per Metron account sees every
+# request this process makes. A slot taken once per call instead let one
+# call fetch dozens of pages unpaced. The cache holds the ``MetronClient``
+# wrapping each Session.
+_SESSION_CACHE: Dict[str, "MetronClient"] = {}
 _SESSION_CACHE_LOCK = threading.Lock()
 
 # mokkari 5.0 removed username/password auth: a token is the only credential.
@@ -95,21 +94,39 @@ def _metron_cache() -> Optional[SqliteCache]:
         return None
 
 
-_BURST_WINDOW_SECONDS = 60.0
-_SAFE_BURST_LIMIT = 15  # stay under Metron's 20/min burst limit for headroom
+# Metron's documented minimum burst limit, and what Settings shows
+# (``MetronProvider.rate_limit``; a test keeps the two equal). Used only until
+# the first response reports the real one.
+_DEFAULT_BURST_LIMIT = 20
 
 
-# Re-exported so existing callers (and tests) keep importing it from here.
-_SlidingWindowRateLimiter = SlidingWindowRateLimiter
+class _CluRateLimiter(HeaderPacedRateLimiter):
+    """mokkari's header-paced limiter, paced from the first request.
 
-_metron_rate_limiter = get_limiter(
-    "metron", _SAFE_BURST_LIMIT, _BURST_WINDOW_SECONDS
-)
+    ``HeaderPacedRateLimiter`` learns the burst limit from response headers,
+    so until the first response arrives it has no limit and spaces nothing:
+    every thread that starts at once -- a scheduled sweep, a bulk job and a
+    page load after a restart -- goes out together. Until Metron says
+    otherwise, assume its documented minimum.
+    """
 
-# Longest we'll pause waiting for the per-minute burst window to roll over.
-# The window is 60s, so this is a guard against a bad/skewed reset header
-# parking a thread, not a normal-path value.
-_MAX_BURST_WAIT_SECONDS = 90.0
+    @staticmethod
+    def _seeded(status):
+        if status is None or status.burst.limit is not None:
+            return status
+        burst = status.burst
+        return RateLimitStatus(
+            burst=RateLimitWindow(
+                limit=_DEFAULT_BURST_LIMIT, remaining=burst.remaining, reset=burst.reset
+            ),
+            sustained=status.sustained,
+        )
+
+    def acquire(self, status):
+        super().acquire(self._seeded(status))
+
+    def release(self, status):
+        super().release(self._seeded(status))
 
 
 def _as_aware(dt):
@@ -169,151 +186,9 @@ def _auth_detail(exc: Exception) -> str:
     return body[:200]
 
 
-class _AuthBlock:
-    """Latched "Metron rejected our credentials" state, persisted to the DB.
-
-    Deliberately has no timer. A 401 does not heal on its own, so retrying it
-    later only repeats the request that got the user banned; the block is
-    cleared by saving credentials, by a successful connection test, or by the
-    button on the settings page -- all of them acts of a human who has changed
-    something.
-
-    The database is the source of truth. The in-process copy is only a memo so
-    the hot path is not a query per API call; ``forget()`` drops it so the next
-    read comes from the database again.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._loaded = False
-        self._blocked = False
-        self._error = None
-        self._blocked_at = None
-
-    @staticmethod
-    def _read_persisted() -> Optional[Dict[str, Any]]:
-        """The stored state, or None when the store could not be read at all.
-
-        Queried directly rather than through ``get_user_preference``, which
-        swallows its own errors and returns the default: a read made before the
-        database is ready would then be indistinguishable from "not blocked".
-        Caching *that* would leave the lockout switched off for the life of the
-        process -- the exact failure this feature exists to prevent.
-        """
-        from core.database import get_db_connection
-
-        conn = get_db_connection()
-        if conn is None:
-            return None
-        try:
-            rows = conn.execute(
-                "SELECT key, value FROM user_preferences WHERE key IN (?, ?, ?)",
-                (PREF_AUTH_BLOCKED, PREF_AUTH_ERROR, PREF_AUTH_BLOCKED_AT),
-            ).fetchall()
-        finally:
-            conn.close()
-
-        values = {}
-        for key, raw in rows:
-            try:
-                values[key] = json.loads(raw)
-            except (TypeError, ValueError):
-                values[key] = None
-        return values
-
-    def _load_locked(self) -> None:
-        if self._loaded:
-            return
-        try:
-            values = self._read_persisted()
-        except Exception as e:
-            app_logger.debug(f"Metron auth-block state unreadable: {e}")
-            values = None
-
-        if values is None:
-            # Fail open, but do not remember it: leaving the memo unloaded means
-            # the next call tries again, so a lockout is picked up as soon as
-            # the database becomes readable.
-            return
-
-        self._blocked = bool(values.get(PREF_AUTH_BLOCKED))
-        self._error = values.get(PREF_AUTH_ERROR)
-        self._blocked_at = values.get(PREF_AUTH_BLOCKED_AT)
-        self._loaded = True
-
-    @staticmethod
-    def _persist(blocked: bool, error, blocked_at) -> None:
-        try:
-            from core.database import set_user_preference
-
-            set_user_preference(PREF_AUTH_BLOCKED, bool(blocked), category="providers")
-            set_user_preference(PREF_AUTH_ERROR, error, category="providers")
-            set_user_preference(PREF_AUTH_BLOCKED_AT, blocked_at, category="providers")
-        except Exception as e:
-            app_logger.warning(f"Could not persist Metron auth-block state: {e}")
-
-    def blocked(self) -> bool:
-        with self._lock:
-            self._load_locked()
-            return self._blocked
-
-    def state(self) -> Dict[str, Any]:
-        with self._lock:
-            self._load_locked()
-            return {
-                "blocked": self._blocked,
-                "error": self._error,
-                "blocked_at": self._blocked_at,
-            }
-
-    def latch(self, status: Optional[int], detail: str, context: str = "") -> None:
-        """Stop all Metron traffic until a human fixes the credentials."""
-        message = f"Metron rejected the configured credentials (HTTP {status})."
-        if detail:
-            message = f"{message} {detail}"
-        blocked_at = datetime.now(timezone.utc).isoformat()
-
-        with self._lock:
-            self._load_locked()
-            already = self._blocked
-            self._blocked = True
-            self._error = message
-            self._blocked_at = blocked_at
-
-        if already:
-            return
-
-        self._persist(True, message, blocked_at)
-        suffix = f" {context}".rstrip()
-        app_logger.error(
-            f"Metron authentication failed{suffix}: {message} "
-            f"Pausing all Metron requests until the credentials are updated."
-        )
-        try:
-            from core.database import update_provider_validity
-
-            update_provider_validity("metron", False)
-        except Exception:
-            pass
-
-    def clear(self) -> None:
-        with self._lock:
-            self._load_locked()
-            was_blocked = self._blocked
-            self._blocked = False
-            self._error = None
-            self._blocked_at = None
-        self._persist(False, None, None)
-        if was_blocked:
-            app_logger.info("Metron authentication block cleared; resuming Metron requests")
-
-    def forget(self) -> None:
-        """Drop the memo so the next read comes from the database."""
-        with self._lock:
-            self._loaded = False
-
-
-_auth_block = _AuthBlock()
+# The lockout is shared with every provider (``core.provider_client``); the
+# preference keys it derives from "metron" are the PREF_AUTH_* names above.
+_auth_block = AuthLockout("metron", "Metron")
 
 
 def auth_blocked() -> bool:
@@ -336,148 +211,98 @@ def latch_auth_failure(status: Optional[int], detail: str = "", context: str = "
     _auth_block.latch(status, detail, context)
 
 
-class _MetronPacer:
-    """Paces Metron requests from the limits Metron itself reports.
+# Metron reports two windows, and they need opposite responses:
+#
+# * **burst** (per-minute, same for everyone). Short, worth waiting out -- and
+#   the session's limiter does exactly that, per send. Nothing here.
+# * **sustained** (daily, varies by donor tier). Hours away. Waiting is
+#   pointless, so once it is known to be empty we stop calling until it resets.
+_daily = QuotaLatch("Metron", "daily")
 
-    mokkari parses ``X-RateLimit-*`` into ``session.rate_limit_status`` but its
-    own pre-emptive check is advisory -- its docstring says callers must cap
-    their own concurrency. So we read the same headers and do the capping here.
 
-    Two windows matter, and they need opposite responses:
+def daily_limit_reached() -> bool:
+    """True while Metron's daily quota is known to be spent."""
+    return _daily.reached()
 
-    * **burst** (per-minute, same for everyone). Short. Worth waiting out.
-    * **sustained** (daily, varies by donor tier). Hours away. Waiting is
-      pointless -- and worse, mokkari reports ``retry_after`` as
-      ``max(burst_wait, sustained_wait)``, so an exhausted daily quota surfaced
-      as a 59.5s wait that sat just under the "this must be the daily cap"
-      threshold and got retried 3x *per series*, for every series in a sweep.
-      That is the log in the bug report. Once the daily window is known to be
-      empty we stop calling until it resets.
+
+def _observe_sustained(session) -> None:
+    """Latch the daily window when the last response says it is empty.
+
+    Every field is ``None`` until the first response completes, and Metron may
+    not report the window at all, so each step has to tolerate a gap.
     """
-
-    def __init__(self, limiter):
-        self._limiter = limiter
-        self._lock = threading.Lock()
-        self._sustained_until = None
-        self._burst_until = None
-
-    def before(self, ignore_auth_lock: bool = False) -> bool:
-        """Take a slot. False when the daily quota is spent or auth is blocked."""
-        if not ignore_auth_lock and _auth_block.blocked():
-            return False
-        now = datetime.now(timezone.utc)
-        with self._lock:
-            sustained_until = self._sustained_until
-            burst_until = self._burst_until
-            if burst_until is not None and now >= burst_until:
-                self._burst_until = None
-                burst_until = None
-
-        if sustained_until is not None:
-            if now < sustained_until:
-                return False
-            with self._lock:
-                self._sustained_until = None
-            app_logger.info("Metron daily rate limit window has reset; resuming")
-
-        if burst_until is not None:
-            wait = min((burst_until - now).total_seconds(), _MAX_BURST_WAIT_SECONDS)
-            if wait > 0:
-                app_logger.info(
-                    f"Metron burst window exhausted; waiting {wait:.1f}s for reset"
-                )
-                time.sleep(wait)
-            with self._lock:
-                self._burst_until = None
-
-        self._limiter.acquire()
-        return True
-
-    def observe(self, session) -> None:
-        """Update pacing from the rate-limit headers on the last response.
-
-        Every field is ``None`` until the first response completes, and Metron
-        may not report a given window at all, so each branch has to fall back to
-        the configured defaults rather than assume a number is present.
-        """
-        status = getattr(session, "rate_limit_status", None)
-        if status is None:
-            return
-        try:
-            self._observe_burst(getattr(status, "burst", None))
-            self._observe_sustained(getattr(status, "sustained", None))
-        except Exception as e:  # never let telemetry break a worker thread
-            app_logger.debug(f"Metron rate-limit header parse skipped: {e}")
-
-    def _observe_burst(self, burst) -> None:
-        if burst is None:
-            return
-        limit = getattr(burst, "limit", None)
-        if isinstance(limit, int) and limit > 0:
-            # Stop guessing at 15/min once Metron tells us the real number.
-            self._limiter.retune(max(1, int(limit * 0.8)), _BURST_WINDOW_SECONDS)
-
-        remaining = getattr(burst, "remaining", None)
-        reset = _as_aware(getattr(burst, "reset", None))
-        if (
-            isinstance(remaining, int)
-            and remaining <= 1
-            and reset is not None
-            and reset > datetime.now(timezone.utc)
-        ):
-            with self._lock:
-                self._burst_until = reset
-
-    def _observe_sustained(self, sustained) -> None:
-        if sustained is None:
-            return
+    status = getattr(session, "rate_limit_status", None)
+    sustained = getattr(status, "sustained", None)
+    if sustained is None:
+        return
+    try:
         remaining = getattr(sustained, "remaining", None)
         reset = _as_aware(getattr(sustained, "reset", None))
-        if not (isinstance(remaining, int) and remaining <= 0):
-            return
-        if reset is None or reset <= datetime.now(timezone.utc):
-            return
-        with self._lock:
-            already_latched = self._sustained_until is not None
-            self._sustained_until = reset
-        if not already_latched:
-            app_logger.warning(
-                f"Metron daily rate limit exhausted; pausing Metron calls until "
-                f"{reset.isoformat()}"
-            )
-
-    def daily_limit_reached(self) -> bool:
-        """True when the last response said the daily quota is spent."""
-        with self._lock:
-            until = self._sustained_until
-        return until is not None and datetime.now(timezone.utc) < until
-
-    def latch_daily_limit(self, seconds: float, context: str) -> None:
-        """Record a daily-cap rejection reported via ``retry_after``."""
-        reset = datetime.now(timezone.utc) + timedelta(seconds=max(0.0, seconds))
-        with self._lock:
-            already_latched = self._sustained_until is not None
-            self._sustained_until = reset
-        if not already_latched:
-            app_logger.warning(
-                f"Metron daily rate limit exceeded {context}; pausing Metron "
-                f"calls until {reset.isoformat()}"
-            )
-
-    def reset(self) -> None:
-        with self._lock:
-            self._sustained_until = None
-            self._burst_until = None
-        self._limiter.retune(_SAFE_BURST_LIMIT, _BURST_WINDOW_SECONDS)
-        self._limiter.reset()
+        if isinstance(remaining, int) and remaining <= 0 and reset is not None:
+            _daily.latch_until(reset)
+    except Exception as e:  # never let telemetry break a worker thread
+        app_logger.debug(f"Metron rate-limit header parse skipped: {e}")
 
 
-_metron_pacer = _MetronPacer(_metron_rate_limiter)
+def _observe_all_sessions() -> None:
+    for session in _cached_sessions():
+        _observe_sustained(session)
+
+
+class _MetronPolicy(GuardedClient):
+    """Metron's half of the shared call policy: how to read its errors."""
+
+    def _classify(self, exc):
+        if isinstance(exc, RateLimitError):
+            return self._classify_rate_limit(exc)
+        if isinstance(exc, ApiError):
+            status = auth_failure_status(exc)
+            if status is not None:
+                return Verdict.auth(status, _auth_detail(exc))
+            if is_connection_error(exc):
+                return Verdict.connection()
+            return Verdict.error()
+        return None
+
+    @staticmethod
+    def _classify_rate_limit(exc):
+        retry_after = getattr(exc, "retry_after", 0) or 0
+        if retry_after > _DAILY_RATE_LIMIT_THRESHOLD:
+            return Verdict.quota(retry_after)
+        # mokkari reports retry_after as max(burst_wait, sustained_wait), so a
+        # spent daily quota can arrive as a sub-threshold wait (observed: 59.5s)
+        # and get retried three times per series for a whole sweep. The headers
+        # say which window it really is -- trust them over the magnitude.
+        _observe_all_sessions()
+        if _daily.reached():
+            return Verdict.quota()
+        if type(exc) is RateLimitError:
+            # mokkari raises the base class only for a request it never sent:
+            # the session's limiter refusing because the daily window is spent.
+            # A 429 that Metron returned is a subclass.
+            if retry_after > 0:
+                return Verdict.quota(retry_after)
+            return Verdict.retry(_RATE_LIMIT_DEFAULT_WAIT)
+        # A 429 that Metron returned. The session's limiter has already blocked
+        # every thread for its Retry-After, so the next send waits by itself;
+        # sleeping here too is how the two retry layers used to stack.
+        return Verdict.retry(0)
+
+    def _after_success(self):
+        _observe_all_sessions()
+
+
+_metron_policy = _MetronPolicy("Metron", _auth_block, _daily)
+
+
+def paused_reason() -> Optional[str]:
+    """Why Metron calls are being skipped right now, or None."""
+    return _metron_policy.paused_reason()
 
 
 def _cached_sessions() -> List[MokkariSession]:
     with _SESSION_CACHE_LOCK:
-        return list(_SESSION_CACHE.values())
+        return [client._library for client in _SESSION_CACHE.values()]
 
 
 def invalidate_session_cache() -> None:
@@ -487,7 +312,7 @@ def invalidate_session_cache() -> None:
     expired row, so this only reclaims the space they take on disk.
     """
     with _SESSION_CACHE_LOCK:
-        sessions = list(_SESSION_CACHE.values())
+        sessions = [client._library for client in _SESSION_CACHE.values()]
         _SESSION_CACHE.clear()
     for session in sessions:
         cache = getattr(session, "cache", None)
@@ -497,7 +322,7 @@ def invalidate_session_cache() -> None:
             cache.cleanup()
         except Exception:
             pass
-    _metron_pacer.reset()
+    _daily.reset()
     # Credentials may have changed under us; re-read the lockout from the
     # database rather than trusting a memo taken with the old ones.
     _auth_block.forget()
@@ -505,6 +330,10 @@ def invalidate_session_cache() -> None:
 
 # mokkari's default; a Session built by a test stand-in may not carry one.
 _METRON_API_URL = "https://metron.cloud/api/{}/"
+
+
+def _sessions_to_purge(api) -> List[MokkariSession]:
+    return [api._library] if api is not None else _cached_sessions()
 
 
 def _purge_cached(api, context: str, keys_for, resources=()) -> int:
@@ -516,7 +345,8 @@ def _purge_cached(api, context: str, keys_for, resources=()) -> int:
     runs out.
 
     Args:
-        api: Optional Session to purge; defaults to every cached session.
+        api: Optional ``MetronClient`` whose session to purge; defaults to
+            every cached session.
         context: Human-readable subject, used only in log messages.
         keys_for: Called with a session's ``api_url`` template; returns the
             exact keys to delete.
@@ -530,7 +360,7 @@ def _purge_cached(api, context: str, keys_for, resources=()) -> int:
     """
     removed = 0
     seen: List[Any] = []
-    for session in [api] if api is not None else _cached_sessions():
+    for session in _sessions_to_purge(api):
         cache = getattr(session, "cache", None)
         if cache is None or any(cache is c for c in seen):
             continue
@@ -562,7 +392,7 @@ def purge_issue_cache(issue_id, api=None) -> int:
 
     Args:
         issue_id: Metron issue id whose cached detail response should be dropped.
-        api: Optional Session to purge; defaults to every cached session.
+        api: Optional ``MetronClient`` to purge; defaults to every cached session.
 
     Returns:
         Number of cached rows removed.
@@ -611,7 +441,7 @@ def purge_series_cache(series_id, api=None) -> int:
 
     Args:
         series_id: Metron series id whose cached responses should be dropped.
-        api: Optional Session to purge; defaults to every cached session.
+        api: Optional ``MetronClient`` to purge; defaults to every cached session.
 
     Returns:
         Number of cached rows removed.
@@ -634,8 +464,7 @@ def purge_series_cache(series_id, api=None) -> int:
     # The per-issue detail bodies hold the credits, and their keys say nothing
     # about the series -- ask CLU's own issue cache which ids belong to it.
     # Guarded, so an uncached session never pays for the database round trip.
-    if any(getattr(s, "cache", None) is not None
-           for s in ([api] if api is not None else _cached_sessions())):
+    if any(getattr(s, "cache", None) is not None for s in _sessions_to_purge(api)):
         for issue_id in _known_issue_ids(series_id):
             removed += purge_issue_cache(issue_id, api=api)
 
@@ -692,90 +521,147 @@ def purge_arc_issues_cache(arc_id, api=None) -> int:
     )
 
 
-def _handle_rate_limit(e: "RateLimitError", attempt: int, context: str) -> bool:
-    """Sleep and signal whether to retry after a RateLimitError.
+# mokkari 5 Session's read methods, plus ``collection_scrobble`` -- the one
+# write CLU sends. Every other write (``*_post``, ``*_patch``,
+# ``collection_add``...) is deliberately absent, so it cannot be called.
+_MOKKARI_READS = frozenset({
+    "arc", "arc_issues_list", "arcs_list", "character", "character_issues_list",
+    "characters_list", "collection", "collection_missing_issues",
+    "collection_missing_series", "collection_scrobble", "collection_stats",
+    "collections_list", "creator", "creators_list", "imprint", "imprints_list",
+    "issue", "issues_list", "publisher", "publishers_list", "pull_list",
+    "pull_list_issues", "pull_list_series", "reading_list", "reading_list_items",
+    "reading_lists_list", "role_list", "series", "series_issues_list",
+    "series_list", "series_type_list", "team", "team_issues_list", "teams_list",
+    "universe", "universes_list", "wish_list", "wish_list_items",
+})
 
-    Returns True if the caller should retry, False if retries are exhausted
-    or the daily API rate limit has been exceeded.
+
+class MetronClient(LibraryClient):
+    """A mokkari ``Session`` whose methods run behind Metron's call policy.
+
+    ``get_api()`` / ``get_flask_api()`` hand these out. Every method has
+    mokkari's name (``api.series(5)``, ``api.issues_list(params)``) and keeps
+    the contract Metron callers have always relied on: on failure it returns
+    the default (``None``, or whatever ``using(default=...)`` set) instead of
+    raising.
+
+    * While Metron's daily quota is spent or its credentials have been
+      rejected, a call returns the default immediately rather than sleeping:
+      a sweep of 800 series must not sit through 800 x 3 x 60s of waits that
+      can't succeed.
+    * Pacing is not done here: the session's limiter paces every HTTP send,
+      each page of a list included.
+    * ``using(ignore_auth_lock=True, raise_auth_errors=True)`` is for the
+      connection test, which must run while the lockout is latched and needs
+      the rejection itself to report it. ``using(raise_api_errors=True)``
+      re-raises any other ``ApiError``, for a route that answers "Metron is
+      unavailable" from ``is_connection_error``.
     """
-    wait = e.retry_after if e.retry_after else _RATE_LIMIT_DEFAULT_WAIT
-    if e.retry_after and e.retry_after > _DAILY_RATE_LIMIT_THRESHOLD:
-        _metron_pacer.latch_daily_limit(e.retry_after, context)
-        return False
 
-    # mokkari reports retry_after as max(burst_wait, sustained_wait), so a spent
-    # daily quota can arrive as a sub-threshold wait (observed: 59.5s) and get
-    # retried three times per series for a whole sweep. The headers say which
-    # window it really is -- trust them over the magnitude.
-    for session in _cached_sessions():
-        _metron_pacer.observe(session)
-    if _metron_pacer.daily_limit_reached():
-        app_logger.info(
-            f"Metron daily rate limit reached {context}: giving up without retrying"
-        )
-        return False
+    READ_METHODS = _MOKKARI_READS
 
-    if attempt < _RATE_LIMIT_MAX_RETRIES - 1:
-        app_logger.info(
-            f"Metron rate limit hit {context}: waiting {wait}s before retry "
-            f"(attempt {attempt + 1}/{_RATE_LIMIT_MAX_RETRIES})"
-        )
-        # Flush log handlers so the warning is visible before the sleep
-        for handler in app_logger.handlers:
-            handler.flush()
-        time.sleep(wait)
-        app_logger.info(f"Metron rate limit wait complete, retrying {context}")
-        return True
-    app_logger.info(
-        f"Metron rate limit exceeded {context}: giving up after {_RATE_LIMIT_MAX_RETRIES} attempts"
-    )
-    return False
+    def __init__(self, library, options=None):
+        super().__init__(library, _metron_policy, options)
 
+    def arcs_page(self, params=None, page=1):
+        """Fetch one page of story arcs, without mokkari's auto-pagination.
 
-def _api_call(
-    fn,
-    context: str,
-    default=None,
-    ignore_auth_lock: bool = False,
-    raise_auth_errors: bool = False,
-):
-    """Call fn() paced by the shared limiter, with rate-limit retry.
+        The one Metron request mokkari does not send, so it carries the rules
+        by hand: it takes the session's limiter around its own send, reports
+        a 429 to it, and latches the lockout and the daily quota itself.
 
-    Returns ``default`` immediately while Metron's daily quota is spent or its
-    credentials have been rejected, rather than sleeping: a sweep of 800 series
-    must not sit through 800 x 3 x 60s of waits that can't succeed. Callers
-    already tolerate ``default`` -- it's the same contract as an ApiError.
+        Returns:
+            dict with keys: results (list of dicts), has_next (bool),
+            count (int), page (int)
+        """
+        session = self._library
+        url = "https://metron.cloud/api/arc/"
+        query_params = {"page": page}
+        if params:
+            query_params.update(params)
 
-    ``ignore_auth_lock`` and ``raise_auth_errors`` exist for the connection
-    test, which must be able to run while the lockout is latched and needs the
-    rejection itself in order to report it back to the user.
-    """
-    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
-        if not _metron_pacer.before(ignore_auth_lock=ignore_auth_lock):
-            app_logger.debug(
-                f"Metron calls are paused (rate limit or auth); skipping {context}"
-            )
-            return default
-        try:
-            result = fn()
-        except RateLimitError as e:
-            if not _handle_rate_limit(e, attempt, context):
-                return default
-        except ApiError as e:
-            status = auth_failure_status(e)
-            if status is not None:
-                if raise_auth_errors:
-                    # The connection test wants the reason, not a silent default.
-                    raise
-                latch_auth_failure(status, _auth_detail(e), context)
-                return default
-            app_logger.error(f"Metron API error {context}: {e}")
-            return default
-        else:
-            for session in _cached_sessions():
-                _metron_pacer.observe(session)
-            return result
-    return default
+        # mokkari 5 keeps the Bearer token out of ``session.header`` (so it
+        # isn't logged with the request headers), so this hand-built request
+        # has to add it. Without it every arc page is a 401 -- which latches
+        # the lockout below and stops *all* Metron traffic.
+        headers = dict(getattr(session, "header", None) or {})
+        api_token = getattr(session, "api_token", None)
+        if isinstance(api_token, str) and api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+
+        # A hand-built request never passes through mokkari's send, so it
+        # takes the session's limiter itself -- the same one mokkari takes for
+        # every request it sends -- or it is the one Metron request nothing
+        # paces. ``release`` gets the session's last status: this response's
+        # headers cannot be fed back through mokkari's public API, and the
+        # next mokkari send refreshes it.
+        limiter = getattr(session, "rate_limiter", None)
+        context = f"fetching arcs page {page}"
+
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES):
+            if _auth_block.blocked() or _daily.reached():
+                break
+            if limiter is not None:
+                try:
+                    limiter.acquire(session.rate_limit_status)
+                except RateLimitError as e:
+                    # The limiter refuses only when the daily window is spent.
+                    _daily.latch_for(getattr(e, "retry_after", 0) or 0, context)
+                    break
+            try:
+                resp = requests_lib.get(
+                    url, params=query_params, headers=headers, timeout=30
+                )
+            except requests_lib.exceptions.RequestException as e:
+                app_logger.error(f"Error fetching arcs page {page}: {e}")
+                break
+            finally:
+                if limiter is not None:
+                    try:
+                        limiter.release(session.rate_limit_status)
+                    except Exception as e:
+                        app_logger.debug(f"Metron rate limiter release failed: {e}")
+
+            if resp.status_code in _AUTH_FAILURE_STATUSES:
+                # This request is built by hand, so it never passes through
+                # the policy -- it has to latch the lockout itself.
+                latch_auth_failure(
+                    resp.status_code, (resp.text or "").strip()[:200], context
+                )
+                break
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", 0) or 0)
+                if retry_after > _DAILY_RATE_LIMIT_THRESHOLD:
+                    _daily.latch_for(retry_after, context)
+                    break
+                if limiter is not None:
+                    # Blocks every Metron send, mokkari's included, for Retry-After.
+                    limiter.on_rate_limited(retry_after)
+                if attempt < _RATE_LIMIT_MAX_RETRIES - 1:
+                    app_logger.info(
+                        f"Metron rate limit hit {context}: retrying after "
+                        f"{retry_after or _RATE_LIMIT_DEFAULT_WAIT}s "
+                        f"(attempt {attempt + 1}/{_RATE_LIMIT_MAX_RETRIES})"
+                    )
+                    if limiter is None:
+                        time.sleep(retry_after or _RATE_LIMIT_DEFAULT_WAIT)
+                    continue
+                break
+            try:
+                resp.raise_for_status()
+            except requests_lib.exceptions.RequestException as e:
+                app_logger.error(f"Error fetching arcs page {page}: {e}")
+                break
+            data = resp.json()
+            return {
+                "results": data.get("results", []),
+                "has_next": data.get("next") is not None,
+                "count": data.get("count", 0),
+                "page": page,
+            }
+
+        return {"results": [], "has_next": False, "count": 0, "page": page}
 
 
 def is_connection_error(exc: Exception) -> bool:
@@ -814,17 +700,17 @@ def get_api(
     ignore_auth_lock: bool = False,
 ):
     """
-    Return a shared Metron API client (Mokkari Session) for this API token.
+    Return the shared ``MetronClient`` for this API token.
 
-    Sessions are cached per token and reused across calls and threads, rather
-    than created fresh each time, so mokkari's own rate-limit header tracking
-    accumulates real state across the whole process instead of being
-    discarded after every call.
+    Clients are cached per token and reused across calls and threads, rather
+    than created fresh each time. Each wraps one mokkari Session. Each Session carries its own
+    ``_CluRateLimiter``, so one cache entry per token is one limiter per
+    Metron account, seeing every request this process sends -- as mokkari
+    asks ("construct one instance per Session").
 
     Returns None while Metron has rejected our credentials. This gate sits
-    *before* the session cache on purpose: several callers fetch a client once
-    and then drive mokkari directly in a loop, so refusing to hand out the
-    client is the only thing that reliably stops them.
+    *before* the session cache on purpose: a caller that fetches a client once
+    and loops over it then never starts, rather than skipping each call.
 
     Args:
         username: Ignored. Kept so existing positional callers still work;
@@ -836,7 +722,7 @@ def get_api(
             never verify the credentials that would clear the lockout.
 
     Returns:
-        Mokkari Session client or None if unavailable
+        A ``MetronClient``, or None if unavailable
     """
     if not api_token:
         if username and password:
@@ -850,13 +736,16 @@ def get_api(
         return None
 
     with _SESSION_CACHE_LOCK:
-        session = _SESSION_CACHE.get(api_token)
-        if session is not None:
-            return session
+        client = _SESSION_CACHE.get(api_token)
+        if client is not None:
+            return client
 
     try:
         session = MokkariSession(
-            api_token, user_agent=CLU_USER_AGENT, cache=_metron_cache()
+            api_token,
+            user_agent=CLU_USER_AGENT,
+            cache=_metron_cache(),
+            rate_limiter=_CluRateLimiter(),
         )
     except (ApiError, AuthenticationError) as e:
         app_logger.error(f"Metron API error initializing session: {e}")
@@ -868,8 +757,8 @@ def get_api(
     with _SESSION_CACHE_LOCK:
         # Another thread may have raced us to create a session for the same
         # token; keep whichever one won so only one is ever cached.
-        session = _SESSION_CACHE.setdefault(api_token, session)
-    return session
+        client = _SESSION_CACHE.setdefault(api_token, MetronClient(session))
+    return client
 
 
 def get_flask_api(app=None):
@@ -879,7 +768,7 @@ def get_flask_api(app=None):
         app: Flask app instance. If None, uses current_app (requires app context).
 
     Returns:
-        Mokkari Session client or None if no token is configured or it is invalid.
+        A ``MetronClient``, or None if no token is configured or it is invalid.
     """
     if app is None:
         from flask import current_app
@@ -986,21 +875,22 @@ def get_series_id_by_comicvine_id(api, cv_series_id: int) -> Optional[int]:
     Returns:
         Metron series ID, or None if not found
     """
-
-    def _call():
-        results = api.series_list({"cv_id": cv_series_id})
-        if results:
-            series_id = results[0].id
-            app_logger.info(f"Found Metron series {series_id} for CV ID {cv_series_id}")
-            return series_id
-        # Informational, not a problem: Metron simply doesn't carry every
-        # ComicVine volume, and callers (the library sweep in particular) fall
-        # through to a ComicVine-sourced identity. Logging this at WARNING made
-        # a routine cascade step look like a failure.
-        app_logger.info(f"No Metron series found for ComicVine ID {cv_series_id}")
+    results = api.using(context=f"looking up CV ID {cv_series_id}").series_list(
+        {"cv_id": cv_series_id}
+    )
+    if results is None:
+        # Failed or paused: that says nothing about Metron's catalogue.
         return None
-
-    return _api_call(_call, f"looking up CV ID {cv_series_id}")
+    if results:
+        series_id = results[0].id
+        app_logger.info(f"Found Metron series {series_id} for CV ID {cv_series_id}")
+        return series_id
+    # Informational, not a problem: Metron simply doesn't carry every
+    # ComicVine volume, and callers (the library sweep in particular) fall
+    # through to a ComicVine-sourced identity. Logging this at WARNING made
+    # a routine cascade step look like a failure.
+    app_logger.info(f"No Metron series found for ComicVine ID {cv_series_id}")
+    return None
 
 
 def update_cvinfo_with_metron_id(cvinfo_path: str, series_id: int) -> bool:
@@ -1146,11 +1036,8 @@ def fetch_issue_detail(api, issue_id, context: str = ""):
 
     purge_issue_cache(issue_id, api=api)
 
-    def _fetch():
-        return api.issue(issue_id)
-
     label = f"fetching details for issue ID {issue_id}"
-    return _api_call(_fetch, f"{label} {context}".strip())
+    return api.using(context=f"{label} {context}".strip()).issue(issue_id)
 
 
 def get_issue_metadata(
@@ -1174,10 +1061,9 @@ def get_issue_metadata(
     # Step 1: Search for the issue (separate retry scope)
     app_logger.debug(f"Metron API: searching issue #{issue_number} in series {series_id}")
 
-    def _search():
-        return api.issues_list({"series_id": series_id, "number": issue_number})
-
-    issues = _api_call(_search, f"searching issue {issue_number} in series {series_id}")
+    issues = api.using(
+        context=f"searching issue {issue_number} in series {series_id}"
+    ).issues_list({"series_id": series_id, "number": issue_number})
     if not issues:
         app_logger.warning(
             f"Issue {issue_number} not found in Metron series {series_id}"
@@ -1574,9 +1460,7 @@ def get_releases(
     if publisher_name:
         params["publisher_name"] = publisher_name
     app_logger.info(f"Fetching releases with params: {params}")
-    return (
-        _api_call(lambda: api.issues_list(params), "getting releases", default=[]) or []
-    )
+    return api.using(default=[], context="getting releases").issues_list(params) or []
 
 
 def get_all_issues_for_series(api, series_id):
@@ -1584,15 +1468,12 @@ def get_all_issues_for_series(api, series_id):
     Retrieves all issues associated with a specific series ID.
     """
 
-    def _call():
-        params = {"series_id": series_id}
-        app_logger.info(
-            f"Fetching issues for series_id: {series_id} with params: {params}"
-        )
-        return api.issues_list(params)
-
+    params = {"series_id": series_id}
+    app_logger.info(f"Fetching issues for series_id: {series_id} with params: {params}")
     return (
-        _api_call(_call, f"retrieving issues for series {series_id}", default=[]) or []
+        api.using(default=[], context=f"retrieving issues for series {series_id}")
+        .issues_list(params)
+        or []
     )
 
 
@@ -1629,7 +1510,7 @@ def list_issues_modified_since(api, since_date: str, context: str = "") -> Dict[
     purge_modified_since_cache("issue", since_date, api=api)
     params = {"modified_gt": since_date}
     label = f"listing issues modified since {since_date}{(' ' + context) if context else ''}"
-    issues = _api_call(lambda: api.issues_list(params), label, default=[]) or []
+    issues = api.using(default=[], context=label).issues_list(params) or []
 
     changed = {}
     for issue in issues:
@@ -1660,42 +1541,42 @@ def search_series_by_name(
     if not api or not series_name:
         return None
 
-    def _call():
-        app_logger.info(f"Searching Metron for series: '{series_name}' (year: {year})")
-        results = api.series_list({"name": series_name})
+    app_logger.info(f"Searching Metron for series: '{series_name}' (year: {year})")
+    results = api.using(context=f"searching for series '{series_name}'").series_list(
+        {"name": series_name}
+    )
+    if results is None:
+        return None
+    if not results:
+        app_logger.info(f"No Metron series found for '{series_name}'")
+        return None
 
-        if not results:
-            app_logger.info(f"No Metron series found for '{series_name}'")
-            return None
+    series_list = list(results)
+    app_logger.info(f"Found {len(series_list)} Metron series matches")
 
-        series_list = list(results)
-        app_logger.info(f"Found {len(series_list)} Metron series matches")
+    if year and len(series_list) > 1:
 
-        if year and len(series_list) > 1:
+        def year_distance(s):
+            s_year = getattr(s, "year_began", None)
+            return abs(s_year - year) if s_year is not None else 9999
 
-            def year_distance(s):
-                s_year = getattr(s, "year_began", None)
-                return abs(s_year - year) if s_year is not None else 9999
+        series_list = sorted(series_list, key=year_distance)
 
-            series_list = sorted(series_list, key=year_distance)
+    series = series_list[0]
+    publisher = getattr(series, "publisher", None)
+    publisher_name = getattr(publisher, "name", None) if publisher else None
 
-        series = series_list[0]
-        publisher = getattr(series, "publisher", None)
-        publisher_name = getattr(publisher, "name", None) if publisher else None
-
-        result = {
-            "id": getattr(series, "id", None),
-            "name": getattr(series, "name", "") or getattr(series, "display_name", ""),
-            "cv_id": getattr(series, "cv_id", None),
-            "publisher_name": publisher_name,
-            "year_began": getattr(series, "year_began", None),
-        }
-        app_logger.info(
-            f"Best Metron match: {result['name']} ({result['year_began']}) - cv_id: {result['cv_id']}"
-        )
-        return result
-
-    return _api_call(_call, f"searching for series '{series_name}'")
+    result = {
+        "id": getattr(series, "id", None),
+        "name": getattr(series, "name", "") or getattr(series, "display_name", ""),
+        "cv_id": getattr(series, "cv_id", None),
+        "publisher_name": publisher_name,
+        "year_began": getattr(series, "year_began", None),
+    }
+    app_logger.info(
+        f"Best Metron match: {result['name']} ({result['year_began']}) - cv_id: {result['cv_id']}"
+    )
+    return result
 
 
 _SERIES_SEP_RE = re.compile(r"\s+[-–—]\s+|\s*:\s*")
@@ -1748,60 +1629,61 @@ def search_series_list(
     if not api or not series_name:
         return []
 
-    def _call():
-        app_logger.info(f"Searching Metron (list) for series: '{series_name}' (year: {year})")
-        series_list = []
-        seen_ids = set()
-        for term in _series_search_terms(series_name):
-            results = api.series_list({"name": term})
-            for s in (list(results) if results else []):
-                if getattr(s, "id", None) in seen_ids:
-                    continue
-                seen_ids.add(getattr(s, "id", None))
-                series_list.append(s)
-            if series_list:
-                break
-        if not series_list:
-            return []
+    app_logger.info(f"Searching Metron (list) for series: '{series_name}' (year: {year})")
+    series_list = []
+    seen_ids = set()
+    for term in _series_search_terms(series_name):
+        # Each variant is its own guarded request: a failed one is skipped
+        # and the next spelling is still tried.
+        results = api.using(context=f"listing series '{term}'").series_list(
+            {"name": term}
+        )
+        for s in (list(results) if results else []):
+            if getattr(s, "id", None) in seen_ids:
+                continue
+            seen_ids.add(getattr(s, "id", None))
+            series_list.append(s)
+        if series_list:
+            break
+    if not series_list:
+        return []
 
-        # A shortened term (the tail after a "-"/":") is broader than the file's
-        # series name; keep only candidates containing every word of it.
-        want = _norm_series_words(series_name)
-        narrowed = [
-            s for s in series_list
-            if want <= _norm_series_words(
-                getattr(s, "name", "") or getattr(s, "display_name", ""))
-        ]
-        if narrowed:
-            series_list = narrowed
+    # A shortened term (the tail after a "-"/":") is broader than the file's
+    # series name; keep only candidates containing every word of it.
+    want = _norm_series_words(series_name)
+    narrowed = [
+        s for s in series_list
+        if want <= _norm_series_words(
+            getattr(s, "name", "") or getattr(s, "display_name", ""))
+    ]
+    if narrowed:
+        series_list = narrowed
 
-        if year and len(series_list) > 1:
+    if year and len(series_list) > 1:
 
-            def year_distance(s):
-                s_year = getattr(s, "year_began", None)
-                return abs(s_year - year) if s_year is not None else 9999
+        def year_distance(s):
+            s_year = getattr(s, "year_began", None)
+            return abs(s_year - year) if s_year is not None else 9999
 
-            series_list = sorted(series_list, key=year_distance)
+        series_list = sorted(series_list, key=year_distance)
 
-        matches = []
-        for series in series_list:
-            publisher = getattr(series, "publisher", None)
-            publisher_name = getattr(publisher, "name", None) if publisher else None
-            image = getattr(series, "image", None)
-            image_url = str(image) if image else None
-            matches.append({
-                "id": getattr(series, "id", None),
-                "name": getattr(series, "name", "") or getattr(series, "display_name", ""),
-                "start_year": getattr(series, "year_began", None),
-                "publisher_name": publisher_name or "",
-                "image_url": image_url,
-                "description": getattr(series, "desc", "") or "",
-                "count_of_issues": getattr(series, "issue_count", None),
-            })
-        app_logger.info(f"Found {len(matches)} Metron series matches (list)")
-        return matches
-
-    return _api_call(_call, f"listing series '{series_name}'") or []
+    matches = []
+    for series in series_list:
+        publisher = getattr(series, "publisher", None)
+        publisher_name = getattr(publisher, "name", None) if publisher else None
+        image = getattr(series, "image", None)
+        image_url = str(image) if image else None
+        matches.append({
+            "id": getattr(series, "id", None),
+            "name": getattr(series, "name", "") or getattr(series, "display_name", ""),
+            "start_year": getattr(series, "year_began", None),
+            "publisher_name": publisher_name or "",
+            "image_url": image_url,
+            "description": getattr(series, "desc", "") or "",
+            "count_of_issues": getattr(series, "issue_count", None),
+        })
+    app_logger.info(f"Found {len(matches)} Metron series matches (list)")
+    return matches
 
 
 def get_series_details(api, series_id: int) -> Optional[Dict[str, Any]]:
@@ -1818,37 +1700,33 @@ def get_series_details(api, series_id: int) -> Optional[Dict[str, Any]]:
     if not api or not series_id:
         return None
 
-    def _call():
-        series = api.series(series_id)
-        if not series:
-            return None
-        publisher = getattr(series, "publisher", None)
-        publisher_name = getattr(publisher, "name", None) if publisher else None
-        result = {
-            "id": series_id,
-            "cv_id": getattr(series, "cv_id", None),
-            "publisher_name": publisher_name,
-            "year_began": getattr(series, "year_began", None),
-        }
-        app_logger.info(
-            f"Metron series details: cv_id={result['cv_id']}, publisher={result['publisher_name']}, year={result['year_began']}"
-        )
-        return result
-
-    return _api_call(_call, f"getting details for series {series_id}")
+    series = api.using(context=f"getting details for series {series_id}").series(series_id)
+    if not series:
+        return None
+    publisher = getattr(series, "publisher", None)
+    publisher_name = getattr(publisher, "name", None) if publisher else None
+    result = {
+        "id": series_id,
+        "cv_id": getattr(series, "cv_id", None),
+        "publisher_name": publisher_name,
+        "year_began": getattr(series, "year_began", None),
+    }
+    app_logger.info(
+        f"Metron series details: cv_id={result['cv_id']}, publisher={result['publisher_name']}, year={result['year_began']}"
+    )
+    return result
 
 
 def get_series(api, series_id: int):
     """Fetch the full Metron series model, blocking and retrying on rate limits.
 
-    Unlike a raw ``api.series(id)`` call (which raises ``RateLimitError`` under
-    bulk load), this waits on the shared rate limiter and retries, so callers
-    that fetch many series in a row (sync, matching, name repair) get the real
-    object instead of erroring out. Returns the Mokkari series model, or None.
+    Retries a 429 once the session's limiter allows, so callers that fetch
+    many series in a row (sync, matching, name repair) get the real object
+    instead of erroring out. Returns the Mokkari series model, or None.
     """
     if not api or not series_id:
         return None
-    return _api_call(lambda: api.series(series_id), f"getting series {series_id}")
+    return api.using(context=f"getting series {series_id}").series(series_id)
 
 
 def get_series_cv_id(api, series_id: int) -> Optional[int]:
@@ -1988,12 +1866,10 @@ def scrobble_issue(api, metron_issue_id: int, date_read: str = "") -> bool:
         issue_id=metron_issue_id, date_read=date_read, rating=None
     )
 
-    result = _api_call(
-        lambda: api.collection_scrobble(scrobble_data) is not None,
-        f"scrobbling issue {metron_issue_id}",
-        default=False,
+    result = api.using(context=f"scrobbling issue {metron_issue_id}").collection_scrobble(
+        scrobble_data
     )
-    return bool(result)
+    return result is not None
 
 
 def resolve_metron_issue_id(
@@ -2139,10 +2015,8 @@ def fetch_reading_lists(api, params=None):
     if not api:
         return []
 
-    results = _api_call(
-        lambda: api.reading_lists_list(params or {}),
-        "fetching reading lists",
-        default=[],
+    results = api.using(default=[], context="fetching reading lists").reading_lists_list(
+        params or {}
     )
     if not results:
         return []
@@ -2179,11 +2053,9 @@ def list_reading_lists_modified_since(api, since_date: str) -> Optional[Dict[int
     # the stored token, so the sweep would skip a list that has moved.
     purge_reading_list_cache(api=api)
     params = {"modified_gt": since_date}
-    results = _api_call(
-        lambda: api.reading_lists_list(params),
-        f"listing reading lists modified since {since_date}",
-        default=None,
-    )
+    results = api.using(
+        context=f"listing reading lists modified since {since_date}"
+    ).reading_lists_list(params)
     if results is None:
         return None
 
@@ -2212,10 +2084,7 @@ def fetch_reading_list_detail(api, list_id):
     if not api:
         return None
 
-    result = _api_call(
-        lambda: api.reading_list(list_id),
-        f"fetching reading list {list_id}",
-    )
+    result = api.using(context=f"fetching reading list {list_id}").reading_list(list_id)
     if not result:
         return None
     return _to_dict(result)
@@ -2234,11 +2103,9 @@ def fetch_reading_list_items(api, list_id):
     if not api:
         return []
 
-    results = _api_call(
-        lambda: api.reading_list_items(list_id),
-        f"fetching items for reading list {list_id}",
-        default=[],
-    )
+    results = api.using(
+        default=[], context=f"fetching items for reading list {list_id}"
+    ).reading_list_items(list_id)
     if not results:
         return []
     return [_to_dict(item) for item in results]
@@ -2257,92 +2124,10 @@ def fetch_arcs(api, params=None):
     if not api:
         return []
 
-    results = _api_call(
-        lambda: api.arcs_list(params or {}),
-        "fetching story arcs",
-        default=[],
-    )
+    results = api.using(default=[], context="fetching story arcs").arcs_list(params or {})
     if not results:
         return []
     return [_to_dict(item) for item in results]
-
-
-def fetch_arcs_page(api, params=None, page=1):
-    """Fetch a single page of story arcs from Metron (no auto-pagination).
-
-    Bypasses Mokkari's auto-pagination by making a direct HTTP request,
-    returning only the requested page of results.
-
-    Args:
-        api: Mokkari API client (used for credentials and user-agent)
-        params: Optional dict of query parameters (e.g. {"name": "..."})
-        page: Page number to fetch (default 1)
-
-    Returns:
-        dict with keys: results (list of dicts), has_next (bool), count (int), page (int)
-    """
-    if not api:
-        return {"results": [], "has_next": False, "count": 0, "page": page}
-
-    url = "https://metron.cloud/api/arc/"
-    query_params = {"page": page}
-    if params:
-        query_params.update(params)
-
-    # mokkari 5 keeps the Bearer token out of ``api.header`` (so it isn't
-    # logged with the request headers), so this hand-built request has to add
-    # it. Without it every arc page is a 401 -- which latches the lockout below
-    # and stops *all* Metron traffic.
-    headers = dict(getattr(api, "header", None) or {})
-    api_token = getattr(api, "api_token", None)
-    if isinstance(api_token, str) and api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
-
-    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
-        if _auth_block.blocked():
-            break
-        _metron_rate_limiter.acquire()
-        try:
-            resp = requests_lib.get(
-                url, params=query_params, headers=headers, timeout=30
-            )
-            if resp.status_code in _AUTH_FAILURE_STATUSES:
-                # This request is built by hand, so it never passes through
-                # ``_api_call`` -- it has to latch the lockout itself.
-                latch_auth_failure(
-                    resp.status_code,
-                    (resp.text or "").strip()[:200],
-                    f"fetching arcs page {page}",
-                )
-                break
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", _RATE_LIMIT_DEFAULT_WAIT))
-                if retry_after > _DAILY_RATE_LIMIT_THRESHOLD:
-                    app_logger.info(
-                        f"Metron daily rate limit exceeded fetching arcs page {page}"
-                    )
-                    break
-                if attempt < _RATE_LIMIT_MAX_RETRIES - 1:
-                    app_logger.info(
-                        f"Metron rate limit hit fetching arcs page {page}: "
-                        f"waiting {retry_after}s (attempt {attempt + 1}/{_RATE_LIMIT_MAX_RETRIES})"
-                    )
-                    time.sleep(retry_after)
-                    continue
-                break
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "results": data.get("results", []),
-                "has_next": data.get("next") is not None,
-                "count": data.get("count", 0),
-                "page": page,
-            }
-        except requests_lib.exceptions.RequestException as e:
-            app_logger.error(f"Error fetching arcs page {page}: {e}")
-            break
-
-    return {"results": [], "has_next": False, "count": 0, "page": page}
 
 
 def fetch_arc_detail(api, arc_id):
@@ -2358,10 +2143,7 @@ def fetch_arc_detail(api, arc_id):
     if not api:
         return None
 
-    result = _api_call(
-        lambda: api.arc(arc_id),
-        f"fetching story arc {arc_id}",
-    )
+    result = api.using(context=f"fetching story arc {arc_id}").arc(arc_id)
     if not result:
         return None
     return _to_dict(result)
@@ -2380,11 +2162,9 @@ def fetch_arc_issues(api, arc_id):
     if not api:
         return []
 
-    results = _api_call(
-        lambda: api.arc_issues_list(arc_id),
-        f"fetching issues for story arc {arc_id}",
-        default=[],
-    )
+    results = api.using(
+        default=[], context=f"fetching issues for story arc {arc_id}"
+    ).arc_issues_list(arc_id)
     if not results:
         return []
     return [_to_dict(item) for item in results]

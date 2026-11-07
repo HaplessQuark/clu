@@ -25,8 +25,10 @@ Things that look arbitrary and are not:
   library root is excluded from the query up front, and ten consecutive OSErrors
   abort the batch *without* stamping or recording those ten (the streak is held
   back and dropped), because "every file failed at once" is a mount, not ten
-  damaged comics. ``_is_definitely_gone`` is the same evidence rule: a missing
-  parent directory proves nothing.
+  damaged comics. ``helpers.library.is_path_provably_gone`` is the evidence
+  rule: a missing file proves something only while its library root is
+  mounted (non-empty), and a file proven gone is forgotten rather than counted
+  toward the streak (#693).
 - **Heavy checks are paced separately from the cheap ones.** The series.json,
   staging-folder and empty-folder walks run at most once a day on a schedule
   (``CHEAP_CHECK_INTERVAL``), though the batch runs every time. A manual run does
@@ -289,7 +291,11 @@ def run_batch(limit, recheck_days, time_budget=DEFAULT_TIME_BUDGET, op_id=None):
         "aborted": False, "cleared": 0,
     }
     started = time.monotonic()
+    vanished = []
     try:
+        from helpers.library import get_library_roots, is_path_provably_gone
+
+        roots, mounted = get_library_roots(), {}
         todo = files_needing_check(limit, recheck_days, _unreachable_roots())
         pending = []  # outcomes held back until the streak is known to be clean
         streak = 0
@@ -334,6 +340,17 @@ def run_batch(limit, recheck_days, time_budget=DEFAULT_TIME_BUDGET, op_id=None):
                         stats["missing"] += 1
                         streak = 0
                         continue
+                    if is_path_provably_gone(path, roots=roots, mounted=mounted):
+                        # Its whole folder went, in a library that is mounted:
+                        # deleted or moved outside CLU. Not a mount problem, so
+                        # no streak and no integrity row; the index forgets it
+                        # (#693). Counting these as I/O errors aborted every
+                        # batch, because they are never stamped and so head
+                        # the queue for good.
+                        vanished.append(path)
+                        stats["missing"] += 1
+                        streak = 0
+                        continue
                     streak += 1
                     pending.append((path, item["size"], item["mtime"], None, None, None, None,
                                     FileNotFoundError(path)))
@@ -359,6 +376,12 @@ def run_batch(limit, recheck_days, time_budget=DEFAULT_TIME_BUDGET, op_id=None):
     except Exception as e:
         app_logger.error(f"Library health batch failed: {e}")
         stats["aborted"] = True
+    if vanished:
+        # After the batch's own connection is closed: forget_deleted_paths
+        # opens its own, and a second writer would wait out busy_timeout.
+        from core.database import forget_deleted_paths
+
+        forget_deleted_paths(vanished)
     return stats
 
 
@@ -1198,6 +1221,83 @@ def resolve_group(group_id, keep_path, trash_paths):
     return {"success": all(r["success"] for r in results), "results": results}
 
 
+def validate_member_rename(group_id, path, new_name):
+    """Check a rename asked for from the compare view. Returns ``{new_path}`` or ``{error}``.
+
+    Only a *likely* group offers it: those are different comics whose names or
+    tags collide, and a rename changes the name key and the filename stem
+    (``issue_stem``) the group was found by. An exact group is identical bytes,
+    which no rename can change. The path must be a member of the group as it is
+    now, so a stale page or a crafted request cannot rename anything else, and
+    the new name stays in the same folder with the same extension -- a rename
+    that turned a ``.cbr`` into a ``.cbz`` would only be lying about the format.
+
+    The name is refused rather than cleaned: it is what the user typed, and
+    quietly writing something else to disk is worse than saying why not.
+    """
+    from core.filename_chars import FILENAME_ILLEGAL_CHARS
+
+    group = _find_group(group_id, strict=True)
+    if group is None:
+        return {"error": "That group no longer exists"}
+    if group["kind"] != "likely":
+        return {"error": "Only likely duplicates can be resolved by renaming"}
+    if path not in {m["path"] for m in group["members"]}:
+        return {"error": "That file is not in this group"}
+
+    name = (new_name or "").strip()
+    old_name = os.path.basename(path)
+    if not name or name in (".", ".."):
+        return {"error": "Enter a file name"}
+    bad = sorted({c for c in name if c in FILENAME_ILLEGAL_CHARS or ord(c) < 32})
+    if bad:
+        shown = " ".join(c if ord(c) >= 32 else f"U+{ord(c):04X}" for c in bad)
+        return {"error": f"A file name cannot contain: {shown}"}
+    if name[0] in "._":
+        # helpers.is_hidden treats these as junk: the file would drop out of the library.
+        return {"error": "A file name cannot start with . or _"}
+    old_ext = os.path.splitext(old_name)[1]
+    stem, ext = os.path.splitext(name)
+    if not stem.strip() or ext.lower() != old_ext.lower():
+        return {"error": f"Keep the {old_ext or 'original'} extension"}
+    if name == old_name:
+        return {"error": "The name is unchanged"}
+    return {"new_path": os.path.join(os.path.dirname(path), name)}
+
+
+def follow_member_rename(old_path, new_path):
+    """Carry a renamed file's ``file_health`` row over to its new path.
+
+    ``os.rename`` keeps size and mtime, so the row is still trusted (it is matched
+    on ``(size, mtime)`` against the index). Without this a renamed file loses its
+    hash until the next scan re-reads it -- and if it was also in an exact group,
+    that group would vanish from the page as though it had been resolved. This is
+    deliberately not in ``move_path_references``: a file moved anywhere else is
+    simply re-hashed.
+    """
+    from core.database import db_conn
+
+    try:
+        with db_conn() as conn:
+            if not conn:
+                return False
+            conn.execute("DELETE FROM file_health WHERE path = ?", (new_path,))
+            conn.execute("UPDATE file_health SET path = ? WHERE path = ?", (new_path, old_path))
+            conn.commit()
+            return True
+    except Exception as e:
+        app_logger.error(f"Library health: could not follow a rename to {new_path}: {e}")
+        return False
+
+
+def group_exists(group_id):
+    """True/False, or None when the duplicates could not be read."""
+    try:
+        return _find_group(group_id, strict=True) is not None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # State, summary and score
 # ---------------------------------------------------------------------------
@@ -1317,6 +1417,12 @@ def run_scan(op_id=None, run_cheap=True, batch=None, time_budget=DEFAULT_TIME_BU
         limit = batch if batch is not None else max(1, get_int("LIBRARY_HEALTH_BATCH"))
         recheck_days = max(1, get_int("LIBRARY_HEALTH_RECHECK_DAYS"))
 
+        # Before the batch and the duplicate count, both of which read the
+        # index: a folder deleted outside CLU otherwise stays in it, and its
+        # comics pair up as "duplicates" of the copies they were moved to.
+        from core.database import prune_vanished_index_dirs
+
+        result["pruned_dirs"] = prune_vanished_index_dirs()
         stats = run_batch(limit, recheck_days, time_budget=time_budget, op_id=op_id)
         stats["pruned"] = prune_health_rows()
         state["last_batch"] = stats

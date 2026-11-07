@@ -29,11 +29,14 @@
     restored.
   </p>
   <p class="text-muted small mb-3">
-    Three ways to clear a group: <strong>Keep selected, trash the rest</strong>;
+    Four ways to clear a group: <strong>Keep selected, trash the rest</strong>;
     <strong>Dismiss</strong> if you already sorted it out elsewhere, such as the File Manager
     &mdash; it stays hidden until the next library health scan and comes back only if that scan
-    still finds it; or <strong>Not duplicates</strong> if they are different comics, which hides
-    the group for good unless another copy turns up.
+    still finds it; <strong>Not duplicates</strong> if they are different comics, which hides
+    the group for good unless another copy turns up; or, for a <strong>Likely</strong> group of
+    different comics whose names clash, open <strong>Compare</strong> and use the pencil to give
+    one its right name (an annual filed as a regular issue, say). Renaming changes the file
+    name only, not its ComicInfo tags.
   </p>
 
   <div class="alert alert-secondary py-2 small" id="dup-summary">Loading&hellip;</div>
@@ -64,11 +67,13 @@
 </div>
 {# Read-only, side-by-side compare of a group's copies (tags, pages, file facts). #}
 {% include 'partials/modal_cbz_dupe.html' %}
+{% include 'partials/modal_cbz_merge.html' %}
 {% endblock %}
 
 {% block scripts %}
 {{ super() }}
 <script src="{{ url_for('static', filename='js/clu-utils.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/clu-cbz-dupe.js') }}?v={{ range(1000, 9999) | random }}"></script>
+<script src="{{ url_for('static', filename='js/clu-cbz-merge.js') }}?v={{ range(1000, 9999) | random }}"></script>
 <script src="{{ url_for('static', filename='js/library_duplicates.js') }}?v={{ range(1000, 9999) | random }}"></script>
 {% endblock %}

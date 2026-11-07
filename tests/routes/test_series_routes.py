@@ -8,7 +8,64 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
+def _real_client(mock_metron, session):
+    """Hand a patched ``routes.series.metron`` a real ``MetronClient``.
+
+    The routes call ``api.using(...).series(...)``, so a bare MagicMock client
+    would answer from a fresh mock and ``session`` would never be asked. A
+    real client over the mock session also runs the real call policy.
+    """
+    from models.metron import MetronClient
+
+    client = MetronClient(session)
+    mock_metron.get_flask_api.return_value = client
+    mock_metron.paused_reason.return_value = None
+    return client
+
+
+def _pause_metron():
+    """Latch Metron's daily quota, so the real policy skips every call."""
+    import models.metron
+
+    models.metron._daily.latch_for(3600, "test")
+
+
 class TestSeriesSearch:
+
+    @patch("routes.series.metron")
+    def test_search_while_metron_is_paused_is_a_503(self, mock_metron, client):
+        """A skipped call (spent daily quota, rejected credentials) says why,
+        rather than answering "no results"."""
+        _real_client(mock_metron, MagicMock())
+        _pause_metron()
+        mock_metron.paused_reason.return_value = "Metron's daily request limit was reached"
+
+        resp = client.get("/api/series/search?q=batman")
+
+        assert resp.status_code == 503
+        assert resp.get_json()["error"] == "Metron's daily request limit was reached"
+
+    @patch("routes.series.metron")
+    def test_search_raises_api_errors_and_keeps_its_unavailable_503(
+        self, mock_metron, client
+    ):
+        """Without ``raise_api_errors`` the failure would come back as None and
+        be answered as a rate limit, not "unavailable"."""
+        import requests
+        from mokkari.exceptions import ApiError
+
+        error = ApiError("boom")
+        error.__cause__ = requests.exceptions.ConnectionError("boom")
+        mock_api = MagicMock()
+        mock_api.series_list.side_effect = error
+        _real_client(mock_metron, mock_api)
+        mock_metron.is_connection_error.return_value = True
+
+        resp = client.get("/api/series/search?q=batman")
+
+        assert resp.status_code == 503
+        assert "unavailable" in resp.get_json()["error"]
+        mock_api.series_list.assert_called_once()
 
     def test_empty_query(self, client):
         resp = client.get("/api/series/search?q=")
@@ -37,7 +94,7 @@ class TestSeriesSearch:
 
         mock_api = MagicMock()
         mock_api.series_list.return_value = [mock_series]
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
 
         mock_app = MagicMock()
@@ -73,7 +130,7 @@ class TestSeriesSearch:
 
         mock_api = MagicMock()
         mock_api.series_list.return_value = [mock_series]
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
 
         # Series id 100 has a mapped folder -> subscribed
@@ -95,7 +152,7 @@ class TestSeriesSearch:
 
         mock_api = MagicMock()
         mock_api.series_list.return_value = []
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
 
         mock_app = MagicMock()
@@ -115,7 +172,7 @@ class TestSeriesSearch:
 
         mock_api = MagicMock()
         mock_api.series_list.return_value = []
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
 
         mock_app = MagicMock()
@@ -544,7 +601,7 @@ class TestLibrariesApi:
 
         assert op["op_type"] == "index"
         assert op["status"] == "completed"
-        sync.assert_called_once_with([{"path": "x"}])
+        sync.assert_called_once_with([{"path": "x"}], walked_roots=[])
 
     @patch("core.database.add_library", return_value=1)
     def test_failed_index_rebuild_marks_the_operation(self, mock_add, client, tmp_path):
@@ -645,7 +702,7 @@ class TestPublishersApi:
 
         mock_api = MagicMock()
         mock_api.publishers_list.return_value = [pub1, pub2]
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
 
         resp = client.post("/api/publishers/sync")
@@ -654,6 +711,21 @@ class TestPublishersApi:
         assert data["success"] is True
         assert data["count"] == 2
         assert mock_save.call_count == 2
+
+    @patch("routes.series.metron")
+    @patch("core.database.save_publisher", return_value=True)
+    def test_sync_publishers_while_metron_is_paused_saves_nothing(
+        self, mock_save, mock_metron, client
+    ):
+        _real_client(mock_metron, MagicMock())
+        _pause_metron()
+        mock_metron.paused_reason.return_value = "Metron rejected the saved credentials"
+
+        resp = client.post("/api/publishers/sync")
+
+        assert resp.status_code == 503
+        assert resp.get_json()["error"] == "Metron rejected the saved credentials"
+        mock_save.assert_not_called()
 
     @patch("routes.series.metron")
     def test_sync_publishers_no_metron(self, mock_metron, client):
@@ -799,7 +871,7 @@ class TestSeriesPageForceRefresh:
             )
 
         mock_api.series.side_effect = _series
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.is_connection_error.return_value = False
         mock_metron.get_all_issues_for_series.return_value = []
         mock_metron.purge_series_cache.side_effect = lambda *a, **k: calls.append("purge")
@@ -807,7 +879,7 @@ class TestSeriesPageForceRefresh:
         resp = client_with_data.get("/series/batman-v2020-100?refresh=1")
 
         assert resp.status_code == 200
-        mock_metron.purge_series_cache.assert_called_once_with(100, api=mock_api)
+        mock_metron.purge_series_cache.assert_called_once_with(100, api=api)
         # Purging after the fetch would be useless.
         assert calls == ["purge", "fetch"]
         assert "Summary edited on Metron" in resp.get_data(as_text=True)
@@ -834,13 +906,13 @@ class TestSyncSeriesDescription:
 
         mock_api = MagicMock()
         mock_api.series.return_value = {"id": 100, "desc": "Rewritten summary"}
-        mock_metron.get_flask_api.return_value = mock_api
+        api = _real_client(mock_metron, mock_api)
         mock_metron.get_all_issues_for_series.return_value = []
 
         resp = client_with_data.post("/api/sync/series/100")
 
         assert resp.status_code == 200
-        mock_metron.purge_series_cache.assert_called_once_with(100, api=mock_api)
+        mock_metron.purge_series_cache.assert_called_once_with(100, api=api)
         # The seeded row already had a description; a changed one must still land.
         assert get_series_by_id(100)["desc"] == "Rewritten summary"
 
@@ -1704,13 +1776,13 @@ class TestReleasesPublisherFilter:
                 patch("core.database.get_tracked_series_lookup", return_value=set()):
             html = self._render_releases_page(client, app)
 
-        # Series 11 is subscribed (cover sticker + table badge); series 99 is not.
-        assert html.count('<span class="release-subscribed" title="Subscribed">') == 1
+        # Series 11 is subscribed (cover ribbon + table badge); series 99 is not.
+        assert html.count('<div class="release-ribbon">Subscribed</div>') == 1
         assert html.count('<span class="badge bg-success ms-1">Subscribed</span>') == 1
 
     def test_cards_are_the_shared_cover_card(self, client, app):
         # Releases uses collection.css's cover card like every other cover
-        # grid: no page-built card, ribbon, tracked border or entrance animation.
+        # grid: no page-built card, tracked border or entrance animation.
         html = self._render_releases_page(client, app)
 
         assert "css/collection.css" in html
@@ -1720,9 +1792,11 @@ class TestReleasesPublisherFilter:
         cards = html[html.index('id="releases-cards"'):html.index('id="releases-table"')]
         assert cards.count('class="thumbnail-container"') == 2
         assert cards.count('class="item-name text-truncate"') == 2
-        # The issue number lives in the shared gold sticker.
-        assert cards.count('<span class="issue-badge"><span class="issue-number">#1</span></span>') == 2
-        for old in ("ribbon", "stagger-load", "fade-in",
+        # The top-right corner belongs to the Subscribed ribbon, so the issue
+        # number is in the caption, not the gold issue sticker.
+        assert "issue-badge" not in cards
+        assert cards.count("#1 &middot; ") == 2
+        for old in ("stagger-load", "fade-in",
                     "release-cover", "no-cover-placeholder"):
             assert old not in html
         from pathlib import Path

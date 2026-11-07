@@ -52,8 +52,9 @@ Things that look arbitrary and are not:
   (`models.metron.list_reading_lists_modified_since`) instead of a detail
   request each. Metron's filter is **date-granular and exclusive**, so the
   lower bound steps back a day or a list edited later on the day it synced is
-  invisible. mokkari follows every `next` link inside that one call and does so
-  *below* the pacer, so the window is clamped to `MAX_BULK_LOOKBACK_DAYS`;
+  invisible. mokkari follows every `next` link inside that one call. Each page
+  is paced now (the session's limiter runs per send, #703), but each still
+  costs daily quota, so the window is clamped to `MAX_BULK_LOOKBACK_DAYS`;
   anything older is probed individually.
 - **`list_reading_lists_modified_since` returns `None` on failure and `{}` for
   "nothing changed", and the caller acts on the difference.** Collapsing the
@@ -82,6 +83,14 @@ one — it used to carry a verbatim copy of the GitHub sync body, which is
 precisely why it never covered anything else. `tests/unit/test_reading_list_scheduled_sync.py`
 asserts that structurally, because app.py cannot be imported in tests. It reuses
 the existing `reading_list_sync` schedule, job id and settings UI.
+
+**`reading_lists.exclude_auto_sync` opts one list out of the scheduled sync**
+(default OFF). Users edit CBL lists by hand and the nightly sweep overwrote
+them. `sync_all` drops excluded rows *before* the Metron prefilter; `sync_one`
+does not look at the flag, so the manual Sync button (an explicit request)
+still works. Toggled from the list page's menu via
+`POST /api/reading-lists/<id>/auto-sync` `{excluded: bool}`, shown only when the
+list is syncable.
 
 `_sanitize_html`, `_is_github_url`, `_convert_github_blob_to_raw`,
 `_metron_year_hints` and the per-provider entry builders live in
