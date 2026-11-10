@@ -184,7 +184,21 @@ Things that look arbitrary and are not:
 
 - Base: `python:3.14-slim-bookworm`
 - Uses `tini` as PID 1, `gosu` for user switching
-- Web scraping uses `cloudscraper` (pure Python) - there is no headless browser in the image. Cloudflare challenges are surfaced to the user as "download manually" rather than solved; see `core/download_utils.py` `is_cloudflare_challenge()`. Do not reintroduce Playwright/Chromium.
+- Web scraping uses `cloudscraper` (pure Python). **Chromium ships only as the
+  bundled FlareSolverr's browser** (`/opt/flaresolverr`, its own venv, pinned by
+  `FLARESOLVERR_VERSION` in the Dockerfile). A Cloudflare challenge is cleared
+  by `core.flaresolverr.clear_challenge(url, session)`, which puts the solver's
+  cookies and User-Agent on the caller's session so the caller retries its own
+  request. FlareSolverr never fetches a payload. What it cannot pass still ends
+  as "download manually" (`manual_url`). Rules:
+  - `core/flaresolverr_supervisor.py` starts it **on the first challenge**
+    (never at boot), from one long-lived thread, and stops it when idle. It
+    binds **127.0.0.1 only**, and its own process group dies with the worker
+    through `PR_SET_PDEATHSIG` (`core/flaresolverr_launch.py`).
+  - `/app/chromedriver` is a build-time **pre-patched** copy of the apt driver.
+    FlareSolverr hard-codes that path, and patching at runtime fails as PUID.
+  - Do not add Playwright or a second browser, and do not route downloads
+    through FlareSolverr.
 - `entrypoint.sh` handles PUID/PGID permissions
 - **`entrypoint.sh` must print before it does anything slow, and must time
   anything that can be slow.** Its first `echo` was once a hundred lines in,
@@ -250,6 +264,16 @@ which blocks auto-checkpoint, which lets the `-wal` grow without bound. During a
 corruption episode *every* call throws, so every call leaks — a feedback loop.
 `db_conn()` exists so new code cannot add to it. The ~290 existing sites are
 being converted where they are hot, not all at once.
+
+A leaked *write* connection is worse: if the exception lands after Python's
+sqlite3 opened its implicit transaction (a UNIQUE violation, say), the
+abandoned connection survives the function in a reference cycle **holding the
+WAL write lock** until the cyclic GC happens to run. Every other writer burns
+its 30s `busy_timeout` and fails. One `UNIQUE constraint failed:
+file_index.path` in `update_file_index_entry` produced 93 "database is locked"
+failures in twelve minutes (#723). `tests/unit/test_db_write_connection_leaks.py`
+is a ratchet on writers in `core/database.py` that commit without closing in a
+`finally`/`db_conn()`; lower its `BASELINE` when you convert one.
 
 ## Subsystem notes (`.claude/rules/`)
 

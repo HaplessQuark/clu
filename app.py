@@ -89,7 +89,7 @@ from core.memory_utils import (
 )
 from core.app_logging import app_logger, APP_LOG, MONITOR_LOG, read_log_tail
 from core.metadata_normalize import normalize_credit_list, strip_provider_ids
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from core.version import __version__
 from core.filename_chars import (
@@ -991,8 +991,17 @@ def process_incoming_wanted_issues():
             )
             continue
 
-        # Move file with original name first
-        temp_dest = os.path.join(dest_dir, filename)
+        # Move file with original name first -- but never onto a comic already
+        # in the series folder. move_file is os.replace underneath, which
+        # replaces an existing destination without a word (#723).
+        from cbz_ops.rename import free_destination
+
+        temp_dest = free_destination(src, os.path.join(dest_dir, filename))
+        if os.path.basename(temp_dest) != filename:
+            app_logger.warning(
+                f"{filename} already exists in {dest_dir}; filing this copy as "
+                f"{os.path.basename(temp_dest)} so neither is overwritten"
+            )
 
         try:
             # move_file, not shutil.move: shutil.move's cross-device fallback
@@ -1027,7 +1036,7 @@ def process_incoming_wanted_issues():
             try:
                 file_stat = os.stat(temp_dest)
                 add_file_index_entry(
-                    name=filename,
+                    name=os.path.basename(temp_dest),
                     path=temp_dest,
                     entry_type="file",
                     size=file_stat.st_size,
@@ -1047,12 +1056,26 @@ def process_incoming_wanted_issues():
 
                 new_filename = get_renamed_filename(filename, file_path=temp_dest)
                 if new_filename and new_filename != filename:
-                    final_path = os.path.join(dest_dir, new_filename)
+                    # Two different issues can render to one name; a bare
+                    # os.rename onto it destroyed the first one (#723).
+                    final_path = free_destination(
+                        temp_dest, os.path.join(dest_dir, new_filename)
+                    )
+                    if os.path.basename(final_path) != new_filename:
+                        app_logger.warning(
+                            f"Rename target {new_filename} already exists in "
+                            f"{dest_dir}; using {os.path.basename(final_path)} "
+                            f"so neither comic is overwritten"
+                        )
+                if final_path != temp_dest:
                     os.rename(temp_dest, final_path)
-                    app_logger.info(f"Renamed: {filename} -> {new_filename}")
+                    app_logger.info(
+                        f"Renamed: {os.path.basename(temp_dest)} -> "
+                        f"{os.path.basename(final_path)}"
+                    )
                     update_file_index_entry(
                         temp_dest,
-                        name=new_filename,
+                        name=os.path.basename(final_path),
                         new_path=final_path,
                         parent=dest_dir,
                     )
@@ -4245,11 +4268,17 @@ def _build_file_index_locked():
     # Track comic files for recent files database
     comic_files = []
 
-    # Helper function to check for folder thumbnail. Shares find_folder_thumbnail's
-    # extension list so an uploaded folder.gif / folder.webp indexes as art rather
-    # than reading as "no thumbnail".
+    # Folder art lives in the cache (core/folder_art.py); a legacy folder.* on
+    # disk still counts. The cached set is read once for the whole walk rather
+    # than queried per folder.
+    from core import folder_art as _folder_art
+
+    _cached_art = _folder_art.folders_with_cached_art()
+
     def check_has_thumbnail(folder_path):
-        return 1 if find_folder_thumbnail(folder_path) else 0
+        if folder_path in _cached_art:
+            return 1
+        return 1 if _folder_art.find_disk_art(folder_path) else 0
 
     try:
         # Iterate over all configured library roots
@@ -4426,8 +4455,17 @@ def scan_filesystem_for_sync(walked_roots=None):
         except (ValueError, OSError):
             return normalized_path.startswith(normalized_target_dir)
 
+    # Folder art lives in the cache (core/folder_art.py); a legacy folder.* on
+    # disk still counts. The cached set is read once for the whole walk rather
+    # than queried per folder.
+    from core import folder_art as _folder_art
+
+    _cached_art = _folder_art.folders_with_cached_art()
+
     def check_has_thumbnail(folder_path):
-        return 1 if find_folder_thumbnail(folder_path) else 0
+        if folder_path in _cached_art:
+            return 1
+        return 1 if _folder_art.find_disk_art(folder_path) else 0
 
     # Get all library roots to scan
     library_roots = get_library_roots()
@@ -5428,46 +5466,18 @@ from helpers import describe_archive_error  # noqa: E402
 
 
 def find_folder_thumbnails_batch(folder_paths):
+    """``{folder_path: art path or None}`` for many folders.
+
+    Kept for callers outside routes/; the body is
+    ``core.folder_art.find_art_batch`` -- cached art first, from one query,
+    and the data disk only for the misses.
     """
-    Find folder/cover thumbnails for multiple directories.
-    Uses ThreadPoolExecutor to parallelize filesystem checks.
+    from core import folder_art
 
-    Note: Cannot use file_index because image files (.png, .jpg, etc.)
-    are excluded from the index during build.
-
-    Args:
-        folder_paths: List of directory paths to check
-
-    Returns:
-        Dict mapping path -> thumbnail_path or None
-    """
-    if not folder_paths:
-        return {}
-
-    results = {}
-
-    # Use thread pool to parallelize filesystem checks
-    with ThreadPoolExecutor(max_workers=min(10, len(folder_paths))) as executor:
-        future_to_path = {
-            executor.submit(find_folder_thumbnail, path): path for path in folder_paths
-        }
-        for future in as_completed(future_to_path):
-            path = future_to_path[future]
-            try:
-                thumb = future.result()
-                results[path] = thumb
-                if thumb:
-                    app_logger.debug(f"Found thumbnail for {path}: {thumb}")
-            except Exception as e:
-                app_logger.error(f"Error finding thumbnail for {path}: {e}")
-                results[path] = None
-
-    # Fill in any missing paths
-    for p in folder_paths:
-        if p not in results:
-            results[p] = None
-
-    return results
+    return {
+        path: (rec["path"] if rec else None)
+        for path, rec in folder_art.find_art_batch(folder_paths).items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -6276,10 +6286,12 @@ def generate_folder_thumbnail():
         # generate_folder_thumbnail_internal below. This route is the explicit
         # user action, so it overwrites any existing folder image.
         if generate_folder_thumbnail_internal(folder_path):
+            from core import folder_art
+
             return jsonify(
                 {
                     "success": True,
-                    "thumbnail_path": os.path.join(folder_path, "folder.png"),
+                    "thumbnail_url": folder_art.art_url(folder_path, "folder"),
                 }
             )
 
@@ -6305,6 +6317,7 @@ def generate_folder_thumbnail_internal(folder_path, overwrite=True, style=None):
     the result into the folder as ``folder.png``.
     """
     try:
+        from core import folder_art
         from core import folder_thumbnails as ft
         from core.database import get_folder_pin
 
@@ -6352,20 +6365,6 @@ def generate_folder_thumbnail_internal(folder_path, overwrite=True, style=None):
 
         final_canvas = spec["compose"](cached_thumbs)
 
-        # Clear existing art. Driven by the same extension list
-        # find_folder_thumbnail reads, so this cannot drift out of step with
-        # what counts as folder art — a missed extension would survive the
-        # write and keep winning the lookup, leaving the new image invisible.
-        for ext in FOLDER_THUMBNAIL_EXTENSIONS:
-            existing_thumb = os.path.join(folder_path, f"folder{ext}")
-            if os.path.exists(existing_thumb):
-                try:
-                    os.remove(existing_thumb)
-                except Exception as e:
-                    app_logger.error(
-                        f"Error removing existing thumbnail {existing_thumb}: {e}"
-                    )
-
         # Nested folders read as folders rather than series by sitting behind
         # the folder icon. Optional since some styles (the full-bleed mosaic in
         # particular) look better without it.
@@ -6378,14 +6377,18 @@ def generate_folder_thumbnail_internal(folder_path, overwrite=True, style=None):
                     final_canvas, folder_icon_path
                 )
 
-        output_path = os.path.join(folder_path, "folder.png")
-        final_canvas.save(output_path, "PNG")
-        # Without this the image lands with the process umask (root:0600 when
-        # the container fell back to root at startup) and cannot be read back
-        # out to serve the thumbnail.
-        match_parent_permissions(output_path)
+        # Into the cache volume, never the library folder (#720): writing
+        # folder.png beside the comics woke spinning data disks on every
+        # generation. The store replaces any cached art of this kind, and
+        # cached art takes precedence over a legacy folder.* on disk, which is
+        # deliberately left where it is.
+        record = folder_art.put_art(
+            folder_path, "folder", final_canvas, ".png", "generated"
+        )
+        if not record:
+            return False
 
-        app_logger.info(f"Generated folder thumbnail: {output_path}")
+        app_logger.info(f"Generated folder thumbnail for {folder_path}")
         # /api/browse serves folder art off this cached flag, so a stale 0 here
         # hides the image until the next full library scan.
         set_directory_has_thumbnail(folder_path, True)
@@ -6511,6 +6514,14 @@ def restart_app():
         monitor_supervisor.stop()
     except Exception as e:
         app_logger.warning(f"Could not stop the folder monitor before restart: {e}")
+    # The bundled FlareSolverr would survive execv the same way, still holding
+    # its port and a browser.
+    try:
+        from core import flaresolverr_supervisor
+
+        flaresolverr_supervisor.stop()
+    except Exception as e:
+        app_logger.warning(f"Could not stop FlareSolverr before restart: {e}")
     os.execv(sys.executable, ["python"] + sys.argv)
 
 
@@ -6882,6 +6893,10 @@ def save_download_api_config():
             bool(data.get("downloadPacks", False)),
             category="downloads",
         )
+        # Written only when sent, like the variant fields above, so an older
+        # page cannot switch the bundled solver off.
+        if "flaresolverrEnabled" in data:
+            set_setting("FLARESOLVERR_ENABLED", bool(data.get("flaresolverrEnabled")))
 
         # Save API credentials to DB (provider_credentials)
         try:
@@ -7158,6 +7173,7 @@ def config_page():
         variantTypes=st["VARIANT_TYPES"],
         oneshotFolders=st["ONESHOT_FOLDERS"],
         downloadPacks=is_download_packs_enabled(),
+        flaresolverrEnabled=st["FLARESOLVERR_ENABLED"],
         enableDebugLogging=st["ENABLE_DEBUG_LOGGING"],
         bootstrapTheme=get_user_preference("bootstrap_theme", default="default"),
         pageWidth=st["PAGE_WIDTH"],
@@ -7613,6 +7629,12 @@ def shutdown_server():
         monitor_supervisor.stop()
     except Exception as e:
         app_logger.warning(f"Monitor cleanup failed during shutdown: {e}")
+    try:
+        from core import flaresolverr_supervisor
+
+        flaresolverr_supervisor.stop()
+    except Exception as e:
+        app_logger.warning(f"FlareSolverr cleanup failed during shutdown: {e}")
     try:
         from core.db_maintenance import shutdown_checkpoint
 
